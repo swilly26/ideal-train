@@ -9,6 +9,14 @@ scikit-learn>=1.5.0
 # We'll use our own engine for the core; this is a reference.
 backtesting>=0.3.3
 
+# Market data providers
+yfinance>=0.2.40
+requests>=2.32.0
+websocket-client>=1.8.0
+
+# Cache (Parquet file format)
+pyarrow>=17.0.0
+
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
