@@ -6,5 +6,26 @@ layer calls this repeatedly while searching for optimal parameters.
 """
 
 from src.backtesting.engine import BacktestEngine, BacktestResult
+from src.backtesting.metrics import (
+    compute_metrics,
+    max_drawdown,
+    num_trades,
+    profit_factor,
+    sharpe_ratio,
+    sortino_ratio,
+    total_return,
+    win_rate,
+)
 
-__all__ = ["BacktestEngine", "BacktestResult"]
+__all__ = [
+    "BacktestEngine",
+    "BacktestResult",
+    "compute_metrics",
+    "max_drawdown",
+    "num_trades",
+    "profit_factor",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "total_return",
+    "win_rate",
+]
