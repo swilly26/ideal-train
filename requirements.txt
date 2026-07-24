@@ -21,6 +21,6 @@ pyarrow>=17.0.0
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
 
-# Optional / future: brokerage SDKs
-# alpaca-py>=0.30.0
+# Brokerage SDKs
+alpaca-py>=0.30.0
 # ib_insync>=0.9.86

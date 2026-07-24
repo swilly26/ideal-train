@@ -5,5 +5,13 @@ never depends on a specific broker's SDK.
 """
 
 from src.execution.broker import Broker, Order, OrderResult, OrderSide, OrderType
+from src.execution.position_manager import PositionManager
 
-__all__ = ["Broker", "Order", "OrderResult", "OrderSide", "OrderType"]
+__all__ = [
+    "Broker",
+    "Order",
+    "OrderResult",
+    "OrderSide",
+    "OrderType",
+    "PositionManager",
+]
