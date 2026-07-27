@@ -259,9 +259,16 @@ class TurboTrader:
         logger.info("=" * 60)
 
         # ── Cancel stale orders from prior sessions ──────────────────
+        # NOTE: cancel_all_orders() cancels EVERY open order on the account
+        # (both turbo's AND the main trader's). This is a known side effect of
+        # sharing an Alpaca paper account. We log a warning so operators are aware.
         logger.info("Cancelling any stale orders from prior sessions…")
         cancelled = await self.broker.cancel_all_orders()
-        logger.info(f"Cancelled {cancelled} stale order(s)")
+        logger.warning(
+            "Cancelled %d open order(s) — this includes ALL orders on the shared "
+            "account (turbo + main trader). Main trader may need to re-submit orders.",
+            cancelled,
+        )
 
         # Wait for open
         await self.wait_for_market_open()
@@ -428,7 +435,11 @@ class TurboTrader:
         added = 0
         removed = 0
 
+        turbo_set = {s.upper() for s in SYMBOLS}
+
         for sym, pos_data in broker_symbols.items():
+            if sym not in turbo_set:
+                continue  # Ignore non-turbo symbols (e.g. main trader's positions)
             if sym not in pm_symbols:
                 self.pm.open_position(
                     symbol=sym,
@@ -442,6 +453,8 @@ class TurboTrader:
                 added += 1
 
         for sym in pm_symbols - set(broker_symbols):
+            if sym not in turbo_set:
+                continue  # Never remove non-turbo positions from PM
             self.pm.close_position(sym, exit_price=0, exit_reason="sync_removed")
             logger.info("  - Removed stale %s (not on broker)", sym)
             removed += 1
@@ -454,6 +467,8 @@ class TurboTrader:
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
         for symbol in list(self.pm.get_open_symbols()):
+            if symbol.upper() not in {s.upper() for s in SYMBOLS}:
+                continue  # Safety: never touch non-turbo symbols
             if not self.pm.has_position(symbol):
                 continue
             try:
@@ -485,8 +500,10 @@ class TurboTrader:
                 logger.error(f"Risk check error {symbol}: {e}")
 
     async def _eod_liquidate(self):
-        """Sell all open positions for mandatory end-of-day liquidation."""
+        """Sell all open TURBO positions for mandatory end-of-day liquidation."""
         positions = await self.broker.get_positions()
+        # Filter to turbo symbols only — never liquidate main trader's positions
+        positions = [p for p in positions if p.get("symbol", "").upper() in {s.upper() for s in SYMBOLS}]
         count = len(positions)
         if count == 0:
             logger.info("⏰ Mandatory EOD liquidation — no positions to close")
@@ -510,11 +527,12 @@ class TurboTrader:
         logger.info(f"⏰ Mandatory EOD liquidation — {count} positions closed.")
 
     async def shutdown(self):
-        """🚀 TURBO SHUTDOWN — Liquidate all positions and report final P&L."""
-        logger.info("🚀 TURBO SHUTDOWN — Liquidating all positions")
+        """🚀 TURBO SHUTDOWN — Liquidate all TURBO positions and report final P&L."""
+        logger.info("🚀 TURBO SHUTDOWN — Liquidating all turbo positions")
 
-        # Close all positions
+        # Close all TURBO positions only (never touch main trader's symbols)
         positions = await self.broker.get_positions()
+        positions = [p for p in positions if p.get("symbol", "").upper() in {s.upper() for s in SYMBOLS}]
         for p in positions:
             sym = p.get("symbol")
             qty = float(p.get("qty", 0))
