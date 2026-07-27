@@ -9,11 +9,34 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 
 from src.execution.broker import Broker, Order, OrderResult, OrderSide, OrderType
 
 logger = logging.getLogger(__name__)
+
+# ── Terminal (failed / dead) order statuses ───────────────────────────
+_TERMINAL_FAILURE_STATUSES = frozenset({
+    "rejected",
+    "canceled",
+    "expired",
+    "suspended",
+    "stopped",
+})
+
+
+def is_order_alive(status: str) -> bool:
+    """Return ``True`` if *status* means the order is still alive / accepted.
+
+    Terminal failure statuses (``rejected``, ``canceled``, ``expired``,
+    ``suspended``, ``stopped``) return ``False``.  Everything else —
+    including ``pending_new``, ``accepted``, ``new``, ``partially_filled``,
+    ``filled``, ``pending_cancel``, ``pending_replace``, ``calculated``,
+    ``held``, ``done_for_day`` — is considered alive.
+    """
+    clean = status.lower().removeprefix("orderstatus.")
+    return clean not in _TERMINAL_FAILURE_STATUSES
 
 
 class AlpacaBroker(Broker):
@@ -75,7 +98,9 @@ class AlpacaBroker(Broker):
     async def place_order(self, order: Order) -> OrderResult:
         """Convert an engine ``Order`` into an Alpaca request and submit it.
 
-        Supports MARKET, LIMIT, and STOP order types.
+        Supports MARKET, LIMIT, and STOP order types.  Generates an
+        idempotency key (``client_order_id``) if none is provided so that
+        Alpaca rejects duplicate submissions from restarted sessions.
         """
         from alpaca.trading.requests import (
             MarketOrderRequest,
@@ -88,12 +113,17 @@ class AlpacaBroker(Broker):
 
         side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
 
+        # ── Idempotency key ──────────────────────────────────────────
+        client_order_id = order.client_id or self._generate_client_order_id(
+            order.symbol, order.side
+        )
+
         common = {
             "symbol": order.symbol.upper(),
             "qty": order.quantity,
             "side": side,
             "time_in_force": TimeInForce.DAY,
-            "client_order_id": order.client_id,
+            "client_order_id": client_order_id,
         }
 
         if order.order_type == OrderType.MARKET:
@@ -110,11 +140,12 @@ class AlpacaBroker(Broker):
             raise ValueError(f"Unsupported order type: {order.order_type}")
 
         logger.info(
-            "Placing %s %s %s x %s",
+            "Placing %s %s %s x %s (client_id=%s)",
             order.order_type.value,
             order.side.value,
             order.symbol,
             order.quantity,
+            client_order_id,
         )
 
         try:
@@ -122,6 +153,23 @@ class AlpacaBroker(Broker):
                 self._trading_client.submit_order, req
             )
         except Exception as exc:
+            # If Alpaca rejects because this client_order_id was already used,
+            # the order is already live — treat it as success rather than rejected.
+            if _is_duplicate_client_order_id_error(exc):
+                logger.info(
+                    "Order idempotency key %s already exists — order is live",
+                    client_order_id,
+                )
+                return OrderResult(
+                    order_id=client_order_id,
+                    symbol=order.symbol,
+                    side=order.side,
+                    quantity=order.quantity,
+                    filled_quantity=0.0,
+                    filled_avg_price=None,
+                    status="accepted",  # order is alive, we just can't see fill yet
+                    created_at=datetime.now(),
+                )
             logger.error("Order submission failed: %s", exc)
             return OrderResult(
                 order_id="",
@@ -147,6 +195,36 @@ class AlpacaBroker(Broker):
         except Exception as exc:
             logger.error("Cancel order %s failed: %s", order_id, exc)
             return False
+
+    async def cancel_all_orders(self) -> int:
+        """Cancel **all** open orders and return the count cancelled.
+
+        Uses ``get_orders()`` with ``status=\"open\"`` to list open orders,
+        then cancels each one by its Alpaca ID.  Returns the number of
+        orders that were successfully cancelled.
+        """
+        logger.info("Fetching open orders for cancellation…")
+        try:
+            open_orders = await asyncio.to_thread(
+                self._trading_client.get_orders,
+                {"status": "open"},
+            )
+        except Exception as exc:
+            logger.error("Failed to fetch open orders: %s", exc)
+            return 0
+
+        if not open_orders:
+            logger.info("No open orders to cancel")
+            return 0
+
+        cancelled = 0
+        for o in open_orders:
+            oid = str(o.id)
+            if await self.cancel_order(oid):
+                cancelled += 1
+
+        logger.info("Cancelled %d / %d open orders", cancelled, len(open_orders))
+        return cancelled
 
     async def get_positions(self) -> list[dict]:
         """Return current open positions as a list of normalised dicts."""
@@ -244,6 +322,20 @@ class AlpacaBroker(Broker):
                 if alpaca_order.filled_avg_price
                 else None
             ),
-            status=str(alpaca_order.status).lower(),
+            status=str(alpaca_order.status).lower().removeprefix("orderstatus."),
             created_at=created,
         )
+
+    @staticmethod
+    def _generate_client_order_id(symbol: str, side: OrderSide) -> str:
+        """Generate a unique idempotency key for an order.
+
+        Format: ``algoflow_{SYMBOL}_{side}_{timestamp_ns}``
+        """
+        return f"algoflow_{symbol.upper()}_{side.value}_{time.monotonic_ns()}"
+
+
+def _is_duplicate_client_order_id_error(exc: Exception) -> bool:
+    """Return ``True`` if *exc* is an Alpaca "duplicate client order id" error."""
+    msg = str(exc).lower()
+    return "duplicate" in msg and "client_order_id" in msg
