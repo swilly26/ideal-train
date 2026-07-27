@@ -19,6 +19,7 @@ import pandas as pd
 
 from src.execution.broker import Broker, Order, OrderSide, OrderType
 from src.execution.position_manager import PositionManager
+from src.execution.alpaca_broker import is_order_alive
 from src.strategies.base import SignalType, Strategy, StrategyConfig
 from src.data.provider import DataProvider
 
@@ -248,7 +249,7 @@ class LiveTradingRunner:
                 result.order_id,
             )
 
-            if result.status in ("filled", "partially_filled", "new", "accepted"):
+            if is_order_alive(result.status):
                 filled_qty = result.filled_quantity if result.filled_quantity > 0 else quantity
                 self._position_manager.open_position(
                     symbol=symbol,

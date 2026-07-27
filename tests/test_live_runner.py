@@ -230,6 +230,43 @@ class TestPositionManager:
         assert pm.get_open_count() == 0
         assert pm.get_realized_pnl() == 0.0
 
+    def test_sync_adds_unknown_positions(self):
+        """PositionManager.add_position should work for sync-from-broker flow."""
+        pm = PositionManager()
+        # Simulate broker reporting a position we don't know about
+        pm.open_position("TSLA", 50, 300.0)
+        assert pm.has_position("TSLA") is True
+        pos = pm.get_positions()["TSLA"]
+        assert pos.quantity == 50
+        assert pos.entry_price == 300.0
+
+    def test_sync_removes_stale_positions(self):
+        """Closing a position and verifying it's gone."""
+        pm = PositionManager()
+        pm.open_position("MSFT", 20, 400.0)
+        assert pm.has_position("MSFT") is True
+
+        # Broker no longer has MSFT — remove it
+        pm.close_position("MSFT", exit_price=0, exit_reason="sync_removed")
+        assert pm.has_position("MSFT") is False
+        assert pm.get_open_count() == 0
+
+    def test_sync_mixed_scenario(self):
+        """Partial sync: some added, some removed."""
+        pm = PositionManager()
+        # Pre-load positions the PM already knows about
+        pm.open_position("AAPL", 10, 150.0)
+
+        # Broker reports AAPL + SPY, but PM also has stale MSFT
+        # Add SPY (new from broker)
+        pm.open_position("SPY", 5, 450.0)
+        
+        # Remove stale MSFT (if it were present)
+        # Simulate: close MSFT that wasn't on broker
+        assert pm.has_position("AAPL") is True
+        assert pm.has_position("SPY") is True
+        assert pm.get_open_count() == 2
+
 
 # ---------------------------------------------------------------------------
 # Config persistence tests

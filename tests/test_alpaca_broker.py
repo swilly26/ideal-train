@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.execution.broker import Order, OrderSide, OrderType
-from src.execution.alpaca_broker import AlpacaBroker
+from src.execution.alpaca_broker import AlpacaBroker, is_order_alive
 
 
 # ---------------------------------------------------------------------------
@@ -332,3 +332,169 @@ class TestAlpacaBrokerConfig:
             assert broker._api_key == "explicit"
             assert broker._secret_key == "explicit"
             assert broker._paper is True
+
+
+# ---------------------------------------------------------------------------
+# is_order_alive
+# ---------------------------------------------------------------------------
+
+
+class TestIsOrderAlive:
+    """Tests for the ``is_order_alive`` helper that classifies order statuses."""
+
+    @pytest.mark.parametrize("status", [
+        "pending_new",
+        "accepted",
+        "new",
+        "partially_filled",
+        "filled",
+        "pending_cancel",
+        "pending_replace",
+        "calculated",
+        "held",
+        "done_for_day",
+    ])
+    def test_alive_statuses_return_true(self, status):
+        """All non-terminal statuses should be considered alive."""
+        assert is_order_alive(status) is True, f"{status} should be alive"
+
+    @pytest.mark.parametrize("status", [
+        "rejected",
+        "canceled",
+        "expired",
+        "suspended",
+        "stopped",
+    ])
+    def test_terminal_statuses_return_false(self, status):
+        """Terminal failure statuses should be considered dead."""
+        assert is_order_alive(status) is False, f"{status} should NOT be alive"
+
+    def test_case_insensitive(self):
+        """Status matching should be case-insensitive."""
+        assert is_order_alive("PENDING_NEW") is True
+        assert is_order_alive("Rejected") is False
+        assert is_order_alive("FILLED") is True
+
+    def test_orderstatus_prefix_stripped(self):
+        """Statuses with the 'orderstatus.' prefix should also work."""
+        assert is_order_alive("orderstatus.pending_new") is True
+        assert is_order_alive("orderstatus.rejected") is False
+
+
+# ---------------------------------------------------------------------------
+# cancel_all_orders
+# ---------------------------------------------------------------------------
+
+
+class TestCancelAllOrders:
+    @pytest.mark.asyncio
+    async def test_cancel_all_empty(self, broker, mock_trading_client):
+        """When no open orders, return 0."""
+        mock_trading_client.get_orders.return_value = []
+        result = await broker.cancel_all_orders()
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_success(self, broker, mock_trading_client):
+        """All open orders should be cancelled."""
+        o1 = MagicMock()
+        o1.id = "order-1"
+        o2 = MagicMock()
+        o2.id = "order-2"
+        mock_trading_client.get_orders.return_value = [o1, o2]
+        mock_trading_client.cancel_order_by_id.return_value = None
+
+        result = await broker.cancel_all_orders()
+        assert result == 2
+        assert mock_trading_client.cancel_order_by_id.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_partial_failure(self, broker, mock_trading_client):
+        """Returns count of successfully cancelled ones."""
+        o1 = MagicMock()
+        o1.id = "order-1"
+        o2 = MagicMock()
+        o2.id = "order-2"
+        mock_trading_client.get_orders.return_value = [o1, o2]
+        mock_trading_client.cancel_order_by_id.side_effect = [
+            None,  # first succeeds
+            Exception("fail"),  # second fails
+        ]
+
+        result = await broker.cancel_all_orders()
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_fetch_failure(self, broker, mock_trading_client):
+        """If get_orders fails, return 0."""
+        mock_trading_client.get_orders.side_effect = Exception("fetch failed")
+        result = await broker.cancel_all_orders()
+        assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Idempotency keys (client_order_id)
+# ---------------------------------------------------------------------------
+
+
+class TestIdempotencyKeys:
+    @pytest.mark.asyncio
+    async def test_generates_client_order_id_when_none_provided(self, broker, mock_trading_client):
+        """When Order.client_id is None, place_order generates one."""
+        mock_order = MagicMock()
+        mock_order.id = "alpaca-id-1"
+        mock_order.symbol = "AAPL"
+        mock_order.side = "buy"
+        mock_order.qty = "10"
+        mock_order.filled_qty = "10"
+        mock_order.filled_avg_price = "150.00"
+        mock_order.status = "filled"
+        mock_order.created_at = datetime(2026, 1, 15, 10, 30, tzinfo=timezone.utc)
+        mock_trading_client.submit_order.return_value = mock_order
+
+        order = Order(symbol="AAPL", side=OrderSide.BUY, quantity=10)
+        # client_id is None
+        assert order.client_id is None
+
+        await broker.place_order(order)
+
+        # Verify the submitted request had a client_order_id
+        call_args = mock_trading_client.submit_order.call_args[0][0]
+        cid = call_args.client_order_id
+        assert cid is not None
+        assert cid.startswith("algoflow_AAPL_BUY_")
+
+    @pytest.mark.asyncio
+    async def test_respects_explicit_client_id(self, broker, mock_trading_client):
+        """When Order.client_id is set, it should be passed through."""
+        mock_order = MagicMock()
+        mock_order.id = "alpaca-id-1"
+        mock_order.symbol = "AAPL"
+        mock_order.side = "buy"
+        mock_order.qty = "10"
+        mock_order.filled_qty = "10"
+        mock_order.filled_avg_price = "150.00"
+        mock_order.status = "filled"
+        mock_order.created_at = datetime(2026, 1, 15, 10, 30, tzinfo=timezone.utc)
+        mock_trading_client.submit_order.return_value = mock_order
+
+        order = Order(symbol="AAPL", side=OrderSide.BUY, quantity=10, client_id="my-custom-id")
+
+        await broker.place_order(order)
+
+        call_args = mock_trading_client.submit_order.call_args[0][0]
+        assert call_args.client_order_id == "my-custom-id"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_client_order_id_treated_as_success(self, broker, mock_trading_client):
+        """Duplicate client_order_id errors should return 'accepted' status."""
+        mock_trading_client.submit_order.side_effect = Exception(
+            "duplicate client_order_id detected"
+        )
+
+        order = Order(symbol="AAPL", side=OrderSide.BUY, quantity=10)
+        result = await broker.place_order(order)
+
+        assert result.status == "accepted"
+        assert result.symbol == "AAPL"
+        assert result.order_id != ""  # should be the client_order_id
