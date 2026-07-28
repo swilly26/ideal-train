@@ -19,6 +19,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
+
 # ── Project imports ────────────────────────────────────────────────
 import src.strategies  # registers strategies
 from src.data.yfinance_provider import YFinanceProvider
@@ -302,7 +304,6 @@ class TurboTrader:
 
     async def _tick(self, tick_num: int):
         """One polling cycle: fetch → dual-strategy signals → execute."""
-        import pandas as pd
 
         now = datetime.now(timezone.utc)
         lookback = now - timedelta(minutes=60)  # deeper lookback for MA/RSI
