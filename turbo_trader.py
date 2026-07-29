@@ -499,6 +499,12 @@ class TurboTrader:
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
 
+        # GTC orders require whole shares; fractional orders must be DAY.
+        qty = int(qty)
+        if qty == 0:
+            logger.warning("🛡️  STOP %s: position too small for protective stop (qty < 1 share)", symbol.upper())
+            return
+
         stop_price = round(entry_price * (1 - STRATEGY_CONFIG.stop_loss_pct), 2)
         sym = symbol.upper()
         client_id = _turbo_stop_client_id(sym)
@@ -611,7 +617,7 @@ class TurboTrader:
                 "(%s shares @ $%.2f) — placing one now",
                 sym, pos.quantity, pos.entry_price,
             )
-            await self._place_protective_stop(sym, pos.quantity, pos.entry_price)
+            await self._place_protective_stop(sym, int(pos.quantity), pos.entry_price)
 
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
