@@ -29,6 +29,7 @@ from src.execution.broker import Order, OrderSide, OrderType
 from src.execution.position_manager import PositionManager
 from src.strategies.base import Signal, SignalType, Strategy, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
+from src.strategies.liquidity_sweep import LiquiditySweepStrategy
 from src.strategies.indicators import sma, z_score
 
 # ── Configuration ──────────────────────────────────────────────────
@@ -195,6 +196,9 @@ class TurboTrader:
         self.broker = AlpacaBroker()
         self.provider = YFinanceProvider()
         self.mean_reversion = MeanReversionStrategy(config=STRATEGY_CONFIG)
+        self.liquidity_sweep = LiquiditySweepStrategy(symbols=SYMBOLS)
+        self.levels_cache: dict[str, dict[str, float | None]] = {}
+        self._ls_symbols: set[str] = set()  # symbols entered via liquidity sweep
         self.pm = PositionManager(STRATEGY_CONFIG)
         self.day_trades: list[dict] = []
         self.start_equity = 0.0
@@ -261,7 +265,7 @@ class TurboTrader:
         logger.info("=" * 60)
         logger.info("🚀 AlgoFlow TURBO Live Trader — STARTING")
         logger.info(f"Symbols: {SYMBOLS} (3x Leveraged ETFs)")
-        logger.info(f"Strategy: MeanReversion + Momentum | Confidence ≥ {CONFIDENCE_THRESHOLD}")
+        logger.info(f"Strategy: MeanReversion + Momentum + LiquiditySweep | Confidence ≥ {CONFIDENCE_THRESHOLD}")
         logger.info(f"Max positions: {MAX_POSITIONS} | Size: {POSITION_SIZE_PCT*100:.0f}% equity")
         logger.info(f"Stop-loss: {STRATEGY_CONFIG.stop_loss_pct*100:.0f}% | "
                     f"Take-profit: {STRATEGY_CONFIG.take_profit_pct*100:.0f}%")
@@ -284,6 +288,10 @@ class TurboTrader:
 
         # Wait for open
         await self.wait_for_market_open()
+
+        # ── Calculate liquidity sweep levels ────────────────────────
+        await self.liquidity_sweep.calculate_levels(self.provider)
+        self.levels_cache = self.liquidity_sweep.levels
 
         # ── Sync positions from Alpaca at startup ────────────────────
         await self._sync_positions_from_broker()
@@ -316,10 +324,14 @@ class TurboTrader:
             await self.shutdown()
 
     async def _tick(self, tick_num: int):
-        """One polling cycle: fetch → dual-strategy signals → execute."""
+        """One polling cycle: fetch → triple-strategy signals → execute."""
 
         now = datetime.now(timezone.utc)
         lookback = now - timedelta(minutes=60)  # deeper lookback for MA/RSI
+
+        # Track which symbols have active liquidity sweep positions
+        # (prune any that have been closed)
+        self._ls_symbols &= set(self.pm.get_open_symbols())
 
         for symbol in SYMBOLS:
             # Skip if at max positions and don't hold this one
@@ -334,7 +346,7 @@ class TurboTrader:
                 if data.empty or len(data) < 25:
                     continue
 
-                # ── Generate signals from both strategies ────────────
+                # ── Generate signals from all three strategies ───────
                 mr_signals = self.mean_reversion.generate_signals(data)
                 mom_signals = _generate_momentum_signals(
                     data,
@@ -344,10 +356,32 @@ class TurboTrader:
                     rsi_period=MOMENTUM_CONFIG["rsi_period"],
                     rsi_threshold=MOMENTUM_CONFIG["rsi_threshold"],
                 )
+                ls_signals: list[Signal] = []
+                symbol_levels = self.levels_cache.get(symbol.upper(), {})
+                if symbol_levels:
+                    # Inject the symbol name into levels so generate_signals can read it
+                    symbol_levels["_symbol"] = symbol
+                    ls_signals = self.liquidity_sweep.generate_signals(data, symbol_levels)
+
+                # ── Safety: filter LS signals ────────────────────────
+                filtered_ls: list[Signal] = []
+                for sig in ls_signals:
+                    sym_up = sig.symbol.upper()
+                    # Max 1 liquidity sweep position at a time
+                    if sig.signal_type == SignalType.BUY and len(self._ls_symbols) >= 1:
+                        continue
+                    # Skip if LS signal conflicts with existing positions
+                    if sig.signal_type == SignalType.BUY:
+                        if self.pm.has_position(sym_up):
+                            continue
+                    elif sig.signal_type == SignalType.SELL:
+                        if not self.pm.has_position(sym_up):
+                            continue
+                    filtered_ls.append(sig)
 
                 # Pick the highest-confidence signal that meets threshold
                 best_signal: Signal | None = None
-                for sig in (mr_signals + mom_signals):
+                for sig in (mr_signals + mom_signals + filtered_ls):
                     if sig.confidence < CONFIDENCE_THRESHOLD:
                         continue
                     if best_signal is None or sig.confidence > best_signal.confidence:
@@ -361,8 +395,13 @@ class TurboTrader:
 
                 if best_signal.signal_type == SignalType.BUY:
                     await self._handle_buy(symbol, current_price, best_signal.confidence, strategy_name)
+                    # Track liquidity sweep entries for the max-1-LS-position guard
+                    if strategy_name == "liquidity_sweep":
+                        self._ls_symbols.add(symbol.upper())
                 elif best_signal.signal_type == SignalType.SELL:
                     await self._handle_sell(symbol, current_price, best_signal.confidence, strategy_name)
+                    # If we sold an LS position, remove from tracking
+                    self._ls_symbols.discard(symbol.upper())
 
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {e}")
