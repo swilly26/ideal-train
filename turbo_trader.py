@@ -24,7 +24,7 @@ import pandas as pd
 # ── Project imports ────────────────────────────────────────────────
 import src.strategies  # registers strategies
 from src.data.yfinance_provider import YFinanceProvider
-from src.execution.alpaca_broker import AlpacaBroker, is_order_alive
+from src.execution.alpaca_broker import AlpacaBroker, is_order_alive, _is_duplicate_client_order_id_error
 from src.execution.broker import Order, OrderSide, OrderType
 from src.execution.position_manager import PositionManager
 from src.strategies.base import Signal, SignalType, Strategy, StrategyConfig
@@ -180,6 +180,14 @@ def _turbo_client_id(symbol: str, side: OrderSide) -> str:
     return f"algoflow_TURBO_{symbol.upper()}_{side.value}_{time.monotonic_ns()}"
 
 
+def _turbo_stop_client_id(symbol: str) -> str:
+    """Generate a unique idempotency key for turbo protective stop orders.
+
+    Format: ``algoflow_TURBO_{SYMBOL}_STOP_{timestamp_ns}``
+    """
+    return f"algoflow_TURBO_{symbol.upper()}_STOP_{time.monotonic_ns()}"
+
+
 # ── TurboTrader ────────────────────────────────────────────────────
 
 class TurboTrader:
@@ -264,6 +272,8 @@ class TurboTrader:
         # NOTE: cancel_all_orders() cancels EVERY open order on the account
         # (both turbo's AND the main trader's). This is a known side effect of
         # sharing an Alpaca paper account. We log a warning so operators are aware.
+        # This also cancels any stale protective stop orders from prior sessions,
+        # which will be re-created below during position sync.
         logger.info("Cancelling any stale orders from prior sessions…")
         cancelled = await self.broker.cancel_all_orders()
         logger.warning(
@@ -277,6 +287,9 @@ class TurboTrader:
 
         # ── Sync positions from Alpaca at startup ────────────────────
         await self._sync_positions_from_broker()
+
+        # ── Ensure inherited positions have protective stops ────────
+        await self._ensure_protective_stops()
 
         tick = 0
         try:
@@ -383,12 +396,16 @@ class TurboTrader:
         result = await self.broker.place_order(order)
 
         if is_order_alive(result.status):
-            self.pm.open_position(symbol, qty, price)
+            # Use the fill price if available, otherwise fall back to the signal price
+            fill_price = result.filled_avg_price if result.filled_avg_price else price
+            self.pm.open_position(symbol, qty, fill_price)
             strat_tag = f" [{strategy}]" if strategy else ""
             logger.info(
-                f"🚀 BUY  {symbol}: {qty:.1f} shares @ ${price:.2f} = ${value:,.2f} | "
+                f"🚀 BUY  {symbol}: {qty:.1f} shares @ ${fill_price:.2f} = ${value:,.2f} | "
                 f"conf={confidence:.2f}{strat_tag} | order={result.order_id[:8]}"
             )
+            # ── Place GTC protective stop at broker ─────────────────
+            await self._place_protective_stop(symbol, qty, fill_price)
         else:
             logger.warning(f"❌ BUY {symbol} REJECTED: {result.status}")
 
@@ -401,6 +418,10 @@ class TurboTrader:
             return
         qty = pos.quantity
         entry = pos.entry_price
+
+        # ── Cancel protective stop before selling ───────────────────
+        await self._cancel_protective_stops(symbol)
+
         order = Order(
             symbol=symbol,
             side=OrderSide.SELL,
@@ -465,6 +486,133 @@ class TurboTrader:
             len(broker_symbols), added, removed,
         )
 
+    # ── Broker-level protective stops ────────────────────────────────
+
+    async def _place_protective_stop(self, symbol: str, qty: float, entry_price: float):
+        """Place a GTC stop-loss sell order at the broker.
+
+        This order survives process death and sandbox cycling — Alpaca holds
+        it until triggered or cancelled.  The stop price is set at
+        ``entry_price * (1 - stop_loss_pct)`` (currently 6% below entry).
+        """
+        from alpaca.trading.requests import StopOrderRequest
+        from alpaca.trading.enums import OrderSide as AlpacaSide
+        from alpaca.trading.enums import TimeInForce
+
+        stop_price = round(entry_price * (1 - STRATEGY_CONFIG.stop_loss_pct), 2)
+        sym = symbol.upper()
+        client_id = _turbo_stop_client_id(sym)
+
+        req = StopOrderRequest(
+            symbol=sym,
+            qty=qty,
+            side=AlpacaSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            stop_price=stop_price,
+            client_order_id=client_id,
+        )
+
+        try:
+            result = await asyncio.to_thread(
+                self.broker._trading_client.submit_order, req
+            )
+            logger.info(
+                "🛡️  STOP %s: GTC stop-loss at $%.2f (entry=%.2f, -%.0f%%) — order=%s",
+                sym, stop_price, entry_price, STRATEGY_CONFIG.stop_loss_pct * 100,
+                str(result.id)[:8],
+            )
+        except Exception as exc:
+            if _is_duplicate_client_order_id_error(exc):
+                logger.info("🛡️  STOP %s: already placed (duplicate client_order_id)", sym)
+            else:
+                logger.error("🛡️  STOP %s: failed to place — %s", sym, exc)
+
+    async def _cancel_protective_stops(self, symbol: str):
+        """Cancel all open orders for *symbol* — stop-loss and take-profit.
+
+        Called before selling a position so the GTC stop doesn't trigger
+        after the position is closed.
+        """
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        sym = symbol.upper()
+        try:
+            flt = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                symbols=[sym],
+            )
+            open_orders = await asyncio.to_thread(
+                lambda: self.broker._trading_client.get_orders(filter=flt),
+            )
+        except Exception as exc:
+            logger.warning("Failed to fetch open orders for %s: %s", sym, exc)
+            return
+
+        cancelled = 0
+        for o in open_orders:
+            try:
+                await asyncio.to_thread(
+                    self.broker._trading_client.cancel_order_by_id, str(o.id)
+                )
+                cancelled += 1
+                logger.debug("  Cancelled order %s for %s", str(o.id)[:8], sym)
+            except Exception as exc:
+                logger.warning("  Failed to cancel order %s: %s", str(o.id)[:8], exc)
+
+        if cancelled:
+            logger.info("🗑️  Cancelled %d protective order(s) for %s", cancelled, sym)
+
+    async def _ensure_protective_stops(self):
+        """Ensure every inherited turbo position has a GTC protective stop.
+
+        Called after ``_sync_positions_from_broker()`` at startup.  For
+        positions that survived a sandbox cycle, we check whether a stop
+        order already exists at Alpaca.  If not, we place a fresh one.
+        """
+        turbo_set = {s.upper() for s in SYMBOLS}
+        if not self.pm.get_open_symbols():
+            return
+
+        # Fetch all open orders once so we can check stop coverage
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        try:
+            flt = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            open_orders = await asyncio.to_thread(
+                lambda: self.broker._trading_client.get_orders(filter=flt),
+            )
+        except Exception as exc:
+            logger.warning("Cannot verify protective stops — order fetch failed: %s", exc)
+            return
+
+        # Build a set of symbols that already have an open sell order
+        covered_symbols: set[str] = set()
+        for o in open_orders:
+            o_sym = str(o.symbol).upper()
+            o_side = str(o.side).upper()
+            if o_sym in turbo_set and o_side == "SELL":
+                covered_symbols.add(o_sym)
+
+        for sym in list(self.pm.get_open_symbols()):
+            if sym not in turbo_set:
+                continue
+            pos = self.pm.get_positions().get(sym)
+            if pos is None:
+                continue
+
+            if sym in covered_symbols:
+                logger.info("🛡️  %s: existing stop order found — covered", sym)
+                continue
+
+            logger.warning(
+                "🛡️  %s: NO protective stop found for inherited position "
+                "(%s shares @ $%.2f) — placing one now",
+                sym, pos.quantity, pos.entry_price,
+            )
+            await self._place_protective_stop(sym, pos.quantity, pos.entry_price)
+
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
         for symbol in list(self.pm.get_open_symbols()):
@@ -514,6 +662,8 @@ class TurboTrader:
             sym = p.get("symbol")
             qty = float(p.get("qty", 0))
             if qty > 0:
+                # ── Cancel protective stop before liquidating ─────────
+                await self._cancel_protective_stops(sym)
                 logger.info(f"⏰ EOD closing {sym}: {qty} shares...")
                 order = Order(
                     symbol=sym,
@@ -538,6 +688,8 @@ class TurboTrader:
             sym = p.get("symbol")
             qty = float(p.get("qty", 0))
             if qty > 0:
+                # ── Cancel protective stop before liquidating ─────────
+                await self._cancel_protective_stops(sym)
                 logger.info(f"Closing {sym}: {qty} shares...")
                 order = Order(
                     symbol=sym,
