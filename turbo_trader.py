@@ -495,6 +495,7 @@ class TurboTrader:
         it until triggered or cancelled.  The stop price is set at
         ``entry_price * (1 - stop_loss_pct)`` (currently 6% below entry).
         """
+        await asyncio.sleep(2.0)
         from alpaca.trading.requests import StopOrderRequest
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
