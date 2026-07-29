@@ -32,12 +32,12 @@ from src.strategies.mean_reversion import MeanReversionStrategy
 from src.strategies.indicators import sma, z_score
 
 # ── Configuration ──────────────────────────────────────────────────
-SYMBOLS = ["SOXL", "TQQQ", "FNGU", "LABU", "SPXL"]  # 3x leveraged ETFs
+SYMBOLS = ["SOXL", "TQQQ", "FNGU", "SPXL"]  # 3x leveraged ETFs (LABU dropped — data errors)
 CHECK_INTERVAL = 60
 CONFIDENCE_THRESHOLD = 0.4   # Lower threshold = more entries
 MAX_POSITIONS = 3            # Stay focused — fewer, bigger bets
 POSITION_SIZE_PCT = 0.25     # 25% per position (only 3 max = 75% deployed)
-MANDATORY_CLOSE_MINUTES = 5  # Liquidate all positions 5 min before market close
+MANDATORY_CLOSE_MINUTES = 30  # Liquidate all positions 30 min before market close
 
 STRATEGY_CONFIG = StrategyConfig(
     entry_threshold=0.5,
@@ -50,10 +50,10 @@ STRATEGY_CONFIG = StrategyConfig(
 
 # Momentum strategy config (separate thresholds for the dual-strategy approach)
 MOMENTUM_CONFIG = {
-    "ma_period": 20,
-    "trend_periods": 3,         # close > close N periods ago
+    "ma_period": 10,            # Shorter MA for faster crossover signals
+    "trend_periods": 5,         # Periods for trend strength (statistical significance)
     "rsi_period": 14,
-    "rsi_threshold": 50,        # RSI > 50 = bullish momentum
+    "rsi_threshold": 40,        # RSI > 40 = momentum not oversold (lowered from 50)
 }
 
 # Market close in UTC (4 PM ET = 20:00 UTC standard, 20:00 UTC year-round
@@ -96,15 +96,15 @@ def _compute_rsi(close: "pd.Series", period: int = 14) -> "pd.Series":
 def _generate_momentum_signals(
     data: "pd.DataFrame",
     symbol: str,
-    ma_period: int = 20,
-    trend_periods: int = 3,
+    ma_period: int = 10,
+    trend_periods: int = 5,
     rsi_period: int = 14,
-    rsi_threshold: float = 50.0,
+    rsi_threshold: float = 40.0,
 ) -> "list[Signal]":
     """Generate momentum signals for leveraged ETFs.
 
-    - BUY: price above MA, rising (close > close N periods ago), RSI > threshold.
-    - SELL: price crosses below MA (was above, now below).
+    - BUY: price above MA AND RSI > threshold (momentum confirmed, not oversold).
+    - SELL: price crosses below MA (was above, now below), OR price < MA AND RSI < 60.
     """
     close = data["close"]
     ma = sma(close, period=ma_period)
@@ -123,22 +123,16 @@ def _generate_momentum_signals(
         prev_ma = ma.iloc[idx - 1]
         ts = data.index[idx]
 
-        # Price must exist N periods ago for trend check
-        if idx >= trend_periods:
-            close_n_ago = close.iloc[idx - trend_periods]
-        else:
-            close_n_ago = None
-
-        # ── BUY signal: price > MA, rising trend, RSI > 50 ──────────
-        if (cur_close > cur_ma
-                and close_n_ago is not None
-                and cur_close > close_n_ago
-                and cur_rsi > rsi_threshold):
-            # Confidence scales with how far above MA and how strong the trend
-            trend_strength = (cur_close - close_n_ago) / (abs(close_n_ago) + 1e-9)
+        # ── BUY signal: price > MA AND RSI > 40 (simplified — no trend double-count) ──
+        if cur_close > cur_ma and cur_rsi > rsi_threshold:
             ma_distance = (cur_close - cur_ma) / (abs(cur_ma) + 1e-9)
-            confidence = min(1.0, max(0.0, (ma_distance + trend_strength) / 0.04))
-            signals.append(Signal(
+            # Confidence: sigmoid-like blend of MA distance and RSI strength
+            # Produces gradients between 0.3 and 1.0 instead of all 1.0
+            ma_score = min(1.0, ma_distance * 25)       # ma_distance typically 0.005-0.04
+            rsi_score = max(0.0, (cur_rsi - 40) / 40)   # 0 at RSI=40, 1 at RSI=80
+            confidence = round(0.3 + 0.7 * (ma_score + rsi_score) / 2, 4)
+            confidence = min(1.0, max(0.0, confidence))
+            signal = Signal(
                 symbol=symbol,
                 timestamp=ts,
                 signal_type=SignalType.BUY,
@@ -146,26 +140,36 @@ def _generate_momentum_signals(
                 metadata={
                     "strategy": "momentum",
                     "ma_distance": round(ma_distance, 6),
-                    "trend_strength": round(trend_strength, 6),
                     "rsi": round(cur_rsi, 2),
                 },
-            ))
+            )
+            signals.append(signal)
+            logger.info(
+                "🔍 MOMENTUM %s: BUY conf=%.4f (price=%.2f, MA=%.2f, RSI=%.1f)",
+                symbol, confidence, cur_close, cur_ma, cur_rsi,
+            )
 
-        # ── SELL signal: price crosses BELOW MA ─────────────────────
-        elif cur_close < cur_ma and prev_close >= prev_ma:
-            # Cross below MA — momentum broken
+        # ── SELL signal: MA cross-under OR price < MA and weak RSI ──
+        elif (cur_close < cur_ma and prev_close >= prev_ma) or \
+             (cur_close < cur_ma and cur_rsi < 60):
+            # Cross below MA — momentum broken, or price below MA with weakening RSI
             confidence = min(1.0, abs(cur_close - cur_ma) / (abs(cur_ma) + 1e-9) * 10)
-            signals.append(Signal(
+            signal = Signal(
                 symbol=symbol,
                 timestamp=ts,
                 signal_type=SignalType.SELL,
                 confidence=round(confidence, 6),
                 metadata={
                     "strategy": "momentum",
-                    "cross_below_ma": True,
+                    "cross_below_ma": bool(cur_close < cur_ma and prev_close >= prev_ma),
                     "rsi": round(cur_rsi, 2),
                 },
-            ))
+            )
+            signals.append(signal)
+            logger.info(
+                "🔍 MOMENTUM %s: SELL conf=%.4f (price=%.2f, MA=%.2f, RSI=%.1f)",
+                symbol, confidence, cur_close, cur_ma, cur_rsi,
+            )
 
     return signals
 
@@ -463,14 +467,36 @@ class TurboTrader:
             if sym not in turbo_set:
                 continue  # Ignore non-turbo symbols (e.g. main trader's positions)
             if sym not in pm_symbols:
+                entry_price = pos_data["avg_entry_price"]
+                current_price = float(pos_data.get("current_price", entry_price))
+                qty = pos_data["qty"]
+
+                # ── Cleanup: sell inherited underwater positions (>2% loss) ──
+                if current_price > 0 and entry_price > 0:
+                    pnl_pct = (current_price - entry_price) / entry_price
+                    if pnl_pct < -0.02:
+                        logger.info(
+                            "🧹 Cleanup SELL %s: inherited at $%.2f, now $%.2f = %.1f%%",
+                            sym, entry_price, current_price, pnl_pct * 100,
+                        )
+                        order = Order(
+                            symbol=sym,
+                            side=OrderSide.SELL,
+                            quantity=qty,
+                            order_type=OrderType.MARKET,
+                            client_id=_turbo_client_id(sym, OrderSide.SELL),
+                        )
+                        await self.broker.place_order(order)
+                        continue  # Don't add to PM — we just sold it
+
                 self.pm.open_position(
                     symbol=sym,
-                    quantity=pos_data["qty"],
-                    entry_price=pos_data["avg_entry_price"],
+                    quantity=qty,
+                    entry_price=entry_price,
                 )
                 logger.info(
                     "  + Added %s: %s shares @ $%.2f (sync)",
-                    sym, pos_data["qty"], pos_data["avg_entry_price"],
+                    sym, qty, entry_price,
                 )
                 added += 1
 
