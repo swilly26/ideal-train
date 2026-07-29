@@ -14,11 +14,13 @@ registry = StrategyRegistry()
 from src.strategies.momentum import MomentumStrategy  # noqa: E402
 from src.strategies.mean_reversion import MeanReversionStrategy  # noqa: E402
 from src.strategies.breakout import BreakoutStrategy  # noqa: E402
+from src.strategies.liquidity_sweep import LiquiditySweepStrategy  # noqa: E402
 
 # … and register them so the optimizer can discover them at runtime.
 registry.register("momentum", MomentumStrategy)
 registry.register("mean_reversion", MeanReversionStrategy)
 registry.register("breakout", BreakoutStrategy)
+registry.register("liquidity_sweep", LiquiditySweepStrategy)
 
 __all__ = [
     "Signal",
@@ -30,4 +32,5 @@ __all__ = [
     "MomentumStrategy",
     "MeanReversionStrategy",
     "BreakoutStrategy",
+    "LiquiditySweepStrategy",
 ]
