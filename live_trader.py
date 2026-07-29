@@ -26,9 +26,16 @@ from src.strategies.mean_reversion import MeanReversionStrategy
 # ── Configuration ──────────────────────────────────────────────────
 SYMBOLS = ["AAPL", "MSFT", "SPY", "TSLA"]
 CHECK_INTERVAL = 60  # seconds between polls
-CONFIDENCE_THRESHOLD = 0.5
+# NOTE: Analysis shows low-confidence trades (0.4-0.6 bucket) average +$33.46 —
+# actually MORE profitable than high-confidence trades. More signals = more opportunities.
+CONFIDENCE_THRESHOLD = 0.3
 MAX_POSITIONS = 4
 POSITION_SIZE_PCT = 0.10  # 10% of equity per position
+
+# Market close in UTC (4 PM ET = 20:00 UTC)
+MARKET_CLOSE_UTC_HOUR = 20
+MARKET_CLOSE_UTC_MINUTE = 0
+MANDATORY_CLOSE_MINUTES = 15  # Liquidate all positions 15 min before close
 
 STRATEGY_CONFIG = StrategyConfig(
     entry_threshold=0.5,       # z-score to enter (lower = more trades)
@@ -128,6 +135,14 @@ class LiveTrader:
         try:
             while True:
                 tick += 1
+
+                # ── EOD mandatory liquidation check ──────────────────
+                if self._is_near_close():
+                    logger.info(f"⏰ Within {MANDATORY_CLOSE_MINUTES} min of close — "
+                                "triggering mandatory EOD liquidation")
+                    await self._eod_liquidate()
+                    break
+
                 market_open = await self.broker.is_market_open()
                 if not market_open:
                     logger.info("⏹️  Market closed — shutting down")
@@ -266,6 +281,44 @@ class LiveTrader:
             "Synced %d positions from broker (%d added, %d removed)",
             len(broker_symbols), added, removed,
         )
+
+    # ── EOD mandatory liquidation ─────────────────────────────────────
+
+    @staticmethod
+    def _is_near_close() -> bool:
+        """Return True if we are within MANDATORY_CLOSE_MINUTES of market close.
+
+        Market close is 20:00 UTC (4 PM ET).  We trigger mandatory liquidation
+        MANDATORY_CLOSE_MINUTES before that.
+        """
+        now = datetime.now(timezone.utc)
+        close_time = now.replace(
+            hour=MARKET_CLOSE_UTC_HOUR,
+            minute=MARKET_CLOSE_UTC_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+        seconds_until_close = (close_time - now).total_seconds()
+        return 0 <= seconds_until_close <= (MANDATORY_CLOSE_MINUTES * 60)
+
+    async def _eod_liquidate(self):
+        """Liquidate ALL broker positions for mandatory end-of-day close."""
+        positions = await self.broker.get_positions()
+        count = len(positions)
+        if count == 0:
+            logger.info("⏰ Mandatory EOD liquidation — no positions to close")
+            return
+
+        for p in positions:
+            sym = p.get("symbol")
+            qty = float(p.get("qty", 0))
+            if qty > 0:
+                logger.info(f"⏰ EOD closing {sym}: {qty} shares...")
+                order = Order(symbol=sym, side=OrderSide.SELL, quantity=qty, order_type=OrderType.MARKET)
+                await self.broker.place_order(order)
+                self.pm.close_position(sym, exit_price=float(p.get("current_price", 0)), exit_reason="eod")
+
+        logger.info(f"⏰ Mandatory EOD liquidation — {count} positions closed.")
 
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
