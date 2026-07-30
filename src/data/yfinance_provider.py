@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import yfinance as yf
@@ -32,6 +32,11 @@ _TIMEFRAME_MAP: dict[str, str] = {
     "1month": "1mo",
     "1mo": "1mo",
 }
+
+# Maximum seconds to wait for a single yfinance download before timing out.
+# A hung yfinance call blocks a thread in the default executor pool forever;
+# this timeout lets us recover gracefully.
+YFINANCE_TIMEOUT_SEC = 20
 
 
 class YFinanceProvider(DataProvider):
@@ -78,25 +83,53 @@ class YFinanceProvider(DataProvider):
         """
         yf_interval = _TIMEFRAME_MAP.get(timeframe, timeframe)
 
-        try:
-            df = await asyncio.to_thread(
-                yf.download,
-                tickers=symbol,
-                start=start,
-                end=end,
-                interval=yf_interval,
-                progress=False,
-                auto_adjust=True,
-                multi_level_index=False,
-                threads=False,
-            )
-        except Exception as exc:
-            logger.error("Yahoo Finance download failed for %s: %s", symbol, exc)
-            raise ValueError(
-                f"Failed to fetch data for {symbol}: {exc}"
-            ) from exc
+        # Attempt the requested timeframe first; on timeout or empty data
+        # for intraday timeframes, automatically fall back to 5m → 15m.
+        fallback_intervals: list[str] = []
+        if timeframe in ("1min", "1m"):
+            fallback_intervals = ["5m", "15m"]
+        elif timeframe in ("5min", "5m"):
+            fallback_intervals = ["15m"]
 
-        if df is None or df.empty:
+        for attempt, interval in enumerate([yf_interval] + fallback_intervals):
+            try:
+                df = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        yf.download,
+                        tickers=symbol,
+                        start=start,
+                        end=end,
+                        interval=interval,
+                        progress=False,
+                        auto_adjust=True,
+                        multi_level_index=False,
+                        threads=False,
+                    ),
+                    timeout=YFINANCE_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Yahoo Finance download timed out for %s (%s) after %ds",
+                    symbol, interval, YFINANCE_TIMEOUT_SEC,
+                )
+                continue  # try next fallback interval
+            except Exception as exc:
+                logger.error("Yahoo Finance download failed for %s (%s): %s", symbol, interval, exc)
+                if attempt == 0 and fallback_intervals:
+                    continue  # try fallback
+                raise ValueError(
+                    f"Failed to fetch data for {symbol}: {exc}"
+                ) from exc
+
+            if df is not None and not df.empty:
+                if attempt > 0:
+                    logger.info(
+                        "Fallback: using %s data for %s after %s failed",
+                        interval, symbol, yf_interval,
+                    )
+                break  # got data — stop trying fallbacks
+        else:
+            # All attempts exhausted
             raise ValueError(
                 f"No data returned for {symbol} between {start} and {end}. "
                 f"The ticker may be invalid or the date range may have no trading days."

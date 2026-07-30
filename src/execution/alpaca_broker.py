@@ -205,9 +205,13 @@ class AlpacaBroker(Broker):
         """
         logger.info("Fetching open orders for cancellation…")
         try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+
+            flt = GetOrdersRequest(status=QueryOrderStatus.OPEN)
             open_orders = await asyncio.to_thread(
                 self._trading_client.get_orders,
-                {"status": "open"},
+                flt,
             )
         except Exception as exc:
             logger.error("Failed to fetch open orders: %s", exc)
