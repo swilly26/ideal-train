@@ -127,9 +127,6 @@ class LiveTrader:
         cancelled = await self.broker.cancel_all_orders()
         logger.info(f"Cancelled {cancelled} stale order(s)")
 
-        # Wait for open
-        await self.wait_for_market_open()
-
         # ── Layer 2: Sync positions from Alpaca at startup ───────────
         logger.info("STEP 1/3: Syncing positions from broker…")
         await self._sync_positions_from_broker()
@@ -141,6 +138,12 @@ class LiveTrader:
             pos = self.pm.get_positions().get(sym)
             if pos:
                 logger.info("  Inherited: %s x %s @ $%.2f", pos.quantity, sym, pos.entry_price)
+
+        # ── Post-startup stale position cleanup ──────────────────────
+        await self._post_startup_cleanup()
+
+        # Wait for open
+        await self.wait_for_market_open()
 
         logger.info("STEP 2/3: Entering main tick loop…")
         tick = 0
@@ -317,6 +320,51 @@ class LiveTrader:
             "Synced %d positions from broker (%d added, %d removed)",
             len(broker_symbols), added, removed,
         )
+
+    # ── Post-startup stale position cleanup ────────────────────────────
+
+    async def _post_startup_cleanup(self):
+        """Liquidate stale positions if trader starts while market is closed.
+
+        If the market is closed (e.g. after a crash/restart/sandbox cycle
+        that missed the regular EOD window) and there are open positions
+        at the broker, liquidate them immediately so nothing hangs overnight.
+        """
+        try:
+            if await self.broker.is_market_open():
+                return  # Market is open — normal trading, no cleanup needed
+
+            positions = await self.broker.get_positions()
+            if not positions:
+                return
+
+            logger.info(
+                "🧹 Post-close cleanup: liquidating %d stale position(s) from previous session",
+                len(positions),
+            )
+            for p in positions:
+                sym = p.get("symbol")
+                qty = float(p.get("qty", 0))
+                if qty > 0:
+                    logger.info("🧹 Cleanup SELL %s: %s shares", sym, qty)
+                    order = Order(
+                        symbol=sym,
+                        side=OrderSide.SELL,
+                        quantity=qty,
+                        order_type=OrderType.MARKET,
+                    )
+                    await self.broker.place_order(order)
+                    self.pm.close_position(
+                        sym,
+                        exit_price=float(p.get("current_price", 0)),
+                        exit_reason="post_close_cleanup",
+                    )
+            logger.info(
+                "🧹 Post-close cleanup complete — %d position(s) liquidated",
+                len(positions),
+            )
+        except Exception:
+            logger.exception("🧹 Post-close cleanup failed — continuing startup")
 
     # ── EOD mandatory liquidation ─────────────────────────────────────
 
