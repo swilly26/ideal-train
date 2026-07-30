@@ -294,15 +294,29 @@ class TurboTrader:
         await self.wait_for_market_open()
 
         # ── Calculate liquidity sweep levels ────────────────────────
+        logger.info("STEP 1/4: Calculating liquidity sweep levels…")
         await self.liquidity_sweep.calculate_levels(self.provider)
         self.levels_cache = self.liquidity_sweep.levels
+        logger.info("STEP 1/4: Levels calculated for %d symbols", len(self.levels_cache))
 
         # ── Sync positions from Alpaca at startup ────────────────────
+        logger.info("STEP 2/4: Syncing positions from broker…")
         await self._sync_positions_from_broker()
+        logger.info("STEP 2/4: Position sync complete — %d open positions tracked",
+                     self.pm.get_open_count())
+
+        # ── Log inherited position state ────────────────────────────
+        for sym in self.pm.get_open_symbols():
+            pos = self.pm.get_positions().get(sym)
+            if pos:
+                logger.info("  Inherited: %s x %s @ $%.2f", pos.quantity, sym, pos.entry_price)
 
         # ── Ensure inherited positions have protective stops ────────
+        logger.info("STEP 3/4: Checking protective stops for inherited positions…")
         await self._ensure_protective_stops()
+        logger.info("STEP 3/4: Protective stop check complete")
 
+        logger.info("STEP 4/4: Entering main tick loop…")
         tick = 0
         try:
             while True:
@@ -315,12 +329,15 @@ class TurboTrader:
                     await self._eod_liquidate()
                     break
 
+                logger.debug("Tick %d: checking market open…", tick)
                 market_open = await self.broker.is_market_open()
                 if not market_open:
                     logger.info("⏹️  Market closed — shutting down")
                     break
 
+                logger.debug("Tick %d: running strategy evaluation…", tick)
                 await self._tick(tick)
+                logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
                 await asyncio.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
@@ -337,12 +354,16 @@ class TurboTrader:
         # (prune any that have been closed)
         self._ls_symbols &= set(self.pm.get_open_symbols())
 
+        logger.debug("Tick %d: evaluating %d symbols (%d positions open)",
+                     tick_num, len(SYMBOLS), self.pm.get_open_count())
+
         for symbol in SYMBOLS:
             # Skip if at max positions and don't hold this one
             if self.pm.get_open_count() >= MAX_POSITIONS and not self.pm.has_position(symbol):
                 continue
 
             try:
+                logger.debug("Tick %d: fetching %s 1m bars…", tick_num, symbol)
                 mdf = await self.provider.fetch_bars(
                     symbol, start=lookback, end=now, timeframe="1min"
                 )
@@ -644,6 +665,7 @@ class TurboTrader:
         """
         turbo_set = {s.upper() for s in SYMBOLS}
         if not self.pm.get_open_symbols():
+            logger.info("🛡️  No inherited turbo positions — skipping protective stop check")
             return
 
         # Fetch all open orders once so we can check stop coverage

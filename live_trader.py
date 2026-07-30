@@ -24,13 +24,13 @@ from src.strategies.base import SignalType, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
 
 # ── Configuration ──────────────────────────────────────────────────
-SYMBOLS = ["AAPL", "MSFT", "SPY", "TSLA"]
+SYMBOLS = ["NVDA", "META", "QQQ", "TSLA", "COIN", "AVGO"]
 CHECK_INTERVAL = 60  # seconds between polls
 # NOTE: Analysis shows low-confidence trades (0.4-0.6 bucket) average +$33.46 —
 # actually MORE profitable than high-confidence trades. More signals = more opportunities.
 CONFIDENCE_THRESHOLD = 0.3
-MAX_POSITIONS = 4
-POSITION_SIZE_PCT = 0.10  # 10% of equity per position
+MAX_POSITIONS = 6
+POSITION_SIZE_PCT = 0.15  # 15% of equity per position
 
 # Market close in UTC (4 PM ET = 20:00 UTC)
 MARKET_CLOSE_UTC_HOUR = 20
@@ -129,8 +129,18 @@ class LiveTrader:
         await self.wait_for_market_open()
 
         # ── Layer 2: Sync positions from Alpaca at startup ───────────
+        logger.info("STEP 1/3: Syncing positions from broker…")
         await self._sync_positions_from_broker()
+        logger.info("STEP 1/3: Position sync complete — %d open positions tracked",
+                     self.pm.get_open_count())
 
+        # ── Layer 2b: Log inherited position state ────────────────────
+        for sym in self.pm.get_open_symbols():
+            pos = self.pm.get_positions().get(sym)
+            if pos:
+                logger.info("  Inherited: %s x %s @ $%.2f", pos.quantity, sym, pos.entry_price)
+
+        logger.info("STEP 2/3: Entering main tick loop…")
         tick = 0
         try:
             while True:
@@ -143,12 +153,15 @@ class LiveTrader:
                     await self._eod_liquidate()
                     break
 
+                logger.debug("Tick %d: checking market open…", tick)
                 market_open = await self.broker.is_market_open()
                 if not market_open:
                     logger.info("⏹️  Market closed — shutting down")
                     break
 
+                logger.debug("Tick %d: running strategy evaluation…", tick)
                 await self._tick(tick)
+                logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
                 await asyncio.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
@@ -160,12 +173,16 @@ class LiveTrader:
         now = datetime.now(timezone.utc)
         lookback = now - timedelta(minutes=30)
 
+        logger.debug("Tick %d: evaluating %d symbols (%d positions open)",
+                     tick_num, len(SYMBOLS), self.pm.get_open_count())
+
         for symbol in SYMBOLS:
             # Skip if at max positions and don't hold this one
             if self.pm.get_open_count() >= MAX_POSITIONS and not self.pm.has_position(symbol):
                 continue
 
             try:
+                logger.debug("Tick %d: fetching %s 1m bars…", tick_num, symbol)
                 mdf = await self.provider.fetch_bars(
                     symbol, start=lookback, end=now, timeframe="1min"
                 )
