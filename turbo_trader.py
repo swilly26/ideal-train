@@ -292,19 +292,10 @@ class TurboTrader:
             cancelled,
         )
 
-        # Wait for open
-        await self.wait_for_market_open()
-
-        # ── Calculate liquidity sweep levels ────────────────────────
-        logger.info("STEP 1/4: Calculating liquidity sweep levels…")
-        await self.liquidity_sweep.calculate_levels(self.provider)
-        self.levels_cache = self.liquidity_sweep.levels
-        logger.info("STEP 1/4: Levels calculated for %d symbols", len(self.levels_cache))
-
         # ── Sync positions from Alpaca at startup ────────────────────
-        logger.info("STEP 2/4: Syncing positions from broker…")
+        logger.info("STEP 1/4: Syncing positions from broker…")
         await self._sync_positions_from_broker()
-        logger.info("STEP 2/4: Position sync complete — %d open positions tracked",
+        logger.info("STEP 1/4: Position sync complete — %d open positions tracked",
                      self.pm.get_open_count())
 
         # ── Log inherited position state ────────────────────────────
@@ -312,6 +303,18 @@ class TurboTrader:
             pos = self.pm.get_positions().get(sym)
             if pos:
                 logger.info("  Inherited: %s x %s @ $%.2f", pos.quantity, sym, pos.entry_price)
+
+        # ── Post-startup stale position cleanup ──────────────────────
+        await self._post_startup_cleanup()
+
+        # Wait for open
+        await self.wait_for_market_open()
+
+        # ── Calculate liquidity sweep levels ────────────────────────
+        logger.info("STEP 2/4: Calculating liquidity sweep levels…")
+        await self.liquidity_sweep.calculate_levels(self.provider)
+        self.levels_cache = self.liquidity_sweep.levels
+        logger.info("STEP 2/4: Levels calculated for %d symbols", len(self.levels_cache))
 
         # ── Ensure inherited positions have protective stops ────────
         logger.info("STEP 3/4: Checking protective stops for inherited positions…")
@@ -595,6 +598,57 @@ class TurboTrader:
             "Synced %d positions from broker (%d added, %d removed)",
             len(broker_symbols), added, removed,
         )
+
+    # ── Post-startup stale position cleanup ────────────────────────────
+
+    async def _post_startup_cleanup(self):
+        """Liquidate stale turbo positions if trader starts while market is closed.
+
+        If the market is closed (e.g. after a crash/restart/sandbox cycle
+        that missed the regular EOD window) and there are open turbo positions
+        at the broker, liquidate them immediately so nothing hangs overnight.
+        """
+        try:
+            if await self.broker.is_market_open():
+                return  # Market is open — normal trading, no cleanup needed
+
+            positions = await self.broker.get_positions()
+            # Filter to turbo symbols only — never touch main trader's positions
+            turbo_set = {s.upper() for s in SYMBOLS}
+            positions = [p for p in positions if p.get("symbol", "").upper() in turbo_set]
+            if not positions:
+                return
+
+            logger.info(
+                "🧹 Post-close cleanup: liquidating %d stale turbo position(s) from previous session",
+                len(positions),
+            )
+            for p in positions:
+                sym = p.get("symbol")
+                qty = float(p.get("qty", 0))
+                if qty > 0:
+                    # Cancel protective stop before liquidating
+                    await self._cancel_protective_stops(sym)
+                    logger.info("🧹 Cleanup SELL %s: %s shares", sym, qty)
+                    order = Order(
+                        symbol=sym,
+                        side=OrderSide.SELL,
+                        quantity=qty,
+                        order_type=OrderType.MARKET,
+                        client_id=_turbo_client_id(sym, OrderSide.SELL),
+                    )
+                    await self.broker.place_order(order)
+                    self.pm.close_position(
+                        sym,
+                        exit_price=float(p.get("current_price", 0)),
+                        exit_reason="post_close_cleanup",
+                    )
+            logger.info(
+                "🧹 Post-close cleanup complete — %d turbo position(s) liquidated",
+                len(positions),
+            )
+        except Exception:
+            logger.exception("🧹 Post-close cleanup failed — continuing startup")
 
     # ── Broker-level protective stops ────────────────────────────────
 
