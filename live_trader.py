@@ -36,6 +36,7 @@ POSITION_SIZE_PCT = 0.15  # 15% of equity per position
 MARKET_CLOSE_UTC_HOUR = 20
 MARKET_CLOSE_UTC_MINUTE = 0
 MANDATORY_CLOSE_MINUTES = 15  # Liquidate all positions 15 min before close
+MAX_HOLD_MINUTES = 30          # Max time to hold a position — recycle capital
 
 STRATEGY_CONFIG = StrategyConfig(
     entry_threshold=0.5,       # z-score to enter (lower = more trades)
@@ -71,6 +72,7 @@ class LiveTrader:
         self.provider = YFinanceProvider()
         self.strategy = MeanReversionStrategy(config=STRATEGY_CONFIG)
         self.pm = PositionManager(STRATEGY_CONFIG)
+        self._entry_times: dict[str, datetime] = {}  # when each position was opened
         self.day_trades: list[dict] = []
         self.start_equity = 0.0
 
@@ -147,26 +149,41 @@ class LiveTrader:
                 tick += 1
 
                 # ── EOD mandatory liquidation check ──────────────────
-                if self._is_near_close():
-                    logger.info(f"⏰ Within {MANDATORY_CLOSE_MINUTES} min of close — "
-                                "triggering mandatory EOD liquidation")
-                    await self._eod_liquidate()
-                    break
+                try:
+                    if self._is_near_close():
+                        logger.info(f"⏰ Within {MANDATORY_CLOSE_MINUTES} min of close — "
+                                    "triggering mandatory EOD liquidation")
+                        await self._eod_liquidate()
+                        break
+                except Exception:
+                    logger.exception("EOD check/liquidate failed — continuing")
 
-                logger.debug("Tick %d: checking market open…", tick)
-                market_open = await self.broker.is_market_open()
-                if not market_open:
-                    logger.info("⏹️  Market closed — shutting down")
-                    break
+                try:
+                    market_open = await self.broker.is_market_open()
+                    if not market_open:
+                        logger.info("⏹️  Market closed — shutting down")
+                        break
+                except Exception:
+                    logger.exception("Market-open check failed — assuming open, continuing")
 
-                logger.debug("Tick %d: running strategy evaluation…", tick)
-                await self._tick(tick)
+                await self._safe_tick(tick)
                 logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
                 await asyncio.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
+        except Exception as e:
+            logger.exception("FATAL: Unhandled exception in main loop — %s", e)
         finally:
             await self.shutdown()
+
+    async def _safe_tick(self, tick_num: int):
+        """Wrapper around _tick that catches all exceptions so one bad tick
+        never kills the trader.  Logs the full traceback and continues."""
+        try:
+            await self._tick(tick_num)
+        except Exception:
+            logger.exception("Tick %d crashed — continuing to next tick", tick_num)
+            await asyncio.sleep(CHECK_INTERVAL)
 
     async def _tick(self, tick_num: int):
         """One polling cycle: fetch → signals → execute."""
@@ -232,6 +249,7 @@ class LiveTrader:
 
         if is_order_alive(result.status):
             self.pm.open_position(symbol, qty, price)
+            self._entry_times[symbol.upper()] = datetime.now(timezone.utc)  # time-based exit
             logger.info(f"📈 BUY  {symbol}: {qty:.1f} shares @ ${price:.2f} = ${value:,.2f} | "
                         f"conf={confidence:.2f} | order={result.order_id[:8]}")
         else:
@@ -251,6 +269,7 @@ class LiveTrader:
 
         pnl = (price - entry) * qty if entry else 0
         self.pm.close_position(symbol, price)
+        self._entry_times.pop(symbol.upper(), None)
 
         logger.info(f"📉 SELL {symbol}: {qty:.1f} shares @ ${price:.2f} | "
                     f"P&L: ${pnl:,.2f} | conf={confidence:.2f} | order={result.order_id[:8]}")
@@ -360,6 +379,17 @@ class LiveTrader:
                     continue
 
                 change_pct = (price - entry) / entry
+
+                # ── Time-based exit: recycle capital after MAX_HOLD_MINUTES ──
+                entry_time = self._entry_times.get(symbol.upper())
+                held_minutes = 0.0
+                if entry_time is not None:
+                    held_minutes = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
+
+                if held_minutes >= MAX_HOLD_MINUTES:
+                    await self._handle_sell(symbol, price, 1.0)
+                    logger.info(f"⏰ TIME-EXIT {symbol}: held {held_minutes:.0f}min, P&L={change_pct*100:+.1f}%")
+                    continue
 
                 if change_pct <= -STRATEGY_CONFIG.stop_loss_pct:
                     await self._handle_sell(symbol, price, 1.0)

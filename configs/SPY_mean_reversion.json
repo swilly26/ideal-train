@@ -1,0 +1,10 @@
+{
+  "entry_threshold": 0.6477891095297864,
+  "exit_threshold": 0.26596896935421416,
+  "max_position_pct": 0.06619590758937757,
+  "min_position_pct": 0.01,
+  "stop_loss_pct": 0.025963517928612775,
+  "take_profit_pct": 0.05772873241288227,
+  "weight": 1.0,
+  "extra": {}
+}

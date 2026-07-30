@@ -36,9 +36,10 @@ from src.strategies.indicators import sma, z_score
 SYMBOLS = ["SOXL", "TQQQ", "FNGU", "SPXL"]  # 3x leveraged ETFs (LABU dropped — data errors)
 CHECK_INTERVAL = 60
 CONFIDENCE_THRESHOLD = 0.4   # Lower threshold = more entries
-MAX_POSITIONS = 3            # Stay focused — fewer, bigger bets
-POSITION_SIZE_PCT = 0.25     # 25% per position (only 3 max = 75% deployed)
+MAX_POSITIONS = 2            # 50% per position × 2 = 100% deployed — no margin needed
+POSITION_SIZE_PCT = 0.50     # 50% per position — max conviction sizing
 MANDATORY_CLOSE_MINUTES = 30  # Liquidate all positions 30 min before market close
+MAX_HOLD_MINUTES = 30          # Max time to hold a position — recycle capital
 
 STRATEGY_CONFIG = StrategyConfig(
     entry_threshold=0.5,
@@ -145,7 +146,7 @@ def _generate_momentum_signals(
                 },
             )
             signals.append(signal)
-            logger.info(
+            logger.debug(
                 "🔍 MOMENTUM %s: BUY conf=%.4f (price=%.2f, MA=%.2f, RSI=%.1f)",
                 symbol, confidence, cur_close, cur_ma, cur_rsi,
             )
@@ -167,7 +168,7 @@ def _generate_momentum_signals(
                 },
             )
             signals.append(signal)
-            logger.info(
+            logger.debug(
                 "🔍 MOMENTUM %s: SELL conf=%.4f (price=%.2f, MA=%.2f, RSI=%.1f)",
                 symbol, confidence, cur_close, cur_ma, cur_rsi,
             )
@@ -203,6 +204,7 @@ class TurboTrader:
         self.liquidity_sweep = LiquiditySweepStrategy(symbols=SYMBOLS)
         self.levels_cache: dict[str, dict[str, float | None]] = {}
         self._ls_symbols: set[str] = set()  # symbols entered via liquidity sweep
+        self._entry_times: dict[str, datetime] = {}  # when each position was opened
         self.pm = PositionManager(STRATEGY_CONFIG)
         self.day_trades: list[dict] = []
         self.start_equity = 0.0
@@ -323,26 +325,41 @@ class TurboTrader:
                 tick += 1
 
                 # ── EOD mandatory liquidation check ──────────────────
-                if self._is_near_close():
-                    logger.info(f"⏰ Within {MANDATORY_CLOSE_MINUTES} min of close — "
-                                "triggering mandatory EOD liquidation")
-                    await self._eod_liquidate()
-                    break
+                try:
+                    if self._is_near_close():
+                        logger.info(f"⏰ Within {MANDATORY_CLOSE_MINUTES} min of close — "
+                                    "triggering mandatory EOD liquidation")
+                        await self._eod_liquidate()
+                        break
+                except Exception:
+                    logger.exception("EOD check/liquidate failed — continuing")
 
-                logger.debug("Tick %d: checking market open…", tick)
-                market_open = await self.broker.is_market_open()
-                if not market_open:
-                    logger.info("⏹️  Market closed — shutting down")
-                    break
+                try:
+                    market_open = await self.broker.is_market_open()
+                    if not market_open:
+                        logger.info("⏹️  Market closed — shutting down")
+                        break
+                except Exception:
+                    logger.exception("Market-open check failed — assuming open, continuing")
 
-                logger.debug("Tick %d: running strategy evaluation…", tick)
-                await self._tick(tick)
+                await self._safe_tick(tick)
                 logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
                 await asyncio.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
+        except Exception as e:
+            logger.exception("FATAL: Unhandled exception in main loop — %s", e)
         finally:
             await self.shutdown()
+
+    async def _safe_tick(self, tick_num: int):
+        """Wrapper around _tick that catches all exceptions so one bad tick
+        never kills the trader.  Logs the full traceback and continues."""
+        try:
+            await self._tick(tick_num)
+        except Exception:
+            logger.exception("Tick %d crashed — continuing to next tick", tick_num)
+            await asyncio.sleep(CHECK_INTERVAL)
 
     async def _tick(self, tick_num: int):
         """One polling cycle: fetch → triple-strategy signals → execute."""
@@ -357,7 +374,11 @@ class TurboTrader:
         logger.debug("Tick %d: evaluating %d symbols (%d positions open)",
                      tick_num, len(SYMBOLS), self.pm.get_open_count())
 
+        entered_this_tick = False  # max 1 new entry per tick cycle
+
         for symbol in SYMBOLS:
+            if entered_this_tick:
+                break  # one entry per tick — prevents simultaneous all-ins
             # Skip if at max positions and don't hold this one
             if self.pm.get_open_count() >= MAX_POSITIONS and not self.pm.has_position(symbol):
                 continue
@@ -420,6 +441,7 @@ class TurboTrader:
 
                 if best_signal.signal_type == SignalType.BUY:
                     await self._handle_buy(symbol, current_price, best_signal.confidence, strategy_name)
+                    entered_this_tick = True  # max 1 entry per tick
                     # Track liquidity sweep entries for the max-1-LS-position guard
                     if strategy_name == "liquidity_sweep":
                         self._ls_symbols.add(symbol.upper())
@@ -463,6 +485,7 @@ class TurboTrader:
             # Use the fill price if available, otherwise fall back to the signal price
             fill_price = result.filled_avg_price if result.filled_avg_price else price
             self.pm.open_position(symbol, qty, fill_price)
+            self._entry_times[symbol.upper()] = datetime.now(timezone.utc)  # time-based exit
             strat_tag = f" [{strategy}]" if strategy else ""
             logger.info(
                 f"🚀 BUY  {symbol}: {qty:.1f} shares @ ${fill_price:.2f} = ${value:,.2f} | "
@@ -498,6 +521,7 @@ class TurboTrader:
         pnl = (price - entry) * qty if entry else 0
         pnl_pct = ((price / entry) - 1.0) * 100 if entry else 0
         self.pm.close_position(symbol, price)
+        self._entry_times.pop(symbol.upper(), None)  # clean up time tracker
 
         strat_tag = f" [{strategy}]" if strategy else ""
         logger.info(
@@ -732,6 +756,17 @@ class TurboTrader:
                     continue
 
                 change_pct = (price - entry) / entry
+
+                # ── Time-based exit: recycle capital after MAX_HOLD_MINUTES ──
+                entry_time = self._entry_times.get(symbol.upper())
+                held_minutes = 0.0
+                if entry_time is not None:
+                    held_minutes = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
+
+                if held_minutes >= MAX_HOLD_MINUTES:
+                    await self._handle_sell(symbol, price, 1.0, "time_exit")
+                    logger.info(f"⏰ TIME-EXIT {symbol}: held {held_minutes:.0f}min, P&L={change_pct*100:+.1f}%")
+                    continue
 
                 if change_pct <= -STRATEGY_CONFIG.stop_loss_pct:
                     await self._handle_sell(symbol, price, 1.0, "risk_stop")

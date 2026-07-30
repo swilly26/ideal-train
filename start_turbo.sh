@@ -6,15 +6,12 @@
 # account as live_trader.py.  Both can run simultaneously — separate log
 # files, separate PIDs, no shared state.
 
-export ALPACA_API_KEY="PKSM2QGK2KQUUALPZ4CM56F7F3"
-export ALPACA_SECRET_KEY="7d8tkoJ9Xw5X8XfJgmhkxcjpWqCN5u6AHUdAXErsWS8D"
-export ALPACA_PAPER="true"
-
 cd /home/team/shared/engine
 source .venv/bin/activate
+[ -f .env.turbo ] && export $(grep -v '^#' .env.turbo | xargs)
 
 echo "🚀 AlgoFlow TURBO Live Trader"
-echo "Symbols: SOXL, TQQQ, FNGU, LABU, SPXL (3x Leveraged ETFs)"
+echo "Symbols: SOXL, TQQQ, FNGU, SPXL (3x Leveraged ETFs)"
 echo "Strategy: Mean Reversion + Momentum (dual)"
 echo "Stop-Loss: 6% | Take-Profit: 8%"
 echo "⚠️  Mandatory EOD liquidation 5 min before close"
