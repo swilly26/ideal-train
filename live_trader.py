@@ -19,6 +19,7 @@ import src.strategies  # registers strategies
 from src.data.yfinance_provider import YFinanceProvider
 from src.execution.alpaca_broker import AlpacaBroker, is_order_alive
 from src.execution.broker import Order, OrderSide, OrderType
+import time
 from src.execution.position_manager import PositionManager
 from src.strategies.base import SignalType, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
@@ -122,9 +123,15 @@ class LiveTrader:
         logger.info(f"Max positions: {MAX_POSITIONS} | Size: {POSITION_SIZE_PCT*100:.0f}% equity")
         logger.info("=" * 60)
 
+        try:
+            await self.broker.startup_health_check()
+        except Exception as exc:
+            logger.critical("FATAL: broker authentication/account health check failed; refusing to trade: %s", exc)
+            return
+
         # ── Layer 4: Cancel stale orders from prior sessions ─────────
         logger.info("Cancelling any stale orders from prior sessions…")
-        cancelled = await self.broker.cancel_all_orders()
+        cancelled = await self.broker.cancel_orders_by_client_id_prefix("algoflow_MAIN_")
         logger.info(f"Cancelled {cancelled} stale order(s)")
 
         # ── Layer 2: Sync positions from Alpaca at startup ───────────
@@ -247,7 +254,8 @@ class LiveTrader:
         if qty < 1:
             return
 
-        order = Order(symbol=symbol, side=OrderSide.BUY, quantity=qty, order_type=OrderType.MARKET)
+        order = Order(symbol=symbol, side=OrderSide.BUY, quantity=qty, order_type=OrderType.MARKET,
+                      client_id=f"algoflow_MAIN_{symbol.upper()}_BUY_{time.monotonic_ns()}")
         result = await self.broker.place_order(order)
 
         if is_order_alive(result.status):
@@ -267,7 +275,8 @@ class LiveTrader:
             return
         qty = pos.quantity
         entry = pos.entry_price
-        order = Order(symbol=symbol, side=OrderSide.SELL, quantity=qty, order_type=OrderType.MARKET)
+        order = Order(symbol=symbol, side=OrderSide.SELL, quantity=qty, order_type=OrderType.MARKET,
+                      client_id=f"algoflow_MAIN_{symbol.upper()}_SELL_{time.monotonic_ns()}")
         result = await self.broker.place_order(order)
 
         pnl = (price - entry) * qty if entry else 0

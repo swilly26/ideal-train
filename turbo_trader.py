@@ -278,6 +278,12 @@ class TurboTrader:
         logger.info(f"⚠️  Mandatory EOD liquidation {MANDATORY_CLOSE_MINUTES} min before close")
         logger.info("=" * 60)
 
+        try:
+            await self.broker.startup_health_check()
+        except Exception as exc:
+            logger.critical("FATAL: broker authentication/account health check failed; refusing to trade: %s", exc)
+            return
+
         # ── Cancel stale orders from prior sessions ──────────────────
         # NOTE: cancel_all_orders() cancels EVERY open order on the account
         # (both turbo's AND the main trader's). This is a known side effect of
@@ -285,12 +291,7 @@ class TurboTrader:
         # This also cancels any stale protective stop orders from prior sessions,
         # which will be re-created below during position sync.
         logger.info("Cancelling any stale orders from prior sessions…")
-        cancelled = await self.broker.cancel_all_orders()
-        logger.warning(
-            "Cancelled %d open order(s) — this includes ALL orders on the shared "
-            "account (turbo + main trader). Main trader may need to re-submit orders.",
-            cancelled,
-        )
+        cancelled = await self.broker.cancel_orders_by_client_id_prefix("algoflow_TURBO_")
 
         # ── Sync positions from Alpaca at startup ────────────────────
         logger.info("STEP 1/4: Syncing positions from broker…")
@@ -659,7 +660,22 @@ class TurboTrader:
         it until triggered or cancelled.  The stop price is set at
         ``entry_price * (1 - stop_loss_pct)`` (currently 6% below entry).
         """
-        await asyncio.sleep(2.0)
+        # Re-check immediately before submission: another process may have
+        # placed a sell/stop order during the entry-to-stop window.
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            existing = await asyncio.to_thread(
+                lambda: self.broker._trading_client.get_orders(
+                    filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol.upper()])
+                )
+            )
+            if any(str(getattr(o, "side", "")).upper().endswith("SELL") for o in existing):
+                logger.info("🛡️  STOP %s: existing sell order found; not submitting duplicate", symbol.upper())
+                return
+        except Exception as exc:
+            logger.error("🛡️  STOP %s: cannot verify existing orders; refusing stop submission: %s", symbol.upper(), exc)
+            return
         from alpaca.trading.requests import StopOrderRequest
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
