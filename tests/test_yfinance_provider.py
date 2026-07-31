@@ -125,3 +125,39 @@ class TestYFinanceProviderClose:
     @pytest.mark.asyncio
     async def test_close_does_not_raise(self, provider):
         await provider.close()
+
+class TestYFinancePeriodFallback:
+    @pytest.mark.asyncio
+    async def test_intraday_empty_window_uses_period_fallback(self, monkeypatch, provider):
+        calls = []
+        fallback = pd.DataFrame(
+            {"Open": [10.0], "High": [11.0], "Low": [9.0], "Close": [10.5], "Volume": [100]}
+        )
+        fallback.index = pd.DatetimeIndex([datetime(2026, 7, 31, 14, 0)])
+
+        def download(**kwargs):
+            calls.append(kwargs)
+            return pd.DataFrame() if "start" in kwargs else fallback
+
+        monkeypatch.setattr("src.data.yfinance_provider.yf.download", download)
+        result = await provider.fetch_bars(
+            "SPY", datetime(2026, 7, 31, 13, 59), datetime(2026, 7, 31, 14, 1), "1min"
+        )
+        assert len(result.df) == 1
+        assert calls[-1]["period"] == "1d"
+        assert calls[-1]["interval"] == "1m"
+
+    @pytest.mark.asyncio
+    async def test_daily_empty_window_does_not_use_period_fallback(self, monkeypatch, provider):
+        calls = []
+
+        def download(**kwargs):
+            calls.append(kwargs)
+            return pd.DataFrame()
+
+        monkeypatch.setattr("src.data.yfinance_provider.yf.download", download)
+        with pytest.raises(ValueError, match="No data returned"):
+            await provider.fetch_bars(
+                "SPY", datetime(2026, 7, 31), datetime(2026, 8, 1), "1day"
+            )
+        assert all("period" not in call for call in calls)
