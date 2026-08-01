@@ -91,6 +91,7 @@ class YFinanceProvider(DataProvider):
         elif timeframe in ("5min", "5m"):
             fallback_intervals = ["15m"]
 
+        df: pd.DataFrame | None = None
         for attempt, interval in enumerate([yf_interval] + fallback_intervals):
             try:
                 df = await asyncio.wait_for(
@@ -122,6 +123,10 @@ class YFinanceProvider(DataProvider):
                 ) from exc
 
             if df is not None and not df.empty:
+                logger.debug(
+                    "Yahoo Finance returned %d %s bars for %s (latest=%s)",
+                    len(df), interval, symbol, df.index[-1],
+                )
                 if attempt > 0:
                     logger.info(
                         "Fallback: using %s data for %s after %s failed",
@@ -129,11 +134,43 @@ class YFinanceProvider(DataProvider):
                     )
                 break  # got data — stop trying fallbacks
         else:
-            # All attempts exhausted
-            raise ValueError(
-                f"No data returned for {symbol} between {start} and {end}. "
-                f"The ticker may be invalid or the date range may have no trading days."
-            )
+            # Yahoo intermittently returns an empty response for short rolling
+            # intraday start/end windows (often after several symbols have been
+            # requested).  A period query uses Yahoo's cached chart range and
+            # reliably recovers the current session without weakening strategy
+            # thresholds.  Only use it for intraday data; daily requests must
+            # preserve their requested date range semantics.
+            if yf_interval in {"1m", "5m", "15m", "30m", "1h"}:
+                try:
+                    df = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            yf.download,
+                            tickers=symbol,
+                            period="1d",
+                            interval=yf_interval,
+                            progress=False,
+                            auto_adjust=True,
+                            multi_level_index=False,
+                            threads=False,
+                        ),
+                        timeout=YFINANCE_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Yahoo period fallback timed out for %s (%s)", symbol, yf_interval)
+                except Exception as exc:
+                    logger.warning("Yahoo period fallback failed for %s (%s): %s", symbol, yf_interval, exc)
+                if df is not None and not df.empty:
+                    logger.warning(
+                        "Yahoo period fallback used for %s (%s): %d bars, latest=%s",
+                        symbol, yf_interval, len(df), df.index[-1],
+                    )
+                else:
+                    df = None
+            if df is None or df.empty:
+                raise ValueError(
+                    f"No data returned for {symbol} between {start} and {end}. "
+                    f"The ticker may be invalid or the date range may have no trading days."
+                )
 
         # yfinance returns a DataFrame with columns: Open, High, Low, Close, Volume
         # Normalise to lowercase
