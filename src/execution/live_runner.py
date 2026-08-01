@@ -284,6 +284,10 @@ class LiveTradingRunner:
                 result.order_id,
             )
 
+            if not is_order_alive(result.status):
+                logger.warning("SELL %s rejected (%s); keeping position tracked", symbol, result.status)
+                return
+
             exit_price = result.filled_avg_price or current_price
             self._position_manager.close_position(
                 symbol=symbol,
@@ -340,7 +344,10 @@ class LiveTradingRunner:
                 quantity=pos.quantity,
                 order_type=OrderType.MARKET,
             )
-            await self._broker.place_order(order)
+            result = await self._broker.place_order(order)
+            if not is_order_alive(result.status):
+                logger.warning("Risk SELL %s rejected (%s); keeping position tracked", symbol, result.status)
+                continue
 
             self._position_manager.close_position(
                 symbol=symbol,
@@ -367,6 +374,9 @@ class LiveTradingRunner:
                         order_type=OrderType.MARKET,
                     )
                     result = await self._broker.place_order(order)
+                    if not is_order_alive(result.status):
+                        logger.warning("Shutdown SELL %s rejected (%s); keeping position tracked", symbol, result.status)
+                        continue
                     exit_price = result.filled_avg_price or (pos.current_price or 0)
                     self._position_manager.close_position(
                         symbol=symbol,

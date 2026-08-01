@@ -518,6 +518,6 @@ class TestStartupHealth:
     async def test_cancel_prefix_does_not_cancel_other_trader(self, broker, mock_trading_client):
         own = MagicMock(id="own", client_order_id="algoflow_TURBO_A")
         other = MagicMock(id="other", client_order_id="algoflow_MAIN_A")
-        mock_trading_client.get_orders.return_value = [own, other]
+        mock_trading_client.get_orders.side_effect = [[own, other], [other]]
         assert await broker.cancel_orders_by_client_id_prefix("algoflow_TURBO_") == 1
         mock_trading_client.cancel_order_by_id.assert_called_once_with("own")

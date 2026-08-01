@@ -189,16 +189,47 @@ class AlpacaBroker(Broker):
         return self._map_order_result(alpaca_order)
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an open order by its Alpaca order ID."""
+        """Request cancellation of an open order (completion is asynchronous)."""
         logger.info("Cancelling order %s", order_id)
         try:
-            await asyncio.to_thread(
-                self._trading_client.cancel_order_by_id, order_id
-            )
+            await asyncio.to_thread(self._trading_client.cancel_order_by_id, order_id)
             return True
         except Exception as exc:
             logger.error("Cancel order %s failed: %s", order_id, exc)
             return False
+
+    async def cancel_order_and_wait(
+        self, order_id: str, timeout: float = 10.0, poll_interval: float = 0.25
+    ) -> bool:
+        """Cancel an order and wait until it is no longer open.
+
+        Alpaca acknowledges a cancel request before the order leaves
+        ``pending_cancel``.  Callers submitting a replacement sell must wait
+        for this method, otherwise the old stop can still reserve shares.
+        """
+        if not await self.cancel_order(order_id):
+            return False
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                open_orders = await self.get_open_orders()
+                if not any(str(getattr(o, "id", "")) == str(order_id) for o in open_orders):
+                    return True
+                # An order may remain in the open-order snapshot while its
+                # cancellation is completing; query its authoritative status.
+                get_order = getattr(self._trading_client, "get_order_by_id", None)
+                if get_order is not None:
+                    order = await asyncio.to_thread(get_order, order_id)
+                    status = getattr(order, "status", None)
+                    if isinstance(status, str) and not is_order_alive(status):
+                        return True
+            except Exception as exc:
+                logger.warning("Could not confirm cancellation of %s: %s", order_id, exc)
+                return False
+            if time.monotonic() >= deadline:
+                logger.error("Timed out waiting for cancellation of order %s", order_id)
+                return False
+            await asyncio.sleep(poll_interval)
 
     async def get_open_orders(self):
         """Return open orders; failures propagate to safety-critical callers."""
@@ -213,7 +244,7 @@ class AlpacaBroker(Broker):
         owned = [o for o in orders if str(getattr(o, "client_order_id", "")).startswith(prefix)]
         cancelled = 0
         for order in owned:
-            if await self.cancel_order(str(order.id)):
+            if await self.cancel_order_and_wait(str(order.id)):
                 cancelled += 1
         return cancelled
 
@@ -259,7 +290,7 @@ class AlpacaBroker(Broker):
         cancelled = 0
         for o in open_orders:
             oid = str(o.id)
-            if await self.cancel_order(oid):
+            if await self.cancel_order_and_wait(oid):
                 cancelled += 1
 
         logger.info("Cancelled %d / %d open orders", cancelled, len(open_orders))

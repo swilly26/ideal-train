@@ -511,7 +511,9 @@ class TurboTrader:
         entry = pos.entry_price
 
         # ── Cancel protective stop before selling ───────────────────
-        await self._cancel_protective_stops(symbol)
+        if not await self._cancel_protective_stops(symbol):
+            logger.warning("SELL %s deferred: protective-order cancellation was not confirmed", symbol)
+            return
 
         order = Order(
             symbol=symbol,
@@ -521,6 +523,10 @@ class TurboTrader:
             client_id=_turbo_client_id(symbol, OrderSide.SELL),
         )
         result = await self.broker.place_order(order)
+
+        if not is_order_alive(result.status):
+            logger.warning("SELL %s rejected (%s); keeping position tracked", symbol, result.status)
+            return
 
         pnl = (price - entry) * qty if entry else 0
         pnl_pct = ((price / entry) - 1.0) * 100 if entry else 0
@@ -574,8 +580,10 @@ class TurboTrader:
                             order_type=OrderType.MARKET,
                             client_id=_turbo_client_id(sym, OrderSide.SELL),
                         )
-                        await self.broker.place_order(order)
-                        continue  # Don't add to PM — we just sold it
+                        result = await self.broker.place_order(order)
+                        if is_order_alive(result.status):
+                            continue  # Don't add to PM — the sell was accepted
+                        logger.warning("🧹 Cleanup SELL %s rejected (%s); tracking position", sym, result.status)
 
                 self.pm.open_position(
                     symbol=sym,
@@ -629,7 +637,9 @@ class TurboTrader:
                 qty = float(p.get("qty", 0))
                 if qty > 0:
                     # Cancel protective stop before liquidating
-                    await self._cancel_protective_stops(sym)
+                    if not await self._cancel_protective_stops(sym):
+                        logger.warning("🧹 Cleanup SELL %s deferred: cancellation not confirmed", sym)
+                        continue
                     logger.info("🧹 Cleanup SELL %s: %s shares", sym, qty)
                     order = Order(
                         symbol=sym,
@@ -714,7 +724,7 @@ class TurboTrader:
             else:
                 logger.error("🛡️  STOP %s: failed to place — %s", sym, exc)
 
-    async def _cancel_protective_stops(self, symbol: str):
+    async def _cancel_protective_stops(self, symbol: str) -> bool:
         """Cancel all open orders for *symbol* — stop-loss and take-profit.
 
         Called before selling a position so the GTC stop doesn't trigger
@@ -739,16 +749,19 @@ class TurboTrader:
         cancelled = 0
         for o in open_orders:
             try:
-                await asyncio.to_thread(
-                    self.broker._trading_client.cancel_order_by_id, str(o.id)
-                )
-                cancelled += 1
-                logger.debug("  Cancelled order %s for %s", str(o.id)[:8], sym)
+                if await self.broker.cancel_order_and_wait(str(o.id)):
+                    cancelled += 1
+                    logger.debug("  Cancelled order %s for %s", str(o.id)[:8], sym)
+                else:
+                    logger.warning("  Cancellation not confirmed for order %s", str(o.id)[:8])
             except Exception as exc:
                 logger.warning("  Failed to cancel order %s: %s", str(o.id)[:8], exc)
 
         if cancelled:
             logger.info("🗑️  Cancelled %d protective order(s) for %s", cancelled, sym)
+        remaining = await self.broker.get_open_orders()
+        remaining_ids = {str(getattr(order, "id", "")) for order in remaining}
+        return not any(str(o.id) in remaining_ids for o in open_orders)
 
     async def _ensure_protective_stops(self):
         """Ensure every inherited turbo position has a GTC protective stop.
@@ -862,7 +875,9 @@ class TurboTrader:
             qty = float(p.get("qty", 0))
             if qty > 0:
                 # ── Cancel protective stop before liquidating ─────────
-                await self._cancel_protective_stops(sym)
+                if not await self._cancel_protective_stops(sym):
+                    logger.warning("⏰ EOD SELL %s deferred: cancellation not confirmed", sym)
+                    continue
                 logger.info(f"⏰ EOD closing {sym}: {qty} shares...")
                 order = Order(
                     symbol=sym,
@@ -888,7 +903,9 @@ class TurboTrader:
             qty = float(p.get("qty", 0))
             if qty > 0:
                 # ── Cancel protective stop before liquidating ─────────
-                await self._cancel_protective_stops(sym)
+                if not await self._cancel_protective_stops(sym):
+                    logger.warning("Shutdown SELL %s deferred: cancellation not confirmed", sym)
+                    continue
                 logger.info(f"Closing {sym}: {qty} shares...")
                 order = Order(
                     symbol=sym,
@@ -897,7 +914,9 @@ class TurboTrader:
                     order_type=OrderType.MARKET,
                     client_id=_turbo_client_id(sym, OrderSide.SELL),
                 )
-                await self.broker.place_order(order)
+                result = await self.broker.place_order(order)
+                if not is_order_alive(result.status):
+                    logger.warning("Shutdown SELL %s rejected (%s); position remains at broker", sym, result.status)
 
         # Final account state
         account = await self.broker.get_account()
