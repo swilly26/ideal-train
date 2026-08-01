@@ -39,6 +39,10 @@ def is_order_alive(status: str) -> bool:
     return clean not in _TERMINAL_FAILURE_STATUSES
 
 
+class BrokerAuthenticationError(RuntimeError):
+    """Raised when the broker cannot prove that its session is authenticated."""
+
+
 class AlpacaBroker(Broker):
     """Broker implementation backed by the Alpaca Trading API.
 
@@ -195,6 +199,37 @@ class AlpacaBroker(Broker):
         except Exception as exc:
             logger.error("Cancel order %s failed: %s", order_id, exc)
             return False
+
+    async def get_open_orders(self):
+        """Return open orders; failures propagate to safety-critical callers."""
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        flt = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        return await asyncio.to_thread(self._trading_client.get_orders, flt)
+
+    async def cancel_orders_by_client_id_prefix(self, prefix: str) -> int:
+        """Cancel only orders owned by one trader on a shared account."""
+        orders = await self.get_open_orders()
+        owned = [o for o in orders if str(getattr(o, "client_order_id", "")).startswith(prefix)]
+        cancelled = 0
+        for order in owned:
+            if await self.cancel_order(str(order.id)):
+                cancelled += 1
+        return cancelled
+
+    async def startup_health_check(self) -> None:
+        """Prove authentication and account visibility before trading or cleanup."""
+        if not self._api_key or not self._secret_key:
+            raise BrokerAuthenticationError("Alpaca credentials are missing")
+        try:
+            await asyncio.gather(self.get_open_orders(), self._authenticated_positions(),
+                                 asyncio.to_thread(self._trading_client.get_clock),
+                                 asyncio.to_thread(self._trading_client.get_account))
+        except Exception as exc:
+            raise BrokerAuthenticationError(f"Alpaca startup authentication check failed: {exc}") from exc
+
+    async def _authenticated_positions(self):
+        return await asyncio.to_thread(self._trading_client.get_all_positions)
 
     async def cancel_all_orders(self) -> int:
         """Cancel **all** open orders and return the count cancelled.

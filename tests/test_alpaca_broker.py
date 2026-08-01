@@ -498,3 +498,26 @@ class TestIdempotencyKeys:
         assert result.status == "accepted"
         assert result.symbol == "AAPL"
         assert result.order_id != ""  # should be the client_order_id
+
+class TestStartupHealth:
+    @pytest.mark.asyncio
+    async def test_health_check_fails_without_credentials(self, mock_trading_client):
+        from src.execution.alpaca_broker import BrokerAuthenticationError
+        broker = AlpacaBroker(api_key="", secret_key="", paper=True)
+        with pytest.raises(BrokerAuthenticationError):
+            await broker.startup_health_check()
+
+    @pytest.mark.asyncio
+    async def test_health_check_fails_when_api_unauthenticated(self, broker, mock_trading_client):
+        from src.execution.alpaca_broker import BrokerAuthenticationError
+        mock_trading_client.get_orders.side_effect = RuntimeError("You must supply a method of authentication")
+        with pytest.raises(BrokerAuthenticationError):
+            await broker.startup_health_check()
+
+    @pytest.mark.asyncio
+    async def test_cancel_prefix_does_not_cancel_other_trader(self, broker, mock_trading_client):
+        own = MagicMock(id="own", client_order_id="algoflow_TURBO_A")
+        other = MagicMock(id="other", client_order_id="algoflow_MAIN_A")
+        mock_trading_client.get_orders.return_value = [own, other]
+        assert await broker.cancel_orders_by_client_id_prefix("algoflow_TURBO_") == 1
+        mock_trading_client.cancel_order_by_id.assert_called_once_with("own")
