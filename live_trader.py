@@ -133,6 +133,10 @@ class LiveTrader:
         logger.info("Cancelling any stale orders from prior sessions…")
         cancelled = await self.broker.cancel_orders_by_client_id_prefix("algoflow_MAIN_")
         logger.info(f"Cancelled {cancelled} stale order(s)")
+        remaining = await self.broker.get_open_orders()
+        if any(str(getattr(o, "client_order_id", "")).startswith("algoflow_MAIN_") for o in remaining):
+            logger.error("Stale order cancellation was not confirmed; deferring position cleanup")
+            return
 
         # ── Layer 2: Sync positions from Alpaca at startup ───────────
         logger.info("STEP 1/3: Syncing positions from broker…")
@@ -279,6 +283,10 @@ class LiveTrader:
                       client_id=f"algoflow_MAIN_{symbol.upper()}_SELL_{time.monotonic_ns()}")
         result = await self.broker.place_order(order)
 
+        if not is_order_alive(result.status):
+            logger.warning("SELL %s rejected (%s); keeping position tracked", symbol, result.status)
+            return
+
         pnl = (price - entry) * qty if entry else 0
         self.pm.close_position(symbol, price)
         self._entry_times.pop(symbol.upper(), None)
@@ -362,12 +370,15 @@ class LiveTrader:
                         quantity=qty,
                         order_type=OrderType.MARKET,
                     )
-                    await self.broker.place_order(order)
-                    self.pm.close_position(
-                        sym,
-                        exit_price=float(p.get("current_price", 0)),
-                        exit_reason="post_close_cleanup",
-                    )
+                    result = await self.broker.place_order(order)
+                    if is_order_alive(result.status):
+                        self.pm.close_position(
+                            sym,
+                            exit_price=float(p.get("current_price", 0)),
+                            exit_reason="post_close_cleanup",
+                        )
+                    else:
+                        logger.warning("🧹 Cleanup SELL %s rejected (%s); keeping position tracked", sym, result.status)
             logger.info(
                 "🧹 Post-close cleanup complete — %d position(s) liquidated",
                 len(positions),
@@ -408,8 +419,11 @@ class LiveTrader:
             if qty > 0:
                 logger.info(f"⏰ EOD closing {sym}: {qty} shares...")
                 order = Order(symbol=sym, side=OrderSide.SELL, quantity=qty, order_type=OrderType.MARKET)
-                await self.broker.place_order(order)
-                self.pm.close_position(sym, exit_price=float(p.get("current_price", 0)), exit_reason="eod")
+                result = await self.broker.place_order(order)
+                if is_order_alive(result.status):
+                    self.pm.close_position(sym, exit_price=float(p.get("current_price", 0)), exit_reason="eod")
+                else:
+                    logger.warning("⏰ EOD SELL %s rejected (%s); keeping position tracked", sym, result.status)
 
         logger.info(f"⏰ Mandatory EOD liquidation — {count} positions closed.")
 
