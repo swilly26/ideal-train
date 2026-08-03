@@ -16,6 +16,12 @@ from src.execution.broker import Broker, Order, OrderResult, OrderSide, OrderTyp
 
 logger = logging.getLogger(__name__)
 
+# ── API call protection ───────────────────────────────────────────────
+# Hard cap on every blocking Alpaca SDK call.  Without this, a stalled
+# API connection blocks the worker thread forever on a socket read and
+# hangs the whole trader (this is what made both traders miss a session).
+_API_TIMEOUT_SECONDS = 10.0
+
 # ── Terminal (failed / dead) order statuses ───────────────────────────
 _TERMINAL_FAILURE_STATUSES = frozenset({
     "rejected",
@@ -95,6 +101,22 @@ class AlpacaBroker(Broker):
             )
         return self._client
 
+    async def _run_with_timeout(self, fn, *args, timeout: float | None = None, **kwargs):
+        """Run a blocking Alpaca SDK call in a worker thread with a hard timeout.
+
+        ``asyncio.wait_for`` bounds the total call so a stalled API connection
+        can never hang the event loop / trader again: after ``timeout`` seconds
+        we give up and let the caller handle it (retry / fail closed).  The
+        orphaned worker thread keeps blocking on the socket but no longer holds
+        up the trading loop.
+        """
+        if timeout is None:
+            timeout = _API_TIMEOUT_SECONDS
+        return await asyncio.wait_for(
+            asyncio.to_thread(fn, *args, **kwargs),
+            timeout=timeout,
+        )
+
     # ------------------------------------------------------------------
     # Broker ABC
     # ------------------------------------------------------------------
@@ -153,8 +175,27 @@ class AlpacaBroker(Broker):
         )
 
         try:
-            alpaca_order = await asyncio.to_thread(
+            alpaca_order = await self._run_with_timeout(
                 self._trading_client.submit_order, req
+            )
+        except asyncio.TimeoutError:
+            # We never got a response — the order may or may not be live.
+            # Fail closed (rejected) so the caller retries; the idempotency
+            # key prevents a double submission if Alpaca actually got it.
+            logger.warning(
+                "Order submission timed out after %.1fs (client_id=%s) — treating as rejected",
+                _API_TIMEOUT_SECONDS,
+                client_order_id,
+            )
+            return OrderResult(
+                order_id="",
+                symbol=order.symbol,
+                side=order.side,
+                quantity=order.quantity,
+                filled_quantity=0.0,
+                filled_avg_price=None,
+                status="rejected",
+                created_at=datetime.now(),
             )
         except Exception as exc:
             # If Alpaca rejects because this client_order_id was already used,
@@ -192,7 +233,9 @@ class AlpacaBroker(Broker):
         """Request cancellation of an open order (completion is asynchronous)."""
         logger.info("Cancelling order %s", order_id)
         try:
-            await asyncio.to_thread(self._trading_client.cancel_order_by_id, order_id)
+            await self._run_with_timeout(
+                self._trading_client.cancel_order_by_id, order_id
+            )
             return True
         except Exception as exc:
             logger.error("Cancel order %s failed: %s", order_id, exc)
@@ -219,7 +262,7 @@ class AlpacaBroker(Broker):
                 # cancellation is completing; query its authoritative status.
                 get_order = getattr(self._trading_client, "get_order_by_id", None)
                 if get_order is not None:
-                    order = await asyncio.to_thread(get_order, order_id)
+                    order = await self._run_with_timeout(get_order, order_id)
                     status = getattr(order, "status", None)
                     if isinstance(status, str) and not is_order_alive(status):
                         return True
@@ -236,7 +279,7 @@ class AlpacaBroker(Broker):
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus
         flt = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-        return await asyncio.to_thread(self._trading_client.get_orders, flt)
+        return await self._run_with_timeout(self._trading_client.get_orders, flt)
 
     async def cancel_orders_by_client_id_prefix(self, prefix: str) -> int:
         """Cancel only orders owned by one trader on a shared account."""
@@ -253,14 +296,17 @@ class AlpacaBroker(Broker):
         if not self._api_key or not self._secret_key:
             raise BrokerAuthenticationError("Alpaca credentials are missing")
         try:
-            await asyncio.gather(self.get_open_orders(), self._authenticated_positions(),
-                                 asyncio.to_thread(self._trading_client.get_clock),
-                                 asyncio.to_thread(self._trading_client.get_account))
+            await asyncio.gather(
+                self.get_open_orders(),
+                self._authenticated_positions(),
+                self._run_with_timeout(self._trading_client.get_clock),
+                self._run_with_timeout(self._trading_client.get_account),
+            )
         except Exception as exc:
             raise BrokerAuthenticationError(f"Alpaca startup authentication check failed: {exc}") from exc
 
     async def _authenticated_positions(self):
-        return await asyncio.to_thread(self._trading_client.get_all_positions)
+        return await self._run_with_timeout(self._trading_client.get_all_positions)
 
     async def cancel_all_orders(self) -> int:
         """Cancel **all** open orders and return the count cancelled.
@@ -275,7 +321,7 @@ class AlpacaBroker(Broker):
             from alpaca.trading.enums import QueryOrderStatus
 
             flt = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-            open_orders = await asyncio.to_thread(
+            open_orders = await self._run_with_timeout(
                 self._trading_client.get_orders,
                 flt,
             )
@@ -299,9 +345,14 @@ class AlpacaBroker(Broker):
     async def get_positions(self) -> list[dict]:
         """Return current open positions as a list of normalised dicts."""
         try:
-            positions = await asyncio.to_thread(
+            positions = await self._run_with_timeout(
                 self._trading_client.get_all_positions
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Positions fetch timed out after %.1fs — returning empty", _API_TIMEOUT_SECONDS
+            )
+            return []
         except Exception as exc:
             logger.error("Failed to fetch positions: %s", exc)
             return []
@@ -321,7 +372,17 @@ class AlpacaBroker(Broker):
     async def get_account(self) -> dict:
         """Return account summary as a normalised dict."""
         try:
-            acct = await asyncio.to_thread(self._trading_client.get_account)
+            acct = await self._run_with_timeout(self._trading_client.get_account)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Account fetch timed out after %.1fs — returning zeros", _API_TIMEOUT_SECONDS
+            )
+            return {
+                "buying_power": 0.0,
+                "equity": 0.0,
+                "cash": 0.0,
+                "portfolio_value": 0.0,
+            }
         except Exception as exc:
             logger.error("Failed to fetch account: %s", exc)
             return {
@@ -350,11 +411,19 @@ class AlpacaBroker(Broker):
         """Check whether the market is currently open via the Alpaca clock API.
 
         Returns ``True`` if the market is open, ``False`` otherwise.  If the
-        API call fails, returns ``False`` (safe default — don't trade blind).
+        API call fails **or times out** (after ``_API_TIMEOUT_SECONDS``),
+        returns ``False`` — the safe default so the trader loop retries
+        instead of hanging forever on a stalled connection.
         """
         try:
-            clock = await asyncio.to_thread(self._trading_client.get_clock)
+            clock = await self._run_with_timeout(self._trading_client.get_clock)
             return bool(clock.is_open)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Market clock check timed out after %.1fs — assuming closed, will retry",
+                _API_TIMEOUT_SECONDS,
+            )
+            return False
         except Exception as exc:
             logger.error("Market clock check failed: %s", exc)
             return False

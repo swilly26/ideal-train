@@ -4,6 +4,7 @@ All API calls are mocked — no real Alpaca credentials needed.
 """
 
 import os
+import time as _time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -299,6 +300,106 @@ class TestMarketClock:
 
 
 # ---------------------------------------------------------------------------
+# API timeouts — the market-open hang regression
+# ---------------------------------------------------------------------------
+
+
+class TestApiTimeouts:
+    """A stalled Alpaca connection must never hang the trader again.
+
+    Regression for the bug where ``is_market_open()`` called
+    ``asyncio.to_thread(get_clock)`` with no timeout — a dead socket read
+    blocked the worker thread forever and both traders missed a session.
+    """
+
+    @staticmethod
+    def _patch_timeout(monkeypatch):
+        """Shrink the API timeout so tests don't wait the real 10s."""
+        import src.execution.alpaca_broker as broker_mod
+        monkeypatch.setattr(broker_mod, "_API_TIMEOUT_SECONDS", 0.1)
+
+    @pytest.mark.asyncio
+    async def test_is_market_open_times_out_and_returns_false(self, broker, mock_trading_client, monkeypatch):
+        """A hung clock call must return False (bounded), not hang forever."""
+        self._patch_timeout(monkeypatch)
+        mock_trading_client.get_clock.side_effect = lambda: _time.sleep(1)
+
+        start = _time.monotonic()
+        result = await broker.is_market_open()
+        elapsed = _time.monotonic() - start
+
+        assert result is False
+        assert elapsed < 1.0, f"is_market_open hung for {elapsed:.1f}s"
+
+    @pytest.mark.asyncio
+    async def test_get_account_times_out_and_returns_zeros(self, broker, mock_trading_client, monkeypatch):
+        """A hung account fetch must return zeros (fail closed)."""
+        self._patch_timeout(monkeypatch)
+        mock_trading_client.get_account.side_effect = lambda: _time.sleep(1)
+
+        start = _time.monotonic()
+        result = await broker.get_account()
+        elapsed = _time.monotonic() - start
+
+        assert result["equity"] == 0.0
+        assert result["buying_power"] == 0.0
+        assert elapsed < 1.0
+
+    @pytest.mark.asyncio
+    async def test_get_positions_times_out_and_returns_empty(self, broker, mock_trading_client, monkeypatch):
+        """A hung positions fetch must return [] (fail closed)."""
+        self._patch_timeout(monkeypatch)
+        mock_trading_client.get_all_positions.side_effect = lambda: _time.sleep(1)
+
+        start = _time.monotonic()
+        result = await broker.get_positions()
+        elapsed = _time.monotonic() - start
+
+        assert result == []
+        assert elapsed < 1.0
+
+    @pytest.mark.asyncio
+    async def test_get_open_orders_times_out_and_propagates(self, broker, mock_trading_client, monkeypatch):
+        """A hung open-orders fetch must raise (bounded), not block forever."""
+        self._patch_timeout(monkeypatch)
+        mock_trading_client.get_orders.side_effect = lambda flt: _time.sleep(1)
+
+        start = _time.monotonic()
+        with pytest.raises(TimeoutError):
+            await broker.get_open_orders()
+        elapsed = _time.monotonic() - start
+
+        assert elapsed < 1.0
+
+    @pytest.mark.asyncio
+    async def test_place_order_times_out_and_returns_rejected(self, broker, mock_trading_client, monkeypatch):
+        """A hung order submission must return rejected, not hang the loop."""
+        self._patch_timeout(monkeypatch)
+        mock_trading_client.submit_order.side_effect = lambda req: _time.sleep(1)
+
+        order = Order(symbol="AAPL", side=OrderSide.BUY, quantity=10)
+        start = _time.monotonic()
+        result = await broker.place_order(order)
+        elapsed = _time.monotonic() - start
+
+        assert result.status == "rejected"
+        assert elapsed < 1.0
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_times_out_and_returns_false(self, broker, mock_trading_client, monkeypatch):
+        """A hung cancel must return False, not hang the cleanup path."""
+        self._patch_timeout(monkeypatch)
+        mock_trading_client.cancel_order_by_id.side_effect = lambda oid: _time.sleep(1)
+
+        start = _time.monotonic()
+        result = await broker.cancel_order("order-1")
+        elapsed = _time.monotonic() - start
+
+        assert result is False
+        assert elapsed < 1.0
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -396,12 +497,19 @@ class TestCancelAllOrders:
 
     @pytest.mark.asyncio
     async def test_cancel_all_success(self, broker, mock_trading_client):
-        """All open orders should be cancelled."""
+        """All open orders should be cancelled.
+
+        Cancellation is asynchronous in Alpaca: after a successful cancel
+        request the order leaves the open-orders snapshot.  The mock
+        simulates that by returning an empty open-orders list on the
+        follow-up polls inside ``cancel_order_and_wait``.
+        """
         o1 = MagicMock()
         o1.id = "order-1"
         o2 = MagicMock()
         o2.id = "order-2"
-        mock_trading_client.get_orders.return_value = [o1, o2]
+        # call 1: initial listing; calls 2-3: post-cancel confirmation polls
+        mock_trading_client.get_orders.side_effect = [[o1, o2], [], []]
         mock_trading_client.cancel_order_by_id.return_value = None
 
         result = await broker.cancel_all_orders()
@@ -415,7 +523,8 @@ class TestCancelAllOrders:
         o1.id = "order-1"
         o2 = MagicMock()
         o2.id = "order-2"
-        mock_trading_client.get_orders.return_value = [o1, o2]
+        # call 1: initial listing; call 2: post-cancel confirmation for o1
+        mock_trading_client.get_orders.side_effect = [[o1, o2], []]
         mock_trading_client.cancel_order_by_id.side_effect = [
             None,  # first succeeds
             Exception("fail"),  # second fails
