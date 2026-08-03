@@ -212,8 +212,17 @@ class TurboTrader:
     # ── Market open wait ─────────────────────────────────────────────
 
     async def wait_for_market_open(self):
-        """Block until the market opens."""
+        """Block until the market opens.
+
+        Polls ``is_market_open()`` every 30s and emits a throttled INFO
+        heartbeat every 5 minutes so a long pre-open wait is never confused
+        with a hang (the Alpaca clock call is itself timeout-protected in
+        the broker layer).
+        """
         logger.info("🚀 Waiting for market to open (9:30 AM ET)...")
+        last_heartbeat = 0.0
+        heartbeat_interval = 300.0  # 5 min
+        check_interval = 30.0       # fixed 30s poll — simple, safe
         while True:
             try:
                 if await self.broker.is_market_open():
@@ -225,16 +234,29 @@ class TurboTrader:
             except Exception as e:
                 logger.warning(f"Market check failed: {e}")
 
-            remaining = self._seconds_until_open()
-            sleep_time = min(30, max(5, remaining // 2))
-            logger.debug(f"   Next check in {sleep_time}s")
-            await asyncio.sleep(sleep_time)
+            if time.monotonic() - last_heartbeat >= heartbeat_interval:
+                logger.info(
+                    "Still waiting for market open, next check in %.0fs "
+                    "(≈%.0f min until 9:30 AM ET)",
+                    check_interval,
+                    self._seconds_until_open() / 60,
+                )
+                last_heartbeat = time.monotonic()
+            await asyncio.sleep(check_interval)
 
     @staticmethod
     def _seconds_until_open() -> float:
-        """Seconds until next 9:30 AM ET market open (13:30 UTC)."""
-        now = datetime.now(timezone.utc)
-        target = now.replace(hour=13, minute=30, second=0, microsecond=0)
+        """Seconds until next 9:30 AM ET market open (DST-aware).
+
+        Market open is 9:30 AM in the America/New_York timezone, which is
+        13:30 UTC in summer (EDT, UTC-4) but 14:30 UTC in winter (EST,
+        UTC-5).  The old hardcoded 13:30 UTC target was only correct during
+        DST.  Computing the target in the NY zone keeps it right year-round.
+        """
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        now = datetime.now(ny)
+        target = now.replace(hour=9, minute=30, second=0, microsecond=0)
         if now.weekday() >= 5:  # weekend
             days_until_mon = (7 - now.weekday()) % 7
             target += timedelta(days=days_until_mon)
