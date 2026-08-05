@@ -133,6 +133,25 @@ class DummyDataProvider(DataProvider):
         pass
 
 
+class PerSymbolDataProvider(DataProvider):
+    """Data provider that returns a different DataFrame per symbol."""
+
+    def __init__(self, data_by_symbol):
+        super().__init__()
+        self._data = {k.upper(): v for k, v in data_by_symbol.items()}
+
+    async def fetch_bars(self, symbol, start, end, timeframe="1min"):
+        return MarketDataFrame(
+            df=self._data[symbol.upper()].copy(), symbol=symbol, timeframe=timeframe
+        )
+
+    async def subscribe_live(self, symbols, on_bar=None):
+        raise NotImplementedError("streaming not used in tests")
+
+    async def close(self):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Position Manager tests
 # ---------------------------------------------------------------------------
@@ -540,3 +559,70 @@ class TestLiveRunner:
         runner._running = True
         runner.stop()
         assert runner._running is False
+
+    @pytest.mark.asyncio
+    async def test_risk_stop_uses_per_symbol_data(self):
+        """Risk stops must be priced against each position's OWN symbol.
+
+        Regression: ``_check_risk_stops`` used the last-polled symbol's
+        bars to price every position, so a crash in one symbol could
+        trigger erroneous exits in others.
+        """
+        broker = DummyBroker()
+        flat = _make_ohlcv_data(periods=5)  # closes ≈ 100.5 → no stop for entry 100
+        crash = _make_ohlcv_data(periods=5)
+        crash["low"] = 50.0
+        crash["close"] = 50.0
+        provider = PerSymbolDataProvider({"AAPL": flat, "MSFT": crash})
+        config = StrategyConfig(max_position_pct=0.10, stop_loss_pct=0.02, take_profit_pct=0.05)
+
+        runner = LiveTradingRunner(
+            symbols=["AAPL", "MSFT"],
+            strategy_cls=AlwaysBuyStrategy,
+            broker=broker,
+            data_provider=provider,
+            config=config,
+            check_interval_seconds=0.0,
+        )
+        runner._running = True
+        runner._strategy = AlwaysBuyStrategy(config=config, confidence=1.0)
+
+        runner.position_manager.open_position(
+            "AAPL", 10, 100.0, stop_loss_price=98.0, take_profit_price=105.0
+        )
+        # Passing MSFT's crash bars (what the old tick handed to the risk
+        # check) must NOT trigger an AAPL exit — data is fetched per symbol.
+        await runner._check_risk_stops(crash)
+
+        assert len(broker.orders) == 0
+        assert runner.position_manager.has_position("AAPL")
+
+    @pytest.mark.asyncio
+    async def test_risk_stop_triggers_sell_on_own_symbol(self):
+        """A crash in the position's own symbol must still trigger the exit."""
+        broker = DummyBroker()
+        crash = _make_ohlcv_data(periods=5)
+        crash["low"] = 50.0
+        crash["close"] = 50.0
+        provider = PerSymbolDataProvider({"AAPL": crash})
+        config = StrategyConfig(max_position_pct=0.10, stop_loss_pct=0.02, take_profit_pct=0.05)
+
+        runner = LiveTradingRunner(
+            symbols=["AAPL"],
+            strategy_cls=AlwaysBuyStrategy,
+            broker=broker,
+            data_provider=provider,
+            config=config,
+            check_interval_seconds=0.0,
+        )
+        runner._running = True
+        runner._strategy = AlwaysBuyStrategy(config=config, confidence=1.0)
+
+        runner.position_manager.open_position(
+            "AAPL", 10, 100.0, stop_loss_price=98.0, take_profit_price=105.0
+        )
+        await runner._check_risk_stops(None)
+
+        assert len(broker.orders) == 1
+        assert broker.orders[0].side == OrderSide.SELL
+        assert not runner.position_manager.has_position("AAPL")

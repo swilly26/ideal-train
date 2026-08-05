@@ -274,12 +274,127 @@ class AlpacaBroker(Broker):
                 return False
             await asyncio.sleep(poll_interval)
 
-    async def get_open_orders(self):
-        """Return open orders; failures propagate to safety-critical callers."""
+    async def get_open_orders(self, symbol: str | None = None):
+        """Return open orders (optionally filtered to *symbol*).
+
+        Failures propagate to safety-critical callers (they choose to
+        fail closed).  The optional *symbol* filter keeps callers such as
+        protective-stop placement from downloading the whole account's
+        order book and lets them race-check a single symbol's orders.
+        """
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus
-        flt = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        if symbol:
+            flt = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol.upper()])
+        else:
+            flt = GetOrdersRequest(status=QueryOrderStatus.OPEN)
         return await self._run_with_timeout(self._trading_client.get_orders, flt)
+
+    async def wait_for_order_fill(
+        self,
+        order_id: str,
+        timeout: float = 8.0,
+        poll_interval: float = 0.25,
+    ):
+        """Poll an order until it fills, dies, or the timeout elapses.
+
+        This is the settlement barrier the entry path needs before attaching
+        a protective stop: submitting a SELL stop while the entry BUY is
+        still open makes Alpaca reject it as a "potential wash trade"
+        (``opposite side market/stop order exists``).
+
+        Returns
+        -------
+        * the order object once its status is ``filled`` (or ``done_for_day``);
+        * ``False`` if it reached a terminal failure status (rejected, canceled, ...);
+        * ``None`` if neither happened within *timeout* seconds.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                get_order = getattr(self._trading_client, "get_order_by_id", None)
+                if get_order is None:
+                    return None
+                order = await self._run_with_timeout(get_order, order_id)
+                status = str(getattr(order, "status", "")).lower().removeprefix("orderstatus.")
+                if status == "filled" or status == "done_for_day":
+                    return order
+                if not is_order_alive(status):
+                    logger.warning(
+                        "Order %s reached terminal status '%s' before filling",
+                        order_id, status,
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning("Could not poll order %s status: %s", order_id, exc)
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(poll_interval)
+
+    async def place_stop_order(
+        self,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+        client_id: str | None = None,
+    ) -> OrderResult:
+        """Place a GTC stop-loss SELL order at the broker.
+
+        Used for protective stops that must survive process death and
+        sandbox cycling.  GTC orders require whole shares, so *qty* is
+        floored to an integer.  Raises on rejection (so callers can retry
+        with backoff); a duplicate ``client_order_id`` is treated as success
+        (the stop is already live).
+        """
+        from alpaca.trading.requests import StopOrderRequest
+        from alpaca.trading.enums import OrderSide as AlpacaSide
+        from alpaca.trading.enums import TimeInForce
+
+        sym = symbol.upper()
+        whole_qty = int(qty)
+        client_order_id = client_id or self._generate_client_order_id(sym, OrderSide.SELL)
+
+        req = StopOrderRequest(
+            symbol=sym,
+            qty=whole_qty,
+            side=AlpacaSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            stop_price=stop_price,
+            client_order_id=client_order_id,
+        )
+
+        logger.info(
+            "Placing GTC STOP SELL %s x %d @ $%.2f (client_id=%s)",
+            sym, whole_qty, stop_price, client_order_id,
+        )
+        try:
+            alpaca_order = await self._run_with_timeout(
+                self._trading_client.submit_order, req
+            )
+            return self._map_order_result(alpaca_order)
+        except asyncio.TimeoutError:
+            # We never got a response — the stop may or may not be live.
+            # Raise so the caller retries; the idempotency key prevents a
+            # double submission if Alpaca actually got it.
+            logger.warning(
+                "Stop submission timed out after %.1fs (client_id=%s) — retryable",
+                _API_TIMEOUT_SECONDS, client_order_id,
+            )
+            raise
+        except Exception as exc:
+            if _is_duplicate_client_order_id_error(exc):
+                logger.info("🛡️  STOP %s: already placed (duplicate client_order_id)", sym)
+                return OrderResult(
+                    order_id=client_order_id,
+                    symbol=sym,
+                    side=OrderSide.SELL,
+                    quantity=float(whole_qty),
+                    filled_quantity=0.0,
+                    filled_avg_price=None,
+                    status="accepted",  # stop is alive, we just can't see it yet
+                    created_at=datetime.now(),
+                )
+            raise
 
     async def cancel_orders_by_client_id_prefix(self, prefix: str) -> int:
         """Cancel only orders owned by one trader on a shared account."""

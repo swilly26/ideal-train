@@ -630,3 +630,138 @@ class TestStartupHealth:
         mock_trading_client.get_orders.side_effect = [[own, other], [other]]
         assert await broker.cancel_orders_by_client_id_prefix("algoflow_TURBO_") == 1
         mock_trading_client.cancel_order_by_id.assert_called_once_with("own")
+
+
+# ---------------------------------------------------------------------------
+# wait_for_order_fill — the entry-settlement barrier behind the stop-loss fix
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForOrderFill:
+    """Regression for the wash-trade bug: a SELL stop submitted while the
+    entry BUY is still open is rejected by Alpaca ('opposite side market/stop
+    order exists').  The entry path must wait for the fill before attaching
+    the stop."""
+
+    @pytest.mark.asyncio
+    async def test_returns_order_when_filled(self, broker, mock_trading_client):
+        mock_order = MagicMock()
+        mock_order.status = "orderstatus.filled"
+        mock_order.qty = "100"
+        mock_order.filled_avg_price = "32.50"
+        mock_trading_client.get_order_by_id.return_value = mock_order
+
+        result = await broker.wait_for_order_fill("order-1", timeout=1.0)
+        assert result is mock_order
+        assert float(result.qty) == 100.0
+        assert float(result.filled_avg_price) == 32.50
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_order_dies(self, broker, mock_trading_client):
+        mock_order = MagicMock()
+        mock_order.status = "rejected"
+        mock_trading_client.get_order_by_id.return_value = mock_order
+
+        result = await broker.wait_for_order_fill("order-1", timeout=1.0)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_timeout(self, broker, mock_trading_client):
+        """An order stuck open (neither filled nor dead) must time out."""
+        mock_order = MagicMock()
+        mock_order.status = "new"
+        mock_trading_client.get_order_by_id.return_value = mock_order
+
+        start = _time.monotonic()
+        result = await broker.wait_for_order_fill("order-1", timeout=0.2, poll_interval=0.05)
+        elapsed = _time.monotonic() - start
+
+        assert result is None
+        assert elapsed < 1.0
+
+    @pytest.mark.asyncio
+    async def test_polls_until_filled(self, broker, mock_trading_client):
+        """A buy that starts 'new' and later fills must be detected."""
+        o_new = MagicMock()
+        o_new.status = "new"
+        o_filled = MagicMock()
+        o_filled.status = "filled"
+        o_filled.qty = "100"
+        o_filled.filled_avg_price = "32.19"
+        mock_trading_client.get_order_by_id.side_effect = [o_new, o_filled]
+
+        result = await broker.wait_for_order_fill("order-1", timeout=2.0, poll_interval=0.05)
+
+        assert result is o_filled
+        assert mock_trading_client.get_order_by_id.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# place_stop_order — GTC protective stops used by the turbo trader
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceStopOrder:
+    @pytest.mark.asyncio
+    async def test_places_gtc_stop_with_whole_shares(self, broker, mock_trading_client):
+        mock_order = MagicMock()
+        mock_order.id = "stop-1"
+        mock_order.symbol = "FNGU"
+        mock_order.side = "sell"
+        mock_order.qty = "1838"
+        mock_order.filled_qty = "0"
+        mock_order.filled_avg_price = None
+        mock_order.status = "new"
+        mock_order.created_at = datetime(2026, 1, 15, 10, 30, tzinfo=timezone.utc)
+        mock_trading_client.submit_order.return_value = mock_order
+
+        result = await broker.place_stop_order("FNGU", 1838.12, 30.25, client_id="cid-1")
+
+        req = mock_trading_client.submit_order.call_args[0][0]
+        assert req.symbol == "FNGU"
+        assert int(req.qty) == 1838  # floored for GTC
+        assert str(req.side.value) == "sell"
+        assert str(req.time_in_force.value) == "gtc"
+        assert req.stop_price == 30.25
+        assert req.client_order_id == "cid-1"
+        assert result.status == "new"
+
+    @pytest.mark.asyncio
+    async def test_wash_trade_rejection_raises_for_retry(self, broker, mock_trading_client):
+        """A wash-trade rejection must propagate so the caller can retry."""
+        mock_trading_client.submit_order.side_effect = Exception(
+            '{"code":40310000,"message":"potential wash trade detected. use complex orders",'
+            '"reject_reason":"opposite side market/stop order exists"}'
+        )
+        with pytest.raises(Exception, match="wash trade"):
+            await broker.place_stop_order("FNGU", 100, 30.25)
+
+    @pytest.mark.asyncio
+    async def test_duplicate_client_id_returns_accepted(self, broker, mock_trading_client):
+        """A duplicate client_order_id means the stop is already live."""
+        mock_trading_client.submit_order.side_effect = Exception(
+            "duplicate client_order_id detected"
+        )
+        result = await broker.place_stop_order("FNGU", 100, 30.25, client_id="dup-id")
+        assert result.status == "accepted"
+
+
+# ---------------------------------------------------------------------------
+# get_open_orders symbol filter
+# ---------------------------------------------------------------------------
+
+
+class TestGetOpenOrdersFilter:
+    @pytest.mark.asyncio
+    async def test_passes_symbol_filter(self, broker, mock_trading_client):
+        mock_trading_client.get_orders.return_value = []
+        await broker.get_open_orders(symbol="FNGU")
+        flt = mock_trading_client.get_orders.call_args[0][0]
+        assert flt.symbols == ["FNGU"]
+
+    @pytest.mark.asyncio
+    async def test_no_symbol_filter_without_arg(self, broker, mock_trading_client):
+        mock_trading_client.get_orders.return_value = []
+        await broker.get_open_orders()
+        flt = mock_trading_client.get_orders.call_args[0][0]
+        assert getattr(flt, "symbols", None) is None
