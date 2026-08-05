@@ -295,17 +295,32 @@ class LiveTradingRunner:
                 exit_reason="signal",
             )
 
-    async def _check_risk_stops(self, data: pd.DataFrame) -> None:
-        """Check open positions for stop-loss / take-profit triggers."""
+    async def _check_risk_stops(self, data: pd.DataFrame | None = None) -> None:
+        """Check open positions for stop-loss / take-profit triggers.
+
+        Fetches fresh bars **per symbol**: the tick-level ``data`` argument
+        only covers the last-polled symbol, so using it to price other
+        symbols' stops could trigger erroneous stop/take-profit exits on
+        the wrong symbol.  Kept as an optional argument for callers that
+        already hold the right data.
+        """
         positions = self._position_manager.get_positions()
         if not positions:
             return
 
+        now = datetime.now(timezone.utc)
+        lookback = now - timedelta(minutes=5)
+
         for symbol, pos in list(positions.items()):
-            # Use latest bar high/low to check if stop/take were hit
             try:
-                bar = data.loc[data.index[-1]]
-            except (KeyError, IndexError):
+                mdf = await self._data_provider.fetch_bars(
+                    symbol, start=lookback, end=now, timeframe="1min"
+                )
+                if mdf.df.empty:
+                    continue
+                bar = mdf.df.iloc[-1]
+            except Exception as exc:
+                logger.error("Failed to fetch risk data for %s: %s", symbol, exc)
                 continue
 
             high = float(bar["high"])
