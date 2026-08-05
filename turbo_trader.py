@@ -330,53 +330,64 @@ class TurboTrader:
         # ── Post-startup stale position cleanup ──────────────────────
         await self._post_startup_cleanup()
 
-        # Wait for open
-        await self.wait_for_market_open()
+        # Keep the process alive between sessions.  Each iteration waits for
+        # the next market open, prepares session data, trades, and reports a
+        # summary before resetting state for the following trading day.
+        while True:
+            await self.wait_for_market_open()
 
-        # ── Calculate liquidity sweep levels ────────────────────────
-        logger.info("STEP 2/4: Calculating liquidity sweep levels…")
-        await self.liquidity_sweep.calculate_levels(self.provider)
-        self.levels_cache = self.liquidity_sweep.levels
-        logger.info("STEP 2/4: Levels calculated for %d symbols", len(self.levels_cache))
+            # ── Calculate liquidity sweep levels ────────────────────────
+            logger.info("STEP 2/4: Calculating liquidity sweep levels…")
+            await self.liquidity_sweep.calculate_levels(self.provider)
+            self.levels_cache = self.liquidity_sweep.levels
+            logger.info("STEP 2/4: Levels calculated for %d symbols", len(self.levels_cache))
 
-        # ── Ensure inherited positions have protective stops ────────
-        logger.info("STEP 3/4: Checking protective stops for inherited positions…")
-        await self._ensure_protective_stops()
-        logger.info("STEP 3/4: Protective stop check complete")
+            # ── Ensure inherited positions have protective stops ────────
+            logger.info("STEP 3/4: Checking protective stops for inherited positions…")
+            await self._ensure_protective_stops()
+            logger.info("STEP 3/4: Protective stop check complete")
 
-        logger.info("STEP 4/4: Entering main tick loop…")
-        tick = 0
-        try:
-            while True:
-                tick += 1
+            logger.info("STEP 4/4: Entering main tick loop…")
+            tick = 0
+            try:
+                while True:
+                    tick += 1
 
-                # ── EOD mandatory liquidation check ──────────────────
-                try:
-                    if self._is_near_close():
-                        logger.info(f"⏰ Within {MANDATORY_CLOSE_MINUTES} min of close — "
-                                    "triggering mandatory EOD liquidation")
-                        await self._eod_liquidate()
-                        break
-                except Exception:
-                    logger.exception("EOD check/liquidate failed — continuing")
+                    # ── EOD mandatory liquidation check ──────────────────
+                    try:
+                        if self._is_near_close():
+                            logger.info(f"⏰ Within {MANDATORY_CLOSE_MINUTES} min of close — "
+                                        "triggering mandatory EOD liquidation")
+                            await self._eod_liquidate()
+                            break
+                    except Exception:
+                        logger.exception("EOD check/liquidate failed — continuing")
 
-                try:
-                    market_open = await self.broker.is_market_open()
-                    if not market_open:
-                        logger.info("⏹️  Market closed — shutting down")
-                        break
-                except Exception:
-                    logger.exception("Market-open check failed — assuming open, continuing")
+                    try:
+                        market_open = await self.broker.is_market_open()
+                        if not market_open:
+                            logger.info("⏹️  Market closed — completing session and waiting for next open")
+                            break
+                    except Exception:
+                        logger.exception("Market-open check failed — assuming open, continuing")
 
-                await self._safe_tick(tick)
-                logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
-                await asyncio.sleep(CHECK_INTERVAL)
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-        except Exception as e:
-            logger.exception("FATAL: Unhandled exception in main loop — %s", e)
-        finally:
-            await self.shutdown()
+                    await self._safe_tick(tick)
+                    logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
+                    await asyncio.sleep(CHECK_INTERVAL)
+            except KeyboardInterrupt:
+                logger.info("Interrupted by user")
+                await self.shutdown()
+                return
+            except Exception as e:
+                logger.exception("FATAL: Unhandled exception in main loop — %s", e)
+
+            await self.shutdown(close_broker=False)
+            self.pm.reset()
+            self._entry_times.clear()
+            self.day_trades.clear()
+            self._ls_symbols.clear()
+            self.levels_cache.clear()
+            logger.info("Session state reset — waiting for next market open")
 
     async def _safe_tick(self, tick_num: int):
         """Wrapper around _tick that catches all exceptions so one bad tick
@@ -913,8 +924,8 @@ class TurboTrader:
 
         logger.info(f"⏰ Mandatory EOD liquidation — {count} positions closed.")
 
-    async def shutdown(self):
-        """🚀 TURBO SHUTDOWN — Liquidate all TURBO positions and report final P&L."""
+    async def shutdown(self, close_broker: bool = True):
+        """Liquidate all TURBO positions and report P&L; optionally retain broker."""
         logger.info("🚀 TURBO SHUTDOWN — Liquidating all turbo positions")
 
         # Close all TURBO positions only (never touch main trader's symbols)
@@ -958,7 +969,8 @@ class TurboTrader:
         logger.info(f"Log:    {log_file}")
         logger.info("=" * 60)
 
-        await self.broker.close()
+        if close_broker:
+            await self.broker.close()
 
 
 # ── Entry point ────────────────────────────────────────────────────
