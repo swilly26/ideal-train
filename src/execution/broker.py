@@ -49,6 +49,7 @@ class OrderResult:
     filled_avg_price: float | None
     status: str  # "filled", "partial", "rejected", ...
     created_at: datetime
+    error_message: str | None = None
 
 
 class Broker(ABC):

@@ -191,6 +191,19 @@ class PositionManager:
         )
         return trade
 
+    def discard_position(self, symbol: str, reason: str = "broker_rejected") -> PositionRecord | None:
+        """Remove a locally tracked position that the broker says does not exist.
+
+        This is intentionally separate from :meth:`close_position`: a rejected
+        sell (for example Alpaca's ``cannot be sold short`` response) is not a
+        realised trade and must not create a zero-price loss record.
+        """
+        sym = symbol.upper()
+        record = self._positions.pop(sym, None)
+        if record is not None:
+            logger.warning("Removed phantom position %s (%s)", sym, reason)
+        return record
+
     def update_price(self, symbol: str, price: float) -> None:
         """Update the mark-to-market price for an open position."""
         sym = symbol.upper()

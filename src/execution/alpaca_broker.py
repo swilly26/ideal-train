@@ -178,7 +178,7 @@ class AlpacaBroker(Broker):
             alpaca_order = await self._run_with_timeout(
                 self._trading_client.submit_order, req
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             # We never got a response — the order may or may not be live.
             # Fail closed (rejected) so the caller retries; the idempotency
             # key prevents a double submission if Alpaca actually got it.
@@ -196,6 +196,7 @@ class AlpacaBroker(Broker):
                 filled_avg_price=None,
                 status="rejected",
                 created_at=datetime.now(),
+                error_message=str(exc),
             )
         except Exception as exc:
             # If Alpaca rejects because this client_order_id was already used,
@@ -225,6 +226,7 @@ class AlpacaBroker(Broker):
                 filled_avg_price=None,
                 status="rejected",
                 created_at=datetime.now(),
+                error_message=str(exc),
             )
 
         return self._map_order_result(alpaca_order)

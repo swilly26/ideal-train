@@ -212,18 +212,21 @@ class TurboTrader:
     # ── Market open wait ─────────────────────────────────────────────
 
     async def wait_for_market_open(self):
-        """Block until the market opens.
+        """Wait for 9:30 ET using local DST-aware time as the primary gate."""
+        from zoneinfo import ZoneInfo
 
-        Polls ``is_market_open()`` every 30s and emits a throttled INFO
-        heartbeat every 5 minutes so a long pre-open wait is never confused
-        with a hang (the Alpaca clock call is itself timeout-protected in
-        the broker layer).
-        """
         logger.info("🚀 Waiting for market to open (9:30 AM ET)...")
-        last_heartbeat = 0.0
-        heartbeat_interval = 300.0  # 5 min
-        check_interval = 30.0       # fixed 30s poll — simple, safe
+        last_heartbeat = time.monotonic()
+        heartbeat_interval = 300.0
+        check_interval = 30.0
         while True:
+            seconds_until = self._seconds_until_open()
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            before_open = now_et.weekday() < 5 and (now_et.hour, now_et.minute) < (9, 30)
+            if seconds_until > 0 and (before_open or now_et.weekday() >= 5 or now_et.hour >= 16):
+                await asyncio.sleep(min(max(seconds_until - 60.0, 1.0), heartbeat_interval))
+                continue
+
             try:
                 if await self.broker.is_market_open():
                     logger.info("✅ Market is OPEN — starting TURBO trading")
@@ -232,15 +235,16 @@ class TurboTrader:
                     logger.info(f"   Starting equity: ${self.start_equity:,.2f}")
                     return
             except Exception as e:
-                logger.warning(f"Market check failed: {e}")
+                if now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 35):
+                    logger.warning("Market clock unavailable after grace period (%s); proceeding", e)
+                    account = await self.broker.get_account()
+                    self.start_equity = float(account.get("equity", 100_000))
+                    logger.info("✅ Market assumed OPEN — starting TURBO trading")
+                    return
+                logger.warning("Market check failed during grace period: %s", e)
 
             if time.monotonic() - last_heartbeat >= heartbeat_interval:
-                logger.info(
-                    "Still waiting for market open, next check in %.0fs "
-                    "(≈%.0f min until 9:30 AM ET)",
-                    check_interval,
-                    self._seconds_until_open() / 60,
-                )
+                logger.info("Still waiting for market open, next check in %.0fs (clock confirmation)", check_interval)
                 last_heartbeat = time.monotonic()
             await asyncio.sleep(check_interval)
 
@@ -584,13 +588,19 @@ class TurboTrader:
         result = await self.broker.place_order(order)
 
         if not is_order_alive(result.status):
-            # The protective stop was cancelled above — restore it so the
-            # position doesn't run naked because of a rejected exit.
-            logger.warning(
-                "SELL %s rejected (%s); keeping position tracked — restoring protective stop",
-                symbol, result.status,
-            )
-            await self._place_protective_stop(symbol, qty, entry)
+            error = (getattr(result, "error_message", None) or "").lower()
+            if "cannot be sold short" in error:
+                self.pm.discard_position(symbol, reason="broker says position is not held")
+                self._entry_times.pop(symbol.upper(), None)
+                logger.warning("SELL %s rejected as phantom position; removed from tracking", symbol)
+            else:
+                # The protective stop was cancelled above — restore it so the
+                # position doesn't run naked because of a rejected exit.
+                logger.warning(
+                    "SELL %s rejected (%s); keeping position tracked — restoring protective stop",
+                    symbol, result.status,
+                )
+                await self._place_protective_stop(symbol, qty, entry)
             return
 
         pnl = (price - entry) * qty if entry else 0
