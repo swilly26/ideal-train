@@ -36,7 +36,7 @@ _TIMEFRAME_MAP: dict[str, str] = {
 # Maximum seconds to wait for a single yfinance download before timing out.
 # A hung yfinance call blocks a thread in the default executor pool forever;
 # this timeout lets us recover gracefully.
-YFINANCE_TIMEOUT_SEC = 20
+YFINANCE_TIMEOUT_SEC = 15
 
 
 class YFinanceProvider(DataProvider):
@@ -109,6 +109,7 @@ class YFinanceProvider(DataProvider):
                     timeout=YFINANCE_TIMEOUT_SEC,
                 )
             except asyncio.TimeoutError:
+                df = pd.DataFrame()
                 logger.warning(
                     "Yahoo Finance download timed out for %s (%s) after %ds",
                     symbol, interval, YFINANCE_TIMEOUT_SEC,
@@ -156,6 +157,7 @@ class YFinanceProvider(DataProvider):
                         timeout=YFINANCE_TIMEOUT_SEC,
                     )
                 except asyncio.TimeoutError:
+                    df = pd.DataFrame()
                     logger.warning("Yahoo period fallback timed out for %s (%s)", symbol, yf_interval)
                 except Exception as exc:
                     logger.warning("Yahoo period fallback failed for %s (%s): %s", symbol, yf_interval, exc)
