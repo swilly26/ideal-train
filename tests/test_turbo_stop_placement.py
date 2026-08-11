@@ -52,10 +52,10 @@ class FakeBroker:
                 self._open_orders = view
         return [o for o in self._open_orders if o.symbol == symbol]
 
-    async def place_stop_order(self, symbol, qty, stop_price, client_id=None):
+    async def place_stop_order(self, symbol, qty, stop_price, client_id=None, side="SELL"):
         if self._stop_errors:
             raise self._stop_errors.pop(0)
-        self.stop_requests.append((symbol, qty, stop_price, client_id))
+        self.stop_requests.append((symbol, qty, stop_price, client_id, side))
         return MagicMock(status="new")
 
     async def place_order(self, order):
@@ -125,9 +125,10 @@ class TestPlaceProtectiveStop:
 
         assert ok is True
         assert len(broker.stop_requests) == 1
-        symbol, qty, stop_price, _ = broker.stop_requests[0]
+        symbol, qty, stop_price, _, stop_side = broker.stop_requests[0]
         assert symbol == "FNGU"
         assert qty == 100
+        assert stop_side == "SELL"
         assert stop_price == round(32.0 * (1 - turbo_trader.STRATEGY_CONFIG.stop_loss_pct), 2)
 
     @pytest.mark.asyncio
@@ -200,9 +201,10 @@ class TestHandleBuy:
         assert pos.entry_price == 32.50
 
         assert len(broker.stop_requests) == 1
-        symbol, qty, stop_price, _ = broker.stop_requests[0]
+        symbol, qty, stop_price, _, stop_side = broker.stop_requests[0]
         assert symbol == "FNGU"
         assert qty == 100
+        assert stop_side == "SELL"
         assert stop_price == round(32.50 * 0.94, 2)
 
     @pytest.mark.asyncio

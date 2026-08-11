@@ -165,8 +165,12 @@ class PositionManager:
             logger.warning("Attempted to close non-existent position: %s", sym)
             return None
 
+        # P&L is direction-aware: a short position stores a NEGATIVE quantity,
+        # so ``qty * (exit - entry)`` is already correct (a short profits when
+        # price falls).  Only the percentage needs an explicit sign flip.
+        direction = 1.0 if record.quantity > 0 else -1.0
         pnl = record.quantity * (exit_price - record.entry_price)
-        pnl_pct = (exit_price / record.entry_price - 1.0) if record.entry_price else 0.0
+        pnl_pct = (direction * (exit_price / record.entry_price - 1.0)) if record.entry_price else 0.0
 
         trade = ClosedTrade(
             symbol=sym,

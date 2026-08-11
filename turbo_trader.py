@@ -57,6 +57,16 @@ MOMENTUM_CONFIG = {
     "rsi_period": 14,
     "rsi_threshold": 40,        # RSI > 40 = momentum not oversold (lowered from 50)
 }
+# ── Feature flags (Recommendation #1 from the weekly trade analysis) ──
+# Each can be flipped independently for paper-trading A/B comparison.
+ENABLE_REGIME_GATE = True   # Skip mean-reversion LONGs in a confirmed downtrend
+                            # (price below 10-bar MA AND RSI(14) < 40).  The turbo
+                            # trader went 0-for-8 this week buying 3x ETFs into
+                            # falling markets; the gate stops that.
+ENABLE_SHORT_SELLING = True # Open SHORT positions when momentum SELL fires in a
+                            # downtrend (price < MA, RSI < 40, high confidence),
+                            # with inverted stop-loss (above entry) / take-profit
+                            # (below entry).  Flattened with the EOD liquidation.
 
 # Market close in UTC (4 PM ET = 20:00 UTC standard, 20:00 UTC year-round
 # for simplicity — Alpaca clock is the final authority for is_market_open)
@@ -154,8 +164,17 @@ def _generate_momentum_signals(
         # ── SELL signal: MA cross-under OR price < MA and weak RSI ──
         elif (cur_close < cur_ma and prev_close >= prev_ma) or \
              (cur_close < cur_ma and cur_rsi < 60):
-            # Cross below MA — momentum broken, or price below MA with weakening RSI
-            confidence = min(1.0, abs(cur_close - cur_ma) / (abs(cur_ma) + 1e-9) * 10)
+            # Cross below MA — momentum broken, or price below MA with weakening RSI.
+            # Confidence bug (fixed): the old formula ``dist_pct * 10`` produced
+            # 0.05–0.4 for realistic 3x ETF moves (1–3% from the MA), so the SELL
+            # signal could essentially never cross the 0.4 activation threshold.
+            # Rescaled below so a 1% move scores ~0.4 and 2–3% moves reach
+            # 0.5–1.0, blended with RSI weakness and a fresh-cross bonus.
+            dist_pct = abs(cur_close - cur_ma) / (abs(cur_ma) + 1e-9)
+            dist_score = min(1.0, dist_pct * 40)            # 1% away → 0.4, 2.5%+ → 1.0
+            rsi_score = max(0.0, min(1.0, (60.0 - cur_rsi) / 40.0))  # 0 @ RSI=60, 1 @ RSI<=20
+            cross_bonus = 0.15 if (cur_close < cur_ma and prev_close >= prev_ma) else 0.0
+            confidence = min(1.0, 0.3 + 0.7 * (0.5 * dist_score + 0.3 * rsi_score) + cross_bonus)
             signal = Signal(
                 symbol=symbol,
                 timestamp=ts,
@@ -174,6 +193,45 @@ def _generate_momentum_signals(
             )
 
     return signals
+
+
+# ── Regime gate ────────────────────────────────────────────────────
+def _regime_gate_allows_long(
+    data: "pd.DataFrame",
+    ma_period: int = 10,
+    rsi_period: int = 14,
+    rsi_threshold: float = 40.0,
+) -> "tuple[bool, str]":
+    """Return ``(allow, reason)`` for a mean-reversion LONG on *data*.
+
+    A long is BLOCKED only in a confirmed downtrend — price below the
+    10-bar MA AND RSI(14) below *rsi_threshold*.  The turbo trader's
+    0-for-8 week was caused by buying 3x leveraged ETFs into exactly this
+    regime.  When either condition is healthy (price above the MA, or RSI
+    recovering), the long is allowed — this is a filter, not a trend
+    follower.
+
+    ``reason`` is a human-readable string for audit logging when blocked
+    (empty string when allowed).
+    """
+    close = data["close"]
+    if len(close) < max(ma_period, rsi_period) + 1:
+        return True, "insufficient data"
+    ma = sma(close, period=ma_period)
+    rsi = _compute_rsi(close, period=rsi_period)
+    cur = float(close.iloc[-1])
+    cur_ma = float(ma.iloc[-1])
+    cur_rsi = float(rsi.iloc[-1])
+    if pd.isna(cur_ma) or pd.isna(cur_rsi):
+        return True, "insufficient indicator history"
+    below_ma = cur < cur_ma
+    weak_rsi = cur_rsi < rsi_threshold
+    if below_ma and weak_rsi:
+        return False, (
+            f"downtrend: price {cur:.2f} < MA{ma_period} {cur_ma:.2f} "
+            f"AND RSI {cur_rsi:.1f} < {rsi_threshold}"
+        )
+    return True, ""
 
 
 # ── Turbo-specific idempotency key generator ────────────────────────
@@ -479,17 +537,65 @@ class TurboTrader:
 
                 current_price = float(data["close"].iloc[-1])
                 strategy_name = best_signal.metadata.get("strategy", "mean_reversion")
+                pos = self.pm.get_positions().get(symbol.upper())
 
                 if best_signal.signal_type == SignalType.BUY:
-                    await self._handle_buy(symbol, current_price, best_signal.confidence, strategy_name)
-                    entered_this_tick = True  # max 1 entry per tick
-                    # Track liquidity sweep entries for the max-1-LS-position guard
-                    if strategy_name == "liquidity_sweep":
-                        self._ls_symbols.add(symbol.upper())
+                    if pos is not None and pos.quantity < 0:
+                        # Momentum flipped bullish while we are SHORT — buy to
+                        # cover the short (downtrend broken).
+                        logger.info(
+                            "📗 COVER %s: momentum BUY while short — buying to cover",
+                            symbol,
+                        )
+                        await self._handle_sell(symbol, current_price, best_signal.confidence, strategy_name)
+                        self._ls_symbols.discard(symbol.upper())
+                    else:
+                        # ── Regime gate: block mean-reversion LONGs in a
+                        #    confirmed downtrend (price < MA10 AND RSI < 40) ──
+                        if ENABLE_REGIME_GATE and strategy_name == "mean_reversion":
+                            allow, reason = _regime_gate_allows_long(
+                                data,
+                                ma_period=MOMENTUM_CONFIG["ma_period"],
+                                rsi_period=MOMENTUM_CONFIG["rsi_period"],
+                                rsi_threshold=MOMENTUM_CONFIG["rsi_threshold"],
+                            )
+                            if not allow:
+                                logger.info(
+                                    "🚫 REGIME GATE %s: skipping mean-reversion LONG — %s",
+                                    symbol, reason,
+                                )
+                                continue
+                        await self._handle_buy(symbol, current_price, best_signal.confidence, strategy_name)
+                        entered_this_tick = True  # max 1 entry per tick
+                        # Track liquidity sweep entries for the max-1-LS-position guard
+                        if strategy_name == "liquidity_sweep":
+                            self._ls_symbols.add(symbol.upper())
                 elif best_signal.signal_type == SignalType.SELL:
-                    await self._handle_sell(symbol, current_price, best_signal.confidence, strategy_name)
-                    # If we sold an LS position, remove from tracking
-                    self._ls_symbols.discard(symbol.upper())
+                    if pos is not None and pos.quantity < 0:
+                        # Already short — never double up on the downside
+                        logger.debug(
+                            "Momentum SELL %s: already short — skipping (no doubling)",
+                            symbol,
+                        )
+                        continue
+                    if pos is not None:
+                        await self._handle_sell(symbol, current_price, best_signal.confidence, strategy_name)
+                        # If we sold an LS position, remove from tracking
+                        self._ls_symbols.discard(symbol.upper())
+                    elif ENABLE_SHORT_SELLING and strategy_name == "momentum" and \
+                            float(best_signal.metadata.get("rsi", 100)) < MOMENTUM_CONFIG["rsi_threshold"]:
+                        # No position + momentum SELL in a confirmed downtrend
+                        # (price < MA, RSI < 40) → open a SHORT instead of
+                        # doing nothing.
+                        await self._handle_short_sell(symbol, current_price, best_signal.confidence, strategy_name)
+                        entered_this_tick = True  # max 1 new entry per tick
+                    else:
+                        logger.debug(
+                            "SELL %s: no long to close (short selling %s)",
+                            symbol,
+                            "disabled" if not ENABLE_SHORT_SELLING
+                            else "requires momentum RSI < %s" % MOMENTUM_CONFIG["rsi_threshold"],
+                        )
 
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {e}")
@@ -563,6 +669,75 @@ class TurboTrader:
         else:
             logger.warning(f"❌ BUY {symbol} REJECTED: {result.status}")
 
+    async def _handle_short_sell(self, symbol: str, price: float, confidence: float, strategy: str = ""):
+        """Open a SHORT position when momentum SELL fires in a downtrend.
+
+        Submits a SELL market order (Alpaca opens a short when flat), records
+        the position with a NEGATIVE quantity in the PositionManager, and
+        attaches a GTC BUY stop ABOVE entry (the stop-loss side for shorts).
+        Sizing mirrors ``_handle_buy``: ``POSITION_SIZE_PCT`` of equity.
+        """
+        if self.pm.has_position(symbol):
+            return
+        if self.pm.get_open_count() >= MAX_POSITIONS:
+            return
+        account = await self.broker.get_account()
+        equity = float(account.get("equity", 100_000))
+        if not self.pm.can_open(symbol, equity):
+            return
+        value = equity * POSITION_SIZE_PCT
+        qty = value / price if price > 0 else 0
+        if qty < 1:
+            return
+        order = Order(
+            symbol=symbol,
+            side=OrderSide.SELL,  # short sell — opens a short when flat
+            quantity=qty,
+            order_type=OrderType.MARKET,
+            client_id=_turbo_client_id(symbol, OrderSide.SELL),
+        )
+        result = await self.broker.place_order(order)
+        if is_order_alive(result.status):
+            # ── Wait for the entry to fill before attaching the stop ──
+            # A BUY stop submitted while the entry SELL is still open is
+            # rejected by Alpaca's wash-trade filter; poll the entry until it
+            # settles so the stop goes in on a filled position.
+            fill_price = result.filled_avg_price if result.filled_avg_price else price
+            filled_qty = qty
+            order_id = result.order_id
+            if order_id:
+                filled = await self.broker.wait_for_order_fill(order_id, timeout=8.0)
+                if filled is False:
+                    # Entry order died (rejected/canceled) after submission —
+                    # do NOT track a position that doesn't exist.
+                    logger.warning(f"❌ SHORT {symbol} entry order died after submission — not opening position")
+                    return
+                if filled is not None:
+                    fq = float(getattr(filled, "qty", 0) or 0)
+                    fp = float(getattr(filled, "filled_avg_price", 0) or 0)
+                    if fq > 0:
+                        filled_qty = fq
+                    if fp > 0:
+                        fill_price = fp
+                else:
+                    logger.warning(
+                        f"⏳ SHORT {symbol}: fill not confirmed within 8s — opening position "
+                        f"defensively (in-process risk checks still active)"
+                    )
+
+            # Negative quantity = short position (PnL math stays correct).
+            self.pm.open_position(symbol, -filled_qty, fill_price)
+            self._entry_times[symbol.upper()] = datetime.now(timezone.utc)  # time-based exit
+            strat_tag = f" [{strategy}]" if strategy else ""
+            logger.info(
+                f"🔻 SHORT {symbol}: {filled_qty:.1f} shares @ ${fill_price:.2f} = ${value:,.2f} | "
+                f"conf={confidence:.2f}{strat_tag} | order={result.order_id[:8]}"
+            )
+            # ── Place GTC protective BUY stop ABOVE entry ────────────
+            await self._place_protective_stop(symbol, filled_qty, fill_price, is_short=True)
+        else:
+            logger.warning(f"❌ SHORT {symbol} REJECTED: {result.status}")
+
     async def _handle_sell(self, symbol: str, price: float, confidence: float, strategy: str = ""):
         if not self.pm.has_position(symbol):
             return
@@ -572,24 +747,30 @@ class TurboTrader:
             return
         qty = pos.quantity
         entry = pos.entry_price
+        is_short = qty < 0
+        abs_qty = abs(qty)
+        # Closing a long = SELL; closing a short = BUY (buy to cover)
+        side = OrderSide.BUY if is_short else OrderSide.SELL
+        action = "COVER" if is_short else "SELL"
 
         # ── Cancel protective stop before selling ───────────────────
         if not await self._cancel_protective_stops(symbol):
-            logger.warning("SELL %s deferred: protective-order cancellation was not confirmed", symbol)
+            logger.warning("%s %s deferred: protective-order cancellation was not confirmed",
+                           action, symbol)
             return
 
         order = Order(
             symbol=symbol,
-            side=OrderSide.SELL,
-            quantity=qty,
+            side=side,
+            quantity=abs_qty,
             order_type=OrderType.MARKET,
-            client_id=_turbo_client_id(symbol, OrderSide.SELL),
+            client_id=_turbo_client_id(symbol, side),
         )
         result = await self.broker.place_order(order)
 
         if not is_order_alive(result.status):
             error = (getattr(result, "error_message", None) or "").lower()
-            if "cannot be sold short" in error:
+            if not is_short and "cannot be sold short" in error:
                 self.pm.discard_position(symbol, reason="broker says position is not held")
                 self._entry_times.pop(symbol.upper(), None)
                 logger.warning("SELL %s rejected as phantom position; removed from tracking", symbol)
@@ -597,20 +778,26 @@ class TurboTrader:
                 # The protective stop was cancelled above — restore it so the
                 # position doesn't run naked because of a rejected exit.
                 logger.warning(
-                    "SELL %s rejected (%s); keeping position tracked — restoring protective stop",
-                    symbol, result.status,
+                    "%s %s rejected (%s); keeping position tracked — restoring protective stop",
+                    action, symbol, result.status,
                 )
-                await self._place_protective_stop(symbol, qty, entry)
+                await self._place_protective_stop(symbol, abs_qty, entry, is_short=is_short)
             return
 
-        pnl = (price - entry) * qty if entry else 0
-        pnl_pct = ((price / entry) - 1.0) * 100 if entry else 0
+        # Direction-aware P&L: a short profits when price falls.
+        if is_short:
+            pnl = (entry - price) * abs_qty
+            pnl_pct = ((entry / price) - 1.0) * 100 if price else 0
+        else:
+            pnl = (price - entry) * qty
+            pnl_pct = ((price / entry) - 1.0) * 100 if entry else 0
         self.pm.close_position(symbol, price)
         self._entry_times.pop(symbol.upper(), None)  # clean up time tracker
 
         strat_tag = f" [{strategy}]" if strategy else ""
+        log_icon = "📗" if is_short else "📉"
         logger.info(
-            f"📉 SELL {symbol}: {qty:.1f} shares @ ${price:.2f} | "
+            f"{log_icon} {action} {symbol}: {abs_qty:.1f} shares @ ${price:.2f} | "
             f"P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%) | conf={confidence:.2f}{strat_tag} | "
             f"order={result.order_id[:8]}"
         )
@@ -638,36 +825,47 @@ class TurboTrader:
             if sym not in pm_symbols:
                 entry_price = pos_data["avg_entry_price"]
                 current_price = float(pos_data.get("current_price", entry_price))
-                qty = pos_data["qty"]
+                qty = pos_data["qty"]  # negative for short positions
+                is_short = qty < 0
+                abs_qty = abs(qty)
 
-                # ── Cleanup: sell inherited underwater positions (>2% loss) ──
+                # ── Cleanup: liquidate inherited underwater positions (>2% loss) ──
+                # A short is underwater when price RISES above entry.
                 if current_price > 0 and entry_price > 0:
-                    pnl_pct = (current_price - entry_price) / entry_price
+                    if is_short:
+                        pnl_pct = (entry_price - current_price) / entry_price
+                    else:
+                        pnl_pct = (current_price - entry_price) / entry_price
                     if pnl_pct < -0.02:
+                        side = OrderSide.BUY if is_short else OrderSide.SELL
+                        action = "COVER" if is_short else "SELL"
                         logger.info(
-                            "🧹 Cleanup SELL %s: inherited at $%.2f, now $%.2f = %.1f%%",
-                            sym, entry_price, current_price, pnl_pct * 100,
+                            "🧹 Cleanup %s %s: inherited at $%.2f, now $%.2f = %.1f%%",
+                            action, sym, entry_price, current_price, pnl_pct * 100,
                         )
                         order = Order(
                             symbol=sym,
-                            side=OrderSide.SELL,
-                            quantity=qty,
+                            side=side,
+                            quantity=abs_qty,
                             order_type=OrderType.MARKET,
-                            client_id=_turbo_client_id(sym, OrderSide.SELL),
+                            client_id=_turbo_client_id(sym, side),
                         )
                         result = await self.broker.place_order(order)
                         if is_order_alive(result.status):
-                            continue  # Don't add to PM — the sell was accepted
-                        logger.warning("🧹 Cleanup SELL %s rejected (%s); tracking position", sym, result.status)
+                            continue  # Don't add to PM — the exit was accepted
+                        logger.warning(
+                            "🧹 Cleanup %s %s rejected (%s); tracking position",
+                            action, sym, result.status,
+                        )
 
                 self.pm.open_position(
                     symbol=sym,
-                    quantity=qty,
+                    quantity=qty,  # negative qty = short, P&L math stays correct
                     entry_price=entry_price,
                 )
                 logger.info(
-                    "  + Added %s: %s shares @ $%.2f (sync)",
-                    sym, qty, entry_price,
+                    "  + Added %s: %s shares @ $%.2f (sync)%s",
+                    sym, abs_qty, entry_price, " [SHORT]" if is_short else "",
                 )
                 added += 1
 
@@ -710,36 +908,44 @@ class TurboTrader:
             for p in positions:
                 sym = p.get("symbol")
                 qty = float(p.get("qty", 0))
-                if qty > 0:
-                    # Cancel protective stop before liquidating
-                    if not await self._cancel_protective_stops(sym):
-                        logger.warning("🧹 Cleanup SELL %s deferred: cancellation not confirmed", sym)
-                        continue
-                    logger.info("🧹 Cleanup SELL %s: %s shares", sym, qty)
-                    order = Order(
-                        symbol=sym,
-                        side=OrderSide.SELL,
-                        quantity=qty,
-                        order_type=OrderType.MARKET,
-                        client_id=_turbo_client_id(sym, OrderSide.SELL),
+                if qty == 0:
+                    continue
+                is_short = qty < 0
+                abs_qty = abs(qty)
+                side = OrderSide.BUY if is_short else OrderSide.SELL
+                action = "COVER" if is_short else "SELL"
+                # Cancel protective stop before liquidating
+                if not await self._cancel_protective_stops(sym):
+                    logger.warning("🧹 Cleanup %s %s deferred: cancellation not confirmed",
+                                   action, sym)
+                    continue
+                logger.info("🧹 Cleanup %s %s: %s shares%s",
+                            action, sym, abs_qty, " [short]" if is_short else "")
+                order = Order(
+                    symbol=sym,
+                    side=side,
+                    quantity=abs_qty,
+                    order_type=OrderType.MARKET,
+                    client_id=_turbo_client_id(sym, side),
+                )
+                result = await self.broker.place_order(order)
+                if not is_order_alive(result.status):
+                    # Stop was cancelled above — restore it so the stale
+                    # position isn't left naked if the cleanup exit fails.
+                    logger.warning(
+                        "🧹 Cleanup %s %s rejected (%s); restoring protective stop and keeping position",
+                        action, sym, result.status,
                     )
-                    result = await self.broker.place_order(order)
-                    if not is_order_alive(result.status):
-                        # Stop was cancelled above — restore it so the stale
-                        # position isn't left naked if the cleanup sell fails.
-                        logger.warning(
-                            "🧹 Cleanup SELL %s rejected (%s); restoring protective stop and keeping position",
-                            sym, result.status,
-                        )
-                        await self._place_protective_stop(
-                            sym, qty, float(p.get("avg_entry_price", 0)) or 0,
-                        )
-                        continue
-                    self.pm.close_position(
-                        sym,
-                        exit_price=float(p.get("current_price", 0)),
-                        exit_reason="post_close_cleanup",
+                    await self._place_protective_stop(
+                        sym, abs_qty, float(p.get("avg_entry_price", 0)) or 0,
+                        is_short=is_short,
                     )
+                    continue
+                self.pm.close_position(
+                    sym,
+                    exit_price=float(p.get("current_price", 0)),
+                    exit_reason="post_close_cleanup",
+                )
             logger.info(
                 "🧹 Post-close cleanup complete — %d turbo position(s) liquidated",
                 len(positions),
@@ -756,14 +962,17 @@ class TurboTrader:
         entry_price: float,
         max_attempts: int = 4,
         initial_delay: float = 2.0,
+        is_short: bool = False,
     ) -> bool:
-        """Place a GTC stop-loss sell order at the broker.
+        """Place a GTC protective stop-loss order at the broker.
 
         This order survives process death and sandbox cycling — Alpaca holds
-        it until triggered or cancelled.  The stop price is set at
-        ``entry_price * (1 - stop_loss_pct)`` (currently 6% below entry).
+        it until triggered or cancelled.  For LONG positions the stop is a
+        SELL at ``entry_price * (1 - stop_loss_pct)`` (6% below entry); for
+        SHORT positions it is a BUY at ``entry_price * (1 + stop_loss_pct)``
+        (6% ABOVE entry — a short loses money when price rises).
 
-        Retries with backoff: submitting the stop while the entry BUY is
+        Retries with backoff: submitting the stop while the entry order is
         still open makes Alpaca reject it as a "potential wash trade"
         (``opposite side market/stop order exists``), which previously left
         positions running without any broker-side protection for the rest of
@@ -776,23 +985,33 @@ class TurboTrader:
             logger.warning("🛡️  STOP %s: position too small for protective stop (qty < 1 share)", sym)
             return False
 
-        stop_price = round(entry_price * (1 - STRATEGY_CONFIG.stop_loss_pct), 2)
+        stop_price = round(
+            entry_price * (1 + STRATEGY_CONFIG.stop_loss_pct) if is_short
+            else entry_price * (1 - STRATEGY_CONFIG.stop_loss_pct),
+            2,
+        )
+        stop_side = "BUY" if is_short else "SELL"
+        opposite_open = "BUY" if is_short else "SELL"
 
         for attempt in range(1, max_attempts + 1):
             # ── Re-check the symbol's open orders before each attempt ──
-            # Another process may have placed a sell/stop order during the
-            # entry-to-stop window, and an open BUY would make the stop
-            # bounce off Alpaca's wash-trade filter.
+            # Another process may have placed a stop order during the
+            # entry-to-stop window, and an open opposite-side order would
+            # make the stop bounce off Alpaca's wash-trade filter.
             try:
                 existing = await self.broker.get_open_orders(symbol=sym)
-                if any(str(getattr(o, "side", "")).upper().endswith("SELL") for o in existing):
-                    logger.info("🛡️  STOP %s: existing sell order found; not submitting duplicate", sym)
+                # For a long, an existing SELL order means the stop is already
+                # there.  For a short, an existing BUY order plays that role
+                # (the short's entry is a SELL, so it can't be confused).
+                if any(str(getattr(o, "side", "")).upper().endswith(stop_side) for o in existing):
+                    logger.info("🛡️  STOP %s: existing %s order found; not submitting duplicate",
+                                sym, stop_side)
                     return True
-                if any(str(getattr(o, "side", "")).upper().endswith("BUY") for o in existing):
+                if any(str(getattr(o, "side", "")).upper().endswith(opposite_open) for o in existing):
                     if attempt < max_attempts:
                         logger.info(
-                            "🛡️  STOP %s: entry BUY still open — waiting %.0fs before retry (%d/%d)",
-                            sym, initial_delay, attempt, max_attempts,
+                            "🛡️  STOP %s: entry %s still open — waiting %.0fs before retry (%d/%d)",
+                            sym, opposite_open, initial_delay, attempt, max_attempts,
                         )
                         await asyncio.sleep(initial_delay)
                         continue
@@ -809,10 +1028,13 @@ class TurboTrader:
                     qty=qty,
                     stop_price=stop_price,
                     client_id=client_id,
+                    side=stop_side,
                 )
+                direction = "+" if is_short else "-"
                 logger.info(
-                    "🛡️  STOP %s: GTC stop-loss at $%.2f (entry=%.2f, -%.0f%%)",
-                    sym, stop_price, entry_price, STRATEGY_CONFIG.stop_loss_pct * 100,
+                    "🛡️  STOP %s: GTC %s stop-loss at $%.2f (entry=%.2f, %s%.0f%%)",
+                    sym, stop_side, stop_price, entry_price, direction,
+                    STRATEGY_CONFIG.stop_loss_pct * 100,
                 )
                 return True
             except Exception as exc:
@@ -880,12 +1102,13 @@ class TurboTrader:
             logger.warning("Cannot verify protective stops — order fetch failed: %s", exc)
             return
 
-        # Build a set of symbols that already have an open sell order
+        # Build a set of symbols that already have an open stop order
+        # (SELL stop for longs, BUY stop for shorts — either means covered)
         covered_symbols: set[str] = set()
         for o in open_orders:
             o_sym = str(o.symbol).upper()
             o_side = str(o.side).upper()
-            if o_sym in turbo_set and o_side == "SELL":
+            if o_sym in turbo_set and o_side in ("SELL", "BUY"):
                 covered_symbols.add(o_sym)
 
         for sym in list(self.pm.get_open_symbols()):
@@ -899,12 +1122,15 @@ class TurboTrader:
                 logger.info("🛡️  %s: existing stop order found — covered", sym)
                 continue
 
+            is_short = pos.quantity < 0
             logger.warning(
                 "🛡️  %s: NO protective stop found for inherited position "
-                "(%s shares @ $%.2f) — placing one now",
-                sym, pos.quantity, pos.entry_price,
+                "(%s shares @ $%.2f%s) — placing one now",
+                sym, abs(pos.quantity), pos.entry_price, " [short]" if is_short else "",
             )
-            await self._place_protective_stop(sym, int(pos.quantity), pos.entry_price)
+            await self._place_protective_stop(
+                sym, int(abs(pos.quantity)), pos.entry_price, is_short=is_short,
+            )
 
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
@@ -931,6 +1157,7 @@ class TurboTrader:
                     continue
 
                 change_pct = (price - entry) / entry
+                is_short = pos.quantity < 0
 
                 # ── Time-based exit: recycle capital after MAX_HOLD_MINUTES ──
                 entry_time = self._entry_times.get(symbol.upper())
@@ -943,17 +1170,30 @@ class TurboTrader:
                     logger.info(f"⏰ TIME-EXIT {symbol}: held {held_minutes:.0f}min, P&L={change_pct*100:+.1f}%")
                     continue
 
-                if change_pct <= -STRATEGY_CONFIG.stop_loss_pct:
-                    await self._handle_sell(symbol, price, 1.0, "risk_stop")
-                    logger.warning(f"🛑 STOP-LOSS {symbol}: -{abs(change_pct)*100:.1f}%")
-                elif change_pct >= STRATEGY_CONFIG.take_profit_pct:
-                    await self._handle_sell(symbol, price, 1.0, "risk_stop")
-                    logger.info(f"🎯 TAKE-PROFIT {symbol}: +{change_pct*100:.1f}%")
+                if is_short:
+                    # Inverted risk math: a short loses when price RISES above
+                    # entry (stop-loss) and profits when price falls below
+                    # entry by the take-profit distance.
+                    if change_pct >= STRATEGY_CONFIG.stop_loss_pct:
+                        await self._handle_sell(symbol, price, 1.0, "risk_stop")
+                        logger.warning(f"🛑 STOP-LOSS (SHORT) {symbol}: {change_pct*100:+.1f}% above entry")
+                    elif change_pct <= -STRATEGY_CONFIG.take_profit_pct:
+                        await self._handle_sell(symbol, price, 1.0, "risk_stop")
+                        logger.info(f"🎯 TAKE-PROFIT (SHORT) {symbol}: {change_pct*100:+.1f}% below entry")
+                else:
+                    if change_pct <= -STRATEGY_CONFIG.stop_loss_pct:
+                        await self._handle_sell(symbol, price, 1.0, "risk_stop")
+                        logger.warning(f"🛑 STOP-LOSS {symbol}: -{abs(change_pct)*100:.1f}%")
+                    elif change_pct >= STRATEGY_CONFIG.take_profit_pct:
+                        await self._handle_sell(symbol, price, 1.0, "risk_stop")
+                        logger.info(f"🎯 TAKE-PROFIT {symbol}: +{change_pct*100:.1f}%")
             except Exception as e:
                 logger.error(f"Risk check error {symbol}: {e}")
 
     async def _eod_liquidate(self):
-        """Sell all open TURBO positions for mandatory end-of-day liquidation."""
+        """Sell all open TURBO positions for mandatory end-of-day liquidation.
+        Longs are sold; shorts are bought to cover.  Either way every turbo
+        position is flat before the close."""
         positions = await self.broker.get_positions()
         # Filter to turbo symbols only — never liquidate main trader's positions
         positions = [p for p in positions if p.get("symbol", "").upper() in {s.upper() for s in SYMBOLS}]
@@ -965,32 +1205,38 @@ class TurboTrader:
         for p in positions:
             sym = p.get("symbol")
             qty = float(p.get("qty", 0))
-            if qty > 0:
-                # ── Cancel protective stop before liquidating ─────────
-                if not await self._cancel_protective_stops(sym):
-                    logger.warning("⏰ EOD SELL %s deferred: cancellation not confirmed", sym)
-                    continue
-                logger.info(f"⏰ EOD closing {sym}: {qty} shares...")
-                order = Order(
-                    symbol=sym,
-                    side=OrderSide.SELL,
-                    quantity=qty,
-                    order_type=OrderType.MARKET,
-                    client_id=_turbo_client_id(sym, OrderSide.SELL),
+            if qty == 0:
+                continue
+            is_short = qty < 0
+            abs_qty = abs(qty)
+            side = OrderSide.BUY if is_short else OrderSide.SELL
+            action = "COVER" if is_short else "SELL"
+            # ── Cancel protective stop before liquidating ─────────
+            if not await self._cancel_protective_stops(sym):
+                logger.warning("⏰ EOD %s %s deferred: cancellation not confirmed", action, sym)
+                continue
+            logger.info(f"⏰ EOD closing {sym}: {abs_qty} shares ({'short' if is_short else 'long'})...")
+            order = Order(
+                symbol=sym,
+                side=side,
+                quantity=abs_qty,
+                order_type=OrderType.MARKET,
+                client_id=_turbo_client_id(sym, side),
+            )
+            result = await self.broker.place_order(order)
+            if not is_order_alive(result.status):
+                # Stop was cancelled above — restore it so the position
+                # doesn't sit naked overnight if the EOD exit fails.
+                logger.warning(
+                    "⏰ EOD %s %s rejected (%s); restoring protective stop and keeping position",
+                    action, sym, result.status,
                 )
-                result = await self.broker.place_order(order)
-                if not is_order_alive(result.status):
-                    # Stop was cancelled above — restore it so the position
-                    # doesn't sit naked overnight if the EOD exit fails.
-                    logger.warning(
-                        "⏰ EOD SELL %s rejected (%s); restoring protective stop and keeping position",
-                        sym, result.status,
-                    )
-                    await self._place_protective_stop(
-                        sym, qty, float(p.get("avg_entry_price", 0)) or 0,
-                    )
-                    continue
-                self.pm.close_position(sym, exit_price=float(p.get("current_price", 0)), exit_reason="eod")
+                await self._place_protective_stop(
+                    sym, abs_qty, float(p.get("avg_entry_price", 0)) or 0,
+                    is_short=is_short,
+                )
+                continue
+            self.pm.close_position(sym, exit_price=float(p.get("current_price", 0)), exit_reason="eod")
 
         logger.info(f"⏰ Mandatory EOD liquidation — {count} positions closed.")
 
@@ -1004,30 +1250,36 @@ class TurboTrader:
         for p in positions:
             sym = p.get("symbol")
             qty = float(p.get("qty", 0))
-            if qty > 0:
-                # ── Cancel protective stop before liquidating ─────────
-                if not await self._cancel_protective_stops(sym):
-                    logger.warning("Shutdown SELL %s deferred: cancellation not confirmed", sym)
-                    continue
-                logger.info(f"Closing {sym}: {qty} shares...")
-                order = Order(
-                    symbol=sym,
-                    side=OrderSide.SELL,
-                    quantity=qty,
-                    order_type=OrderType.MARKET,
-                    client_id=_turbo_client_id(sym, OrderSide.SELL),
+            if qty == 0:
+                continue
+            is_short = qty < 0
+            abs_qty = abs(qty)
+            side = OrderSide.BUY if is_short else OrderSide.SELL
+            action = "COVER" if is_short else "SELL"
+            # ── Cancel protective stop before liquidating ─────────
+            if not await self._cancel_protective_stops(sym):
+                logger.warning("Shutdown %s %s deferred: cancellation not confirmed", action, sym)
+                continue
+            logger.info(f"Closing {sym}: {abs_qty} shares ({'short' if is_short else 'long'})...")
+            order = Order(
+                symbol=sym,
+                side=side,
+                quantity=abs_qty,
+                order_type=OrderType.MARKET,
+                client_id=_turbo_client_id(sym, side),
+            )
+            result = await self.broker.place_order(order)
+            if not is_order_alive(result.status):
+                # Stop was cancelled above — restore it so the position
+                # doesn't run naked if the shutdown exit fails.
+                logger.warning(
+                    "Shutdown %s %s rejected (%s); restoring protective stop",
+                    action, sym, result.status,
                 )
-                result = await self.broker.place_order(order)
-                if not is_order_alive(result.status):
-                    # Stop was cancelled above — restore it so the position
-                    # doesn't run naked if the shutdown exit fails.
-                    logger.warning(
-                        "Shutdown SELL %s rejected (%s); restoring protective stop",
-                        sym, result.status,
-                    )
-                    await self._place_protective_stop(
-                        sym, qty, float(p.get("avg_entry_price", 0)) or 0,
-                    )
+                await self._place_protective_stop(
+                    sym, abs_qty, float(p.get("avg_entry_price", 0)) or 0,
+                    is_short=is_short,
+                )
 
         # Final account state
         account = await self.broker.get_account()
