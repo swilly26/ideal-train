@@ -339,14 +339,18 @@ class AlpacaBroker(Broker):
         qty: float,
         stop_price: float,
         client_id: str | None = None,
+        side: str = "SELL",
     ) -> OrderResult:
-        """Place a GTC stop-loss SELL order at the broker.
+        """Place a GTC stop-loss order at the broker.
 
         Used for protective stops that must survive process death and
         sandbox cycling.  GTC orders require whole shares, so *qty* is
         floored to an integer.  Raises on rejection (so callers can retry
         with backoff); a duplicate ``client_order_id`` is treated as success
         (the stop is already live).
+
+        *side* is ``"SELL"`` for long positions (stop below entry) or
+        ``"BUY"`` for short positions (stop above entry).
         """
         from alpaca.trading.requests import StopOrderRequest
         from alpaca.trading.enums import OrderSide as AlpacaSide
@@ -355,19 +359,20 @@ class AlpacaBroker(Broker):
         sym = symbol.upper()
         whole_qty = int(qty)
         client_order_id = client_id or self._generate_client_order_id(sym, OrderSide.SELL)
+        stop_side = AlpacaSide.BUY if str(side).upper() == "BUY" else AlpacaSide.SELL
 
         req = StopOrderRequest(
             symbol=sym,
             qty=whole_qty,
-            side=AlpacaSide.SELL,
+            side=stop_side,
             time_in_force=TimeInForce.GTC,
             stop_price=stop_price,
             client_order_id=client_order_id,
         )
 
         logger.info(
-            "Placing GTC STOP SELL %s x %d @ $%.2f (client_id=%s)",
-            sym, whole_qty, stop_price, client_order_id,
+            "Placing GTC STOP %s %s x %d @ $%.2f (client_id=%s)",
+            stop_side.value, sym, whole_qty, stop_price, client_order_id,
         )
         try:
             alpaca_order = await self._run_with_timeout(
