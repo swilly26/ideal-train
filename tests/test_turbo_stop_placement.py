@@ -82,6 +82,7 @@ def _make_trader(broker: FakeBroker):
     trader.pm = PositionManager(turbo_trader.STRATEGY_CONFIG)
     trader._entry_times = {}
     trader._ls_symbols = set()
+    trader._extended_holds = set()
     return trader
 
 

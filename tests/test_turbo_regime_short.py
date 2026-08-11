@@ -113,7 +113,14 @@ def _make_trader(broker: FakeBroker):
     trader.pm = PositionManager(turbo_trader.STRATEGY_CONFIG)
     trader._entry_times = {}
     trader._ls_symbols = set()
+    trader._extended_holds = set()
     trader.levels_cache = {}
+    # Mean-reversion instances: base + UVXY short-lookback (violence tier).
+    # MagicMock keeps _tick's UVXY routing from raising on symbols it visits.
+    trader.mean_reversion = MagicMock()
+    trader.mean_reversion.generate_signals.return_value = []
+    trader.uvxy_mean_reversion = MagicMock()
+    trader.uvxy_mean_reversion.generate_signals.return_value = []
     return trader
 
 

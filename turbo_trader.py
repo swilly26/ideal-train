@@ -33,13 +33,54 @@ from src.strategies.liquidity_sweep import LiquiditySweepStrategy
 from src.strategies.indicators import sma, z_score
 
 # ── Configuration ──────────────────────────────────────────────────
-SYMBOLS = ["SOXL", "TQQQ", "FNGU", "SPXL"]  # 3x leveraged ETFs (LABU dropped — data errors)
+TURBO_SYMBOLS = ["SOXL", "TQQQ", "FNGU", "SPXL"]  # 3x leveraged ETFs (LABU dropped — data errors)
+# ── High-volatility ("VIOLENCE") tier ─────────────────────────────────────
+# More aggressive instruments for the owner's "embrace volatility" direction:
+# bigger per-trade moves mean bigger payouts even at a 60% win rate.  These
+# run ALONGSIDE the base turbo symbols — the effective pool is
+# TURBO_SYMBOLS + VIOLENCE_SYMBOLS (up to 9 symbols).
+VIOLENCE_SYMBOLS = [
+    "TNA",   # 3x Russell 2000 bull — small-caps are more volatile than large-cap ETFs
+    "TZA",   # 3x Russell 2000 bear
+    "LABU",  # 3x biotech bull — biotech is extremely volatile
+    "LABD",  # 3x biotech bear
+    "UVXY",  # 1.5x VIX short-term futures — tracks volatility itself, massive swings
+    "NVDL",  # 2x NVDA bull — single-stock leverage, amplifies NVDA's big moves
+    "TSLR",  # 2x TSLA bull — single-stock leverage
+]
+ENABLE_VIOLENCE_TIER = True    # False → pool falls back to the original 4 turbo symbols
+# Violence-tier risk profile: tight stops get eaten alive on these names, so
+# the stop widens to 9% and take-profit to 13%; position size drops to 40%
+# (vs 50%) to survive the drawdowns.  Same max-2-positions rule.
+VIOLENCE_STOP_LOSS_PCT = 0.09     # 8-10% band — tight stops get eaten alive here
+VIOLENCE_TAKE_PROFIT_PCT = 0.13   # 12-15% band
+VIOLENCE_POSITION_SIZE_PCT = 0.40 # 35-40% band — smaller size survives drawdowns
+MAX_HOLD_EXTENDED_MINUTES = 60    # trend-extension cap: profitable 30-min hold → 60 min
 CHECK_INTERVAL = 60
 CONFIDENCE_THRESHOLD = 0.4   # Lower threshold = more entries
 MAX_POSITIONS = 2            # 50% per position × 2 = 100% deployed — no margin needed
 POSITION_SIZE_PCT = 0.50     # 50% per position — max conviction sizing
 MANDATORY_CLOSE_MINUTES = 30  # Liquidate all positions 30 min before market close
 MAX_HOLD_MINUTES = 30          # Max time to hold a position — recycle capital
+def _effective_symbols() -> list[str]:
+    """Effective turbo symbol pool: base 4 + violence tier when enabled."""
+    if ENABLE_VIOLENCE_TIER:
+        return list(TURBO_SYMBOLS) + list(VIOLENCE_SYMBOLS)
+    return list(TURBO_SYMBOLS)
+SYMBOLS = _effective_symbols()
+_VIOLENCE_SET = {s.upper() for s in VIOLENCE_SYMBOLS}
+def _is_violence_symbol(symbol: str) -> bool:
+    """True if *symbol* belongs to the high-volatility ("VIOLENCE") tier."""
+    return symbol.upper() in _VIOLENCE_SET
+def _risk_params_for(symbol: str) -> tuple[float, float]:
+    """(stop_loss_pct, take_profit_pct) for *symbol* — tier-aware routing."""
+    if _is_violence_symbol(symbol):
+        return VIOLENCE_STOP_LOSS_PCT, VIOLENCE_TAKE_PROFIT_PCT
+    return STRATEGY_CONFIG.stop_loss_pct, STRATEGY_CONFIG.take_profit_pct
+def _position_size_pct_for(symbol: str) -> float:
+    """Position size (fraction of equity) for *symbol* — tier-aware routing."""
+    return VIOLENCE_POSITION_SIZE_PCT if _is_violence_symbol(symbol) else POSITION_SIZE_PCT
+
 
 STRATEGY_CONFIG = StrategyConfig(
     entry_threshold=0.5,
@@ -49,6 +90,18 @@ STRATEGY_CONFIG = StrategyConfig(
     max_position_pct=POSITION_SIZE_PCT,
     extra={"lookback": 20, "std_dev_multiplier": 2.0},
 )
+# UVXY mean-reversion config: VIX products have massive decay and revert
+# faster than equities, so a 20-bar Z-score lookback lags too much — use a
+# shorter 10-bar lookback so reversion entries fire while the move is fresh.
+UVXY_MR_CONFIG = StrategyConfig(
+    entry_threshold=STRATEGY_CONFIG.entry_threshold,
+    exit_threshold=STRATEGY_CONFIG.exit_threshold,
+    stop_loss_pct=VIOLENCE_STOP_LOSS_PCT,
+    take_profit_pct=VIOLENCE_TAKE_PROFIT_PCT,
+    max_position_pct=VIOLENCE_POSITION_SIZE_PCT,
+    extra={"lookback": 10, "std_dev_multiplier": 2.0},
+)
+
 
 # Momentum strategy config (separate thresholds for the dual-strategy approach)
 MOMENTUM_CONFIG = {
@@ -234,6 +287,37 @@ def _regime_gate_allows_long(
     return True, ""
 
 
+def _trend_extension_qualifies(data: "pd.DataFrame", pos) -> bool:
+    """Return True if a violence-tier position held >= MAX_HOLD_MINUTES is
+    profitably trending in the right direction and deserves the extended
+    60-min hold (instead of the hard 30-min exit).
+
+    Qualification: the position must be in profit (price beyond entry in the
+    direction of the trade) AND the latest bar must be moving further in the
+    trade's direction (last close vs first close of the fetched window).
+    - long:  price > entry and price rising
+    - short: price < entry and price falling
+    VIX/leveraged names trend hard when they move; cutting a winner at 30 min
+    is how the turbo trader capped its upside.  Base-tier symbols never get
+    the extension — they keep the plain 30-min max hold.
+    """
+    close = data["close"]
+    if len(close) < 2:
+        return False
+    price = float(close.iloc[-1])
+    entry = float(getattr(pos, "entry_price", 0) or 0)
+    qty = float(getattr(pos, "quantity", 0) or 0)
+    if entry <= 0:
+        return False
+    if qty < 0:  # short — profitable when price fell; needs continued downside
+        if price >= entry:
+            return False
+        return float(close.iloc[-1]) < float(close.iloc[0])
+    # long — profitable when price rose; needs continued upside
+    if price <= entry:
+        return False
+    return float(close.iloc[-1]) > float(close.iloc[0])
+
 # ── Turbo-specific idempotency key generator ────────────────────────
 
 def _turbo_client_id(symbol: str, side: OrderSide) -> str:
@@ -259,10 +343,14 @@ class TurboTrader:
         self.broker = AlpacaBroker()
         self.provider = YFinanceProvider()
         self.mean_reversion = MeanReversionStrategy(config=STRATEGY_CONFIG)
+        # UVXY gets its own mean-reversion instance with a shorter 10-bar
+        # lookback — VIX products decay and revert faster than equities.
+        self.uvxy_mean_reversion = MeanReversionStrategy(config=UVXY_MR_CONFIG)
         self.liquidity_sweep = LiquiditySweepStrategy(symbols=SYMBOLS)
         self.levels_cache: dict[str, dict[str, float | None]] = {}
         self._ls_symbols: set[str] = set()  # symbols entered via liquidity sweep
         self._entry_times: dict[str, datetime] = {}  # when each position was opened
+        self._extended_holds: set[str] = set()  # violence-tier holds granted the 60-min trend extension
         self.pm = PositionManager(STRATEGY_CONFIG)
         self.day_trades: list[dict] = []
         self.start_equity = 0.0
@@ -354,11 +442,17 @@ class TurboTrader:
         """Main trading loop."""
         logger.info("=" * 60)
         logger.info("🚀 AlgoFlow TURBO Live Trader — STARTING")
-        logger.info(f"Symbols: {SYMBOLS} (3x Leveraged ETFs)")
+        logger.info(f"Symbols: {SYMBOLS}")
+        if ENABLE_VIOLENCE_TIER:
+            logger.info(
+                f"🔥 VIOLENCE tier ENABLED: {len(VIOLENCE_SYMBOLS)} high-vol symbols "
+                f"(stops {VIOLENCE_STOP_LOSS_PCT:.0%}/TP {VIOLENCE_TAKE_PROFIT_PCT:.0%}, "
+                f"size {VIOLENCE_POSITION_SIZE_PCT:.0%}, hold ≤ {MAX_HOLD_EXTENDED_MINUTES}min w/ trend ext)"
+            )
         logger.info(f"Strategy: MeanReversion + Momentum + LiquiditySweep | Confidence ≥ {CONFIDENCE_THRESHOLD}")
-        logger.info(f"Max positions: {MAX_POSITIONS} | Size: {POSITION_SIZE_PCT*100:.0f}% equity")
-        logger.info(f"Stop-loss: {STRATEGY_CONFIG.stop_loss_pct*100:.0f}% | "
-                    f"Take-profit: {STRATEGY_CONFIG.take_profit_pct*100:.0f}%")
+        logger.info(f"Max positions: {MAX_POSITIONS} | Base size: {POSITION_SIZE_PCT*100:.0f}% equity")
+        logger.info(f"Base stop-loss: {STRATEGY_CONFIG.stop_loss_pct*100:.0f}% | "
+                    f"take-profit: {STRATEGY_CONFIG.take_profit_pct*100:.0f}%")
         logger.info(f"⚠️  Mandatory EOD liquidation {MANDATORY_CLOSE_MINUTES} min before close")
         logger.info("=" * 60)
 
@@ -448,6 +542,7 @@ class TurboTrader:
             self._entry_times.clear()
             self.day_trades.clear()
             self._ls_symbols.clear()
+            self._extended_holds.clear()
             self.levels_cache.clear()
             logger.info("Session state reset — waiting for next market open")
 
@@ -492,7 +587,13 @@ class TurboTrader:
                     continue
 
                 # ── Generate signals from all three strategies ───────
-                mr_signals = self.mean_reversion.generate_signals(data)
+                # UVXY reverts faster than equities (massive decay) → route
+                # it to the short-lookback (10-bar) mean-reversion instance.
+                mr_strategy = (
+                    self.uvxy_mean_reversion if symbol.upper() == "UVXY"
+                    else self.mean_reversion
+                )
+                mr_signals = mr_strategy.generate_signals(data)
                 mom_signals = _generate_momentum_signals(
                     data,
                     symbol=symbol,
@@ -614,7 +715,7 @@ class TurboTrader:
         if not self.pm.can_open(symbol, equity):
             return
 
-        value = equity * POSITION_SIZE_PCT
+        value = equity * _position_size_pct_for(symbol)  # tier-aware: 50% base / 40% violence
         qty = value / price if price > 0 else 0
         if qty < 1:
             return
@@ -685,7 +786,7 @@ class TurboTrader:
         equity = float(account.get("equity", 100_000))
         if not self.pm.can_open(symbol, equity):
             return
-        value = equity * POSITION_SIZE_PCT
+        value = equity * _position_size_pct_for(symbol)  # tier-aware: 50% base / 40% violence
         qty = value / price if price > 0 else 0
         if qty < 1:
             return
@@ -985,9 +1086,12 @@ class TurboTrader:
             logger.warning("🛡️  STOP %s: position too small for protective stop (qty < 1 share)", sym)
             return False
 
+        # Tier-aware stop distance: 6% for base turbo symbols, 9% for the
+        # violence tier (tight stops get eaten alive on high-vol names).
+        stop_loss_pct = _risk_params_for(symbol)[0]
         stop_price = round(
-            entry_price * (1 + STRATEGY_CONFIG.stop_loss_pct) if is_short
-            else entry_price * (1 - STRATEGY_CONFIG.stop_loss_pct),
+            entry_price * (1 + stop_loss_pct) if is_short
+            else entry_price * (1 - stop_loss_pct),
             2,
         )
         stop_side = "BUY" if is_short else "SELL"
@@ -1034,7 +1138,7 @@ class TurboTrader:
                 logger.info(
                     "🛡️  STOP %s: GTC %s stop-loss at $%.2f (entry=%.2f, %s%.0f%%)",
                     sym, stop_side, stop_price, entry_price, direction,
-                    STRATEGY_CONFIG.stop_loss_pct * 100,
+                    stop_loss_pct * 100,
                 )
                 return True
             except Exception as exc:
@@ -1133,16 +1237,26 @@ class TurboTrader:
             )
 
     async def _check_risk_stops(self):
-        """Check stop-loss / take-profit for open positions."""
+        """Check stop-loss / take-profit for open positions.
+
+        Risk parameters are tier-aware: base turbo symbols use the 6%/8%
+        stops from ``STRATEGY_CONFIG``; violence-tier symbols use the wider
+        9%/13% band.  Time-based exit: base symbols hard-exit after
+        ``MAX_HOLD_MINUTES`` (30); violence-tier symbols may extend a
+        profitably-trending position to ``MAX_HOLD_EXTENDED_MINUTES`` (60).
+        """
+        # Prune extension markers for positions that were closed elsewhere
+        self._extended_holds &= {s.upper() for s in self.pm.get_open_symbols()}
         for symbol in list(self.pm.get_open_symbols()):
             if symbol.upper() not in {s.upper() for s in SYMBOLS}:
                 continue  # Safety: never touch non-turbo symbols
             if not self.pm.has_position(symbol):
                 continue
             try:
+                # 10-min window: enough bars for the trend-extension check
                 mdf = await self.provider.fetch_bars(
                     symbol,
-                    start=datetime.now(timezone.utc) - timedelta(minutes=5),
+                    start=datetime.now(timezone.utc) - timedelta(minutes=10),
                     end=datetime.now(timezone.utc),
                     timeframe="1min",
                 )
@@ -1155,41 +1269,54 @@ class TurboTrader:
                 entry = pos.entry_price
                 if entry == 0:
                     continue
-
                 change_pct = (price - entry) / entry
                 is_short = pos.quantity < 0
-
+                stop_loss_pct, take_profit_pct = _risk_params_for(symbol)
                 # ── Time-based exit: recycle capital after MAX_HOLD_MINUTES ──
                 entry_time = self._entry_times.get(symbol.upper())
                 held_minutes = 0.0
                 if entry_time is not None:
                     held_minutes = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
-
-                if held_minutes >= MAX_HOLD_MINUTES:
+                extended = symbol.upper() in self._extended_holds
+                max_hold = MAX_HOLD_EXTENDED_MINUTES if extended else MAX_HOLD_MINUTES
+                if held_minutes >= max_hold:
+                    # ── Trend extension (violence tier only): at the 30-min
+                    #    mark, a position that is profitable AND still moving
+                    #    in the trade's direction gets 60 min instead of an
+                    #    automatic exit — cutting a trending winner at 30 min
+                    #    caps exactly the upside this tier exists for.
+                    if (not extended and _is_violence_symbol(symbol)
+                            and _trend_extension_qualifies(mdf.df, pos)):
+                        self._extended_holds.add(symbol.upper())
+                        logger.info(
+                            f"⏳ TREND-EXTENSION {symbol}: held {held_minutes:.0f}min, "
+                            f"P&L={change_pct*100:+.1f}%, still trending — "
+                            f"extending hold to {MAX_HOLD_EXTENDED_MINUTES}min"
+                        )
+                        continue
                     await self._handle_sell(symbol, price, 1.0, "time_exit")
+                    self._extended_holds.discard(symbol.upper())
                     logger.info(f"⏰ TIME-EXIT {symbol}: held {held_minutes:.0f}min, P&L={change_pct*100:+.1f}%")
                     continue
-
                 if is_short:
                     # Inverted risk math: a short loses when price RISES above
                     # entry (stop-loss) and profits when price falls below
                     # entry by the take-profit distance.
-                    if change_pct >= STRATEGY_CONFIG.stop_loss_pct:
+                    if change_pct >= stop_loss_pct:
                         await self._handle_sell(symbol, price, 1.0, "risk_stop")
                         logger.warning(f"🛑 STOP-LOSS (SHORT) {symbol}: {change_pct*100:+.1f}% above entry")
-                    elif change_pct <= -STRATEGY_CONFIG.take_profit_pct:
+                    elif change_pct <= -take_profit_pct:
                         await self._handle_sell(symbol, price, 1.0, "risk_stop")
                         logger.info(f"🎯 TAKE-PROFIT (SHORT) {symbol}: {change_pct*100:+.1f}% below entry")
                 else:
-                    if change_pct <= -STRATEGY_CONFIG.stop_loss_pct:
+                    if change_pct <= -stop_loss_pct:
                         await self._handle_sell(symbol, price, 1.0, "risk_stop")
                         logger.warning(f"🛑 STOP-LOSS {symbol}: -{abs(change_pct)*100:.1f}%")
-                    elif change_pct >= STRATEGY_CONFIG.take_profit_pct:
+                    elif change_pct >= take_profit_pct:
                         await self._handle_sell(symbol, price, 1.0, "risk_stop")
                         logger.info(f"🎯 TAKE-PROFIT {symbol}: +{change_pct*100:.1f}%")
             except Exception as e:
                 logger.error(f"Risk check error {symbol}: {e}")
-
     async def _eod_liquidate(self):
         """Sell all open TURBO positions for mandatory end-of-day liquidation.
         Longs are sold; shorts are bought to cover.  Either way every turbo
