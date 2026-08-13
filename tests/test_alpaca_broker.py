@@ -214,12 +214,13 @@ class TestGetAccount:
         assert result["portfolio_value"] == 100000.00
 
     @pytest.mark.asyncio
-    async def test_get_account_failure_returns_zeros(self, broker, mock_trading_client):
-        """Failed account fetch should return zeros."""
+    async def test_get_account_failure_returns_sentinel(self, broker, mock_trading_client):
+        """Failed account fetch should return the unavailable sentinel, never zeros."""
         mock_trading_client.get_account.side_effect = Exception("network error")
         result = await broker.get_account()
-        assert result["buying_power"] == 0.0
-        assert result["equity"] == 0.0
+        assert result["buying_power"] is None
+        assert result["equity"] is None
+        assert result["available"] is False
 
 
 class TestGetPositions:
@@ -293,10 +294,10 @@ class TestMarketClock:
         assert await broker.is_market_open() is False
 
     @pytest.mark.asyncio
-    async def test_is_market_open_returns_false_on_error(self, broker, mock_trading_client):
-        """When clock API fails, default to False (safe)."""
+    async def test_is_market_open_returns_none_on_error(self, broker, mock_trading_client):
+        """When clock API fails, return None (indeterminate) so the run loop retries."""
         mock_trading_client.get_clock.side_effect = Exception("timeout")
-        assert await broker.is_market_open() is False
+        assert await broker.is_market_open() is None
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +319,6 @@ class TestApiTimeouts:
         import src.execution.alpaca_broker as broker_mod
         monkeypatch.setattr(broker_mod, "_API_TIMEOUT_SECONDS", 0.1)
 
-    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_is_market_open_times_out_and_returns_none(self, broker, mock_trading_client, monkeypatch):
         """A hung clock call must return None (indeterminate, bounded) - the run
@@ -343,6 +343,8 @@ class TestApiTimeouts:
         assert result["buying_power"] is None
         assert result["available"] is False
         assert elapsed < 1.0, f"get_account hung for {elapsed:.1f}s"
+
+    @pytest.mark.asyncio
     async def test_get_positions_times_out_and_returns_empty(self, broker, mock_trading_client, monkeypatch):
         """A hung positions fetch must return [] (fail closed)."""
         self._patch_timeout(monkeypatch)
