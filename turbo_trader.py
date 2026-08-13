@@ -437,6 +437,7 @@ class TurboTrader:
                 logger.info("Still waiting for market open, next check in %.0fs (clock confirmation)", check_interval)
                 last_heartbeat = time.monotonic()
             await asyncio.sleep(check_interval)
+    @staticmethod
     def _seconds_until_open() -> float:
         """Seconds until next 9:30 AM ET market open (DST-aware).
 
