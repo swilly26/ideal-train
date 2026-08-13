@@ -159,8 +159,14 @@ class TestRunLoopRetriesOnNone:
         trader.liquidity_sweep.calculate_levels = noop_calculate_levels
         trader.provider = None
 
+        wait_calls = {"n": 0}
+
         async def fake_wait_for_market_open():
-            pass
+            # First call: start the session.  Second call: stop the infinite
+            # outer loop of run() so the test can terminate.
+            wait_calls["n"] += 1
+            if wait_calls["n"] >= 2:
+                raise KeyboardInterrupt
         trader.wait_for_market_open = fake_wait_for_market_open
         trader._ensure_protective_stops = lambda: asyncio.sleep(0)
         trader._post_startup_cleanup = lambda: asyncio.sleep(0)
@@ -176,7 +182,8 @@ class TestRunLoopRetriesOnNone:
         trader.shutdown = fake_shutdown
 
         monkeypatch.setattr(turbo_trader, "CHECK_INTERVAL", 0.001)
-        await trader.run()
+        with pytest.raises(KeyboardInterrupt):
+            await trader.run()
 
         assert calls["clock_calls"] >= 5
         assert calls["ticks"] == 2          # traded after the clock recovered
