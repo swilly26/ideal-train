@@ -17,10 +17,11 @@ from pathlib import Path
 # ── Project imports ────────────────────────────────────────────────
 import src.strategies  # registers strategies
 from src.data.yfinance_provider import YFinanceProvider
-from src.execution.alpaca_broker import AlpacaBroker, is_order_alive
+from src.execution.alpaca_broker import AlpacaBroker, account_equity, is_order_alive
 from src.execution.broker import Order, OrderSide, OrderType
 import time
 from src.execution.position_manager import PositionManager
+from src.execution.session_state import load_start_equity, save_start_equity
 from src.strategies.base import SignalType, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
 
@@ -77,14 +78,47 @@ class LiveTrader:
         self.day_trades: list[dict] = []
         self.start_equity = 0.0
 
+    # ── Session baseline (start equity) ──────────────────────────────
+    def _restore_start_equity(self) -> bool:
+        """Reload today's persisted start baseline (stable across restarts)."""
+        equity = load_start_equity()
+        if equity is not None and equity > 0:
+            self.start_equity = equity
+            return True
+        return False
+
+    def _set_start_equity(self, equity: float) -> None:
+        """Record the day baseline and persist it for watchdog restarts."""
+        self.start_equity = float(equity)
+        if not save_start_equity(self.start_equity):
+            logger.warning("Could not persist session start equity to %s",
+                           "logs/session_state.json")
+
+    async def _begin_session(self, assumed: bool) -> bool:
+        """Establish the day's P&L baseline; return True when ready to trade."""
+        if self.start_equity is None or self.start_equity <= 0:
+            if self._restore_start_equity():
+                logger.info("✅ %s — resuming session (baseline reloaded)",
+                            "Market is OPEN" if not assumed else "Market assumed OPEN")
+                return True
+            account = await self.broker.get_account()
+            equity = account_equity(account)
+            if equity is None or equity <= 0:
+                logger.warning("Account equity unavailable — cannot establish session baseline")
+                return False
+            self._set_start_equity(equity)
+        logger.info("✅ %s — starting trading",
+                    "Market is OPEN" if not assumed else "Market assumed OPEN")
+        logger.info("   Starting equity: ${:,.2f}".format(self.start_equity))
+        return True
+
     async def wait_for_market_open(self):
         """Wait for 9:30 ET using local DST-aware time as the primary gate.
-
-        Alpaca's clock is only a confirmation: a timeout cannot strand the
-        trader after the session has opened (with a five-minute grace period).
+        Alpaca's clock is only a confirmation: a timeout (``None``) cannot
+        strand the trader after the session has opened (with a five-minute
+        grace period) and can never be mistaken for a confirmed close.
         """
         from zoneinfo import ZoneInfo
-
         logger.info("Waiting for market to open (9:30 AM ET)...")
         last_heartbeat = time.monotonic()
         heartbeat_interval = 300.0
@@ -99,32 +133,29 @@ class LiveTrader:
                 sleep_for = min(max(seconds_until - 60.0, 1.0), heartbeat_interval)
                 await asyncio.sleep(sleep_for)
                 continue
-
             # We are at/past the calculated open. Confirm with Alpaca, but do
             # not wait indefinitely when its clock endpoint is unavailable.
             try:
-                clock_open = await self.broker.is_market_open()
-                if clock_open:
-                    logger.info("✅ Market is OPEN — starting trading")
-                    account = await self.broker.get_account()
-                    self.start_equity = float(account.get("equity", 100_000))
-                    logger.info(f"   Starting equity: ${self.start_equity:,.2f}")
-                    return
+                market_open = await self.broker.is_market_open()
             except Exception as e:
-                if now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 35):
-                    logger.warning("Market clock unavailable after grace period (%s); proceeding", e)
-                    account = await self.broker.get_account()
-                    self.start_equity = float(account.get("equity", 100_000))
-                    logger.info("✅ Market assumed OPEN — starting trading")
+                logger.warning("Market check failed: %s", e)
+                market_open = None
+            if market_open is True:
+                if await self._begin_session(assumed=False):
                     return
-                logger.warning("Market check failed during grace period: %s", e)
-
+            elif market_open is None:
+                # Clock unavailable — indeterminate, NOT a confirmed close.
+                if now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 35):
+                    logger.warning("Market clock unavailable after grace period — proceeding on local time")
+                    if await self._begin_session(assumed=True):
+                        return
+                else:
+                    logger.warning("Market clock unavailable during grace period — retrying")
+            # market_open is False → confirmed closed → keep waiting.
             if time.monotonic() - last_heartbeat >= heartbeat_interval:
                 logger.info("Still waiting for market open, next check in %.0fs (clock confirmation)", check_interval)
                 last_heartbeat = time.monotonic()
             await asyncio.sleep(check_interval)
-
-    @staticmethod
     def _seconds_until_open() -> float:
         """Seconds until next 9:30 AM ET market open (DST-aware).
 
@@ -210,11 +241,20 @@ class LiveTrader:
 
                     try:
                         market_open = await self.broker.is_market_open()
-                        if not market_open:
-                            logger.info("⏹️  Market closed — completing session and waiting for next open")
-                            break
                     except Exception:
-                        logger.exception("Market-open check failed — assuming open, continuing")
+                        logger.exception("Market-open check failed — treating as unknown, will retry")
+                        market_open = None
+                    if market_open is None:
+                        # Indeterminate clock (timeout/outage) — never treat as
+                        # a confirmed close.  Retry instead of shutting down,
+                        # so a transient API outage cannot trigger a false
+                        # mid-session liquidation.
+                        logger.warning("Market clock UNKNOWN — retrying instead of shutting down")
+                        await asyncio.sleep(CHECK_INTERVAL)
+                        continue
+                    if not market_open:
+                        logger.info("⏹️  Market closed — completing session and waiting for next open")
+                        break
 
                     await self._safe_tick(tick)
                     logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
@@ -294,7 +334,10 @@ class LiveTrader:
             return
 
         account = await self.broker.get_account()
-        equity = float(account.get("equity", 100_000))
+        equity = account_equity(account)
+        if equity is None:
+            logger.warning(f"⚠️  {symbol}: account equity unavailable — skipping entry")
+            return
         if not self.pm.can_open(symbol, equity):
             return
 
@@ -536,20 +579,39 @@ class LiveTrader:
                 order = Order(symbol=sym, side=OrderSide.SELL, quantity=qty, order_type=OrderType.MARKET)
                 await self.broker.place_order(order)
 
-        # Final account state
+        # Final account state — NEVER fabricate an end equity.  A timed-out
+        # fetch returns the unavailable sentinel (equity None); we then print
+        # "UNKNOWN" instead of computing a bogus -100% from 0.0.
         account = await self.broker.get_account()
-        end_equity = float(account.get("equity", 0))
-        pnl = end_equity - self.start_equity
-        pnl_pct = (pnl / self.start_equity * 100) if self.start_equity > 0 else 0
-
+        end_equity = account_equity(account)
+        start_equity = self.start_equity
+        if start_equity is None or start_equity <= 0:
+            persisted = load_start_equity()
+            if persisted is not None:
+                start_equity = persisted
         logger.info("=" * 60)
         logger.info(f"SESSION COMPLETE")
-        logger.info(f"Start: ${self.start_equity:,.2f}")
-        logger.info(f"End:   ${end_equity:,.2f}")
-        logger.info(f"P&L:   ${pnl:+,.2f} ({pnl_pct:+.2f}%)")
+        if start_equity is None or start_equity <= 0:
+            logger.info("Start: UNKNOWN (no baseline captured)")
+        else:
+            logger.info(f"Start: ${start_equity:,.2f}")
+        if end_equity is None:
+            logger.info("End:   UNKNOWN (account fetch failed)")
+            logger.info("P&L:   UNKNOWN (account fetch timed out)")
+        elif start_equity is None or start_equity <= 0:
+            logger.info(f"End:   ${end_equity:,.2f}")
+            logger.info("P&L:   UNKNOWN (no session start baseline)")
+        else:
+            pnl = end_equity - start_equity
+            pnl_pct = (pnl / start_equity * 100)
+            logger.info(f"End:   ${end_equity:,.2f}")
+            logger.info(f"P&L:   ${pnl:+,.2f} ({pnl_pct:+.2f}%)")
         logger.info(f"Log:   {log_file}")
         logger.info("=" * 60)
-
+        # Reset the day baseline so the next session re-captures it.  The
+        # persisted state file is date-stamped, so it is ignored on a new day
+        # and re-used on a same-day restart (stable day P&L).
+        self.start_equity = 0.0
         if close_broker:
             await self.broker.close()
 

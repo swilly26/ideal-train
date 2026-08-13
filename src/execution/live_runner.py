@@ -19,7 +19,7 @@ import pandas as pd
 
 from src.execution.broker import Broker, Order, OrderSide, OrderType
 from src.execution.position_manager import PositionManager
-from src.execution.alpaca_broker import is_order_alive
+from src.execution.alpaca_broker import account_equity, is_order_alive
 from src.strategies.base import SignalType, Strategy, StrategyConfig
 from src.data.provider import DataProvider
 
@@ -140,6 +140,11 @@ class LiveTradingRunner:
         market_open = True
         if hasattr(self._broker, "is_market_open"):
             market_open = await self._broker.is_market_open()
+        if market_open is None:
+            # Indeterminate clock (timeout/outage) — retry, never treat as
+            # a confirmed close (which would risk a false liquidation).
+            logger.warning("Market status UNKNOWN — skipping tick, will retry")
+            return
         if not market_open:
             logger.debug("Market is closed — skipping tick")
             return
@@ -217,9 +222,12 @@ class LiveTradingRunner:
             if self._position_manager.get_open_count() >= self._max_positions:
                 return
 
-            # Check equity
+            # Check equity — never size on an unavailable fetch (equity None)
             acct = await self._broker.get_account()
-            equity = float(acct.get("equity", 0))
+            equity = account_equity(acct)
+            if equity is None:
+                logger.warning("Account equity unavailable — skipping entry for %s", symbol)
+                return
             if not self._position_manager.can_open(symbol, equity):
                 return
 

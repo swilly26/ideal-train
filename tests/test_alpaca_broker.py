@@ -319,33 +319,30 @@ class TestApiTimeouts:
         monkeypatch.setattr(broker_mod, "_API_TIMEOUT_SECONDS", 0.1)
 
     @pytest.mark.asyncio
-    async def test_is_market_open_times_out_and_returns_false(self, broker, mock_trading_client, monkeypatch):
-        """A hung clock call must return False (bounded), not hang forever."""
+    @pytest.mark.asyncio
+    async def test_is_market_open_times_out_and_returns_none(self, broker, mock_trading_client, monkeypatch):
+        """A hung clock call must return None (indeterminate, bounded) - the run
+        loop retries on None instead of treating it as a confirmed close."""
         self._patch_timeout(monkeypatch)
         mock_trading_client.get_clock.side_effect = lambda: _time.sleep(1)
-
         start = _time.monotonic()
         result = await broker.is_market_open()
         elapsed = _time.monotonic() - start
-
-        assert result is False
+        assert result is None
         assert elapsed < 1.0, f"is_market_open hung for {elapsed:.1f}s"
-
     @pytest.mark.asyncio
-    async def test_get_account_times_out_and_returns_zeros(self, broker, mock_trading_client, monkeypatch):
-        """A hung account fetch must return zeros (fail closed)."""
+    async def test_get_account_times_out_and_returns_sentinel(self, broker, mock_trading_client, monkeypatch):
+        """A hung account fetch must return the sentinel (equity None), never 0.0.
+        Regression: the old zeros fallback made shutdown() print a bogus -100%."""
         self._patch_timeout(monkeypatch)
         mock_trading_client.get_account.side_effect = lambda: _time.sleep(1)
-
         start = _time.monotonic()
         result = await broker.get_account()
         elapsed = _time.monotonic() - start
-
-        assert result["equity"] == 0.0
-        assert result["buying_power"] == 0.0
-        assert elapsed < 1.0
-
-    @pytest.mark.asyncio
+        assert result["equity"] is None
+        assert result["buying_power"] is None
+        assert result["available"] is False
+        assert elapsed < 1.0, f"get_account hung for {elapsed:.1f}s"
     async def test_get_positions_times_out_and_returns_empty(self, broker, mock_trading_client, monkeypatch):
         """A hung positions fetch must return [] (fail closed)."""
         self._patch_timeout(monkeypatch)
