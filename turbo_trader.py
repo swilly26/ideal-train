@@ -24,9 +24,10 @@ import pandas as pd
 # ── Project imports ────────────────────────────────────────────────
 import src.strategies  # registers strategies
 from src.data.yfinance_provider import YFinanceProvider
-from src.execution.alpaca_broker import AlpacaBroker, is_order_alive
+from src.execution.alpaca_broker import AlpacaBroker, account_equity, is_order_alive
 from src.execution.broker import Order, OrderSide, OrderType
 from src.execution.position_manager import PositionManager
+from src.execution.session_state import load_start_equity, ny_today, save_start_equity
 from src.strategies.base import Signal, SignalType, Strategy, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
 from src.strategies.liquidity_sweep import LiquiditySweepStrategy
@@ -357,10 +358,53 @@ class TurboTrader:
 
     # ── Market open wait ─────────────────────────────────────────────
 
-    async def wait_for_market_open(self):
-        """Wait for 9:30 ET using local DST-aware time as the primary gate."""
-        from zoneinfo import ZoneInfo
+    # ── Session baseline (start equity) ──────────────────────────────
+    def _restore_start_equity(self) -> bool:
+        """Reload today's persisted start baseline (stable across restarts)."""
+        equity = load_start_equity()
+        if equity is not None and equity > 0:
+            self.start_equity = equity
+            return True
+        return False
 
+    def _set_start_equity(self, equity: float) -> None:
+        """Record the day baseline and persist it for watchdog restarts."""
+        self.start_equity = float(equity)
+        if not save_start_equity(self.start_equity):
+            logger.warning("Could not persist session start equity to %s",
+                           "logs/session_state.json")
+
+    async def _begin_session(self, assumed: bool) -> bool:
+        """Establish the day's P&L baseline; return True when ready to trade.
+
+        Prefers the persisted baseline for today (so a watchdog restart mid-day
+        keeps the day's P&L anchored to the original market-open equity), and
+        falls back to fetching the account.  Never starts trading with an
+        unknown baseline.
+        """
+        if self.start_equity is None or self.start_equity <= 0:
+            if self._restore_start_equity():
+                logger.info("✅ %s — resuming session (baseline reloaded)",
+                            "Market is OPEN" if not assumed else "Market assumed OPEN")
+                return True
+            account = await self.broker.get_account()
+            equity = account_equity(account)
+            if equity is None or equity <= 0:
+                logger.warning("Account equity unavailable — cannot establish session baseline")
+                return False
+            self._set_start_equity(equity)
+        logger.info("✅ %s — starting TURBO trading",
+                    "Market is OPEN" if not assumed else "Market assumed OPEN")
+        logger.info("   Starting equity: ${:,.2f}".format(self.start_equity))
+        return True
+
+    async def wait_for_market_open(self):
+        """Wait for 9:30 ET using local DST-aware time as the primary gate.
+        Alpaca's clock is only a confirmation: a timeout (``None``) cannot
+        strand the trader after the session has opened (with a five-minute
+        grace period) and can never be mistaken for a confirmed close.
+        """
+        from zoneinfo import ZoneInfo
         logger.info("🚀 Waiting for market to open (9:30 AM ET)...")
         last_heartbeat = time.monotonic()
         heartbeat_interval = 300.0
@@ -372,29 +416,27 @@ class TurboTrader:
             if seconds_until > 0 and (before_open or now_et.weekday() >= 5 or now_et.hour >= 16):
                 await asyncio.sleep(min(max(seconds_until - 60.0, 1.0), heartbeat_interval))
                 continue
-
             try:
-                if await self.broker.is_market_open():
-                    logger.info("✅ Market is OPEN — starting TURBO trading")
-                    account = await self.broker.get_account()
-                    self.start_equity = float(account.get("equity", 100_000))
-                    logger.info(f"   Starting equity: ${self.start_equity:,.2f}")
-                    return
+                market_open = await self.broker.is_market_open()
             except Exception as e:
-                if now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 35):
-                    logger.warning("Market clock unavailable after grace period (%s); proceeding", e)
-                    account = await self.broker.get_account()
-                    self.start_equity = float(account.get("equity", 100_000))
-                    logger.info("✅ Market assumed OPEN — starting TURBO trading")
+                logger.warning("Market check failed: %s", e)
+                market_open = None
+            if market_open is True:
+                if await self._begin_session(assumed=False):
                     return
-                logger.warning("Market check failed during grace period: %s", e)
-
+            elif market_open is None:
+                # Clock unavailable — indeterminate, NOT a confirmed close.
+                if now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 35):
+                    logger.warning("Market clock unavailable after grace period — proceeding on local time")
+                    if await self._begin_session(assumed=True):
+                        return
+                else:
+                    logger.warning("Market clock unavailable during grace period — retrying")
+            # market_open is False → confirmed closed → keep waiting.
             if time.monotonic() - last_heartbeat >= heartbeat_interval:
                 logger.info("Still waiting for market open, next check in %.0fs (clock confirmation)", check_interval)
                 last_heartbeat = time.monotonic()
             await asyncio.sleep(check_interval)
-
-    @staticmethod
     def _seconds_until_open() -> float:
         """Seconds until next 9:30 AM ET market open (DST-aware).
 
@@ -521,11 +563,20 @@ class TurboTrader:
 
                     try:
                         market_open = await self.broker.is_market_open()
-                        if not market_open:
-                            logger.info("⏹️  Market closed — completing session and waiting for next open")
-                            break
                     except Exception:
-                        logger.exception("Market-open check failed — assuming open, continuing")
+                        logger.exception("Market-open check failed — treating as unknown, will retry")
+                        market_open = None
+                    if market_open is None:
+                        # Indeterminate clock (timeout/outage) — never treat as
+                        # a confirmed close.  Retry instead of shutting down,
+                        # so a transient API outage cannot trigger a false
+                        # mid-session liquidation.
+                        logger.warning("Market clock UNKNOWN — retrying instead of shutting down")
+                        await asyncio.sleep(CHECK_INTERVAL)
+                        continue
+                    if not market_open:
+                        logger.info("⏹️  Market closed — completing session and waiting for next open")
+                        break
 
                     await self._safe_tick(tick)
                     logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
@@ -711,7 +762,10 @@ class TurboTrader:
             return
 
         account = await self.broker.get_account()
-        equity = float(account.get("equity", 100_000))
+        equity = account_equity(account)
+        if equity is None:
+            logger.warning(f"⚠️  {symbol}: account equity unavailable — skipping entry")
+            return
         if not self.pm.can_open(symbol, equity):
             return
 
@@ -783,7 +837,10 @@ class TurboTrader:
         if self.pm.get_open_count() >= MAX_POSITIONS:
             return
         account = await self.broker.get_account()
-        equity = float(account.get("equity", 100_000))
+        equity = account_equity(account)
+        if equity is None:
+            logger.warning(f"⚠️  {symbol}: account equity unavailable — skipping entry")
+            return
         if not self.pm.can_open(symbol, equity):
             return
         value = equity * _position_size_pct_for(symbol)  # tier-aware: 50% base / 40% violence
@@ -992,9 +1049,13 @@ class TurboTrader:
         at the broker, liquidate them immediately so nothing hangs overnight.
         """
         try:
-            if await self.broker.is_market_open():
+            market_status = await self.broker.is_market_open()
+            if market_status is True:
                 return  # Market is open — normal trading, no cleanup needed
-
+            if market_status is None:
+                # Indeterminate clock (outage) — never liquidate on a guess.
+                logger.warning("Market status UNKNOWN at startup — skipping stale-position cleanup")
+                return
             positions = await self.broker.get_positions()
             # Filter to turbo symbols only — never touch main trader's positions
             turbo_set = {s.upper() for s in SYMBOLS}
@@ -1408,24 +1469,43 @@ class TurboTrader:
                     is_short=is_short,
                 )
 
-        # Final account state
+        # Final account state — NEVER fabricate an end equity.  A timed-out
+        # fetch returns the unavailable sentinel (equity None); we then print
+        # "UNKNOWN" instead of computing a bogus -100% from 0.0.
         account = await self.broker.get_account()
-        end_equity = float(account.get("equity", 0))
-        pnl = end_equity - self.start_equity
-        pnl_pct = (pnl / self.start_equity * 100) if self.start_equity > 0 else 0
-
+        end_equity = account_equity(account)
+        start_equity = self.start_equity
+        if start_equity is None or start_equity <= 0:
+            persisted = load_start_equity()
+            if persisted is not None:
+                start_equity = persisted
         logger.info("=" * 60)
         logger.info("🚀 TURBO SESSION COMPLETE")
-        logger.info(f"Start:  ${self.start_equity:,.2f}")
-        logger.info(f"End:    ${end_equity:,.2f}")
-        logger.info(f"P&L:    ${pnl:+,.2f}  ({pnl_pct:+.2f}%)")
-        if pnl_pct > 0:
-            logger.info("🔥 TURBO PROFIT — account growing!")
-        elif pnl_pct < 0:
-            logger.info("💥 TURBO LOSS — aggressive mode took a hit")
+        if start_equity is None or start_equity <= 0:
+            logger.info("Start:  UNKNOWN (no baseline captured)")
+        else:
+            logger.info(f"Start:  ${start_equity:,.2f}")
+        if end_equity is None:
+            logger.info("End:    UNKNOWN (account fetch failed)")
+            logger.info("P&L:    UNKNOWN (account fetch timed out)")
+        elif start_equity is None or start_equity <= 0:
+            logger.info(f"End:    ${end_equity:,.2f}")
+            logger.info("P&L:    UNKNOWN (no session start baseline)")
+        else:
+            pnl = end_equity - start_equity
+            pnl_pct = (pnl / start_equity * 100)
+            logger.info(f"End:    ${end_equity:,.2f}")
+            logger.info(f"P&L:    ${pnl:+,.2f}  ({pnl_pct:+.2f}%)")
+            if pnl_pct > 0:
+                logger.info("🔥 TURBO PROFIT — account growing!")
+            elif pnl_pct < 0:
+                logger.info("💥 TURBO LOSS — aggressive mode took a hit")
         logger.info(f"Log:    {log_file}")
         logger.info("=" * 60)
-
+        # Reset the day baseline so the next session re-captures it.  The
+        # persisted state file is date-stamped, so it is ignored on a new day
+        # and re-used on a same-day restart (stable day P&L).
+        self.start_equity = 0.0
         if close_broker:
             await self.broker.close()
 

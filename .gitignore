@@ -9,3 +9,12 @@ dist/
 .env*
 logs/
 *.log
+
+# scratch / demo files
+demo.py
+full_demo.py
+quick_test.py
+run_demo.sh
+run_quick.sh
+trade_1share.py
+trade_now.py

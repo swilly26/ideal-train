@@ -45,6 +45,39 @@ def is_order_alive(status: str) -> bool:
     return clean not in _TERMINAL_FAILURE_STATUSES
 
 
+# ── Unavailable-account sentinel ────────────────────────────────────────
+# Returned by ``get_account()`` when the fetch fails or times out.  ``equity``
+# is ``None`` — NEVER a fabricated number — so callers can distinguish
+# "unreadable" from a real (even zero) account.  ``available`` is an explicit
+# flag for the same signal.  This kills the spurious -100% P&L bug where a
+# timed-out fetch returned ``equity: 0.0`` and shutdown() computed
+# ``0 - start_equity`` → -100%.
+ACCOUNT_UNAVAILABLE: dict = {
+    "buying_power": None,
+    "equity": None,
+    "cash": None,
+    "portfolio_value": None,
+    "available": False,
+}
+
+
+def account_equity(account: dict) -> float | None:
+    """Extract equity from a ``get_account()`` result.
+
+    Returns ``None`` when the fetch failed (sentinel), or when the payload is
+    not a dict / lacks a numeric equity — never a fabricated number.
+    """
+    if not isinstance(account, dict) or account.get("available") is False:
+        return None
+    equity = account.get("equity")
+    if equity is None:
+        return None
+    try:
+        return float(equity)
+    except (TypeError, ValueError):
+        return None
+
+
 class BrokerAuthenticationError(RuntimeError):
     """Raised when the broker cannot prove that its session is authenticated."""
 
@@ -492,35 +525,31 @@ class AlpacaBroker(Broker):
         return result
 
     async def get_account(self) -> dict:
-        """Return account summary as a normalised dict."""
+        """Return account summary as a normalised dict.
+
+        On a failed/timed-out fetch returns ``ACCOUNT_UNAVAILABLE`` — a
+        sentinel with ``equity: None`` and ``available: False`` — never a
+        fabricated ``0.0``.  Callers must treat the sentinel as "unknown" and
+        NOT compute P&L / sizing from it.
+        """
         try:
             acct = await self._run_with_timeout(self._trading_client.get_account)
         except asyncio.TimeoutError:
             logger.warning(
-                "Account fetch timed out after %.1fs — returning zeros", _API_TIMEOUT_SECONDS
+                "Account fetch timed out after %.1fs — equity UNKNOWN (sentinel)",
+                _API_TIMEOUT_SECONDS,
             )
-            return {
-                "buying_power": 0.0,
-                "equity": 0.0,
-                "cash": 0.0,
-                "portfolio_value": 0.0,
-            }
+            return dict(ACCOUNT_UNAVAILABLE)
         except Exception as exc:
-            logger.error("Failed to fetch account: %s", exc)
-            return {
-                "buying_power": 0.0,
-                "equity": 0.0,
-                "cash": 0.0,
-                "portfolio_value": 0.0,
-            }
-
+            logger.error("Failed to fetch account: %s — equity UNKNOWN (sentinel)", exc)
+            return dict(ACCOUNT_UNAVAILABLE)
         return {
             "buying_power": float(acct.buying_power or 0),
             "equity": float(acct.equity or 0),
             "cash": float(acct.cash or 0),
             "portfolio_value": float(acct.portfolio_value or 0),
+            "available": True,
         }
-
     async def close(self) -> None:
         """Release broker resources (no persistent connections to close)."""
         self._client = None
@@ -529,31 +558,30 @@ class AlpacaBroker(Broker):
     # Alpaca-specific
     # ------------------------------------------------------------------
 
-    async def is_market_open(self) -> bool:
+    async def is_market_open(self) -> bool | None:
         """Check whether the market is currently open via the Alpaca clock API.
 
-        Returns ``True`` if the market is open, ``False`` otherwise.  If the
-        API call fails **or times out** (after ``_API_TIMEOUT_SECONDS``),
-        returns ``False`` — the safe default so the trader loop retries
-        instead of hanging forever on a stalled connection.
+        Returns:
+          * ``True``  — market is open (clock confirmed).
+          * ``False`` — market is confirmed closed (clock responded).
+          * ``None``  — indeterminate: the clock API failed or timed out.
+            Callers MUST treat ``None`` as "unknown — retry" and never as a
+            confirmed close.  Only a confirmed ``False`` may trigger
+            end-of-session liquidation; an indeterminate clock must not
+            (this prevents a false liquidation during an API outage).
         """
         try:
             clock = await self._run_with_timeout(self._trading_client.get_clock)
             return bool(clock.is_open)
         except asyncio.TimeoutError:
             logger.warning(
-                "Market clock check timed out after %.1fs — assuming closed, will retry",
+                "Market clock check timed out after %.1fs — state UNKNOWN, will retry",
                 _API_TIMEOUT_SECONDS,
             )
-            return False
+            return None
         except Exception as exc:
-            logger.error("Market clock check failed: %s", exc)
-            return False
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
+            logger.error("Market clock check failed: %s — state UNKNOWN, will retry", exc)
+            return None
     @staticmethod
     def _map_order_result(alpaca_order) -> OrderResult:
         """Map an Alpaca ``Order`` model to our ``OrderResult`` dataclass."""
