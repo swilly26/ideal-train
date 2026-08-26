@@ -190,7 +190,11 @@ class LiveTrader:
         from zoneinfo import ZoneInfo
         logger.info("Waiting for market to open (9:30 AM ET)...")
         last_heartbeat = time.monotonic()
-        heartbeat_interval = 300.0
+        # ~4 min cadence keeps quiet waits below the watchdog's staleness
+        # threshold (WATCHDOG_STALE_SECONDS, default 300s) so the log
+        # freshness signal is truthful even without the closed-market
+        # exemption (watchdog.sh / src/watchdog/policy.py).
+        heartbeat_interval = 240.0
         check_interval = 30.0
         while True:
             seconds_until = self._seconds_until_open()
@@ -201,6 +205,16 @@ class LiveTrader:
                 # cap it so heartbeat messages remain useful.
                 sleep_for = min(max(seconds_until - 60.0, 1.0), heartbeat_interval)
                 await asyncio.sleep(sleep_for)
+                # Heartbeat: pre-open / weekend waits produce no trading
+                # output for hours, so emit a low-frequency marker that
+                # keeps the watchdog's staleness check truthful.
+                if time.monotonic() - last_heartbeat >= heartbeat_interval:
+                    mins_left = max(int(self._seconds_until_open() // 60), 0)
+                    logger.info(
+                        "heartbeat: waiting for market open, ~%dm remaining",
+                        mins_left,
+                    )
+                    last_heartbeat = time.monotonic()
                 continue
             # We are at/past the calculated open. Confirm with Alpaca, but do
             # not wait indefinitely when its clock endpoint is unavailable.
