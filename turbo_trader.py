@@ -121,6 +121,15 @@ ENABLE_SHORT_SELLING = True # Open SHORT positions when momentum SELL fires in a
                             # downtrend (price < MA, RSI < 40, high confidence),
                             # with inverted stop-loss (above entry) / take-profit
                             # (below entry).  Flattened with the EOD liquidation.
+ENABLE_MEAN_REVERSION_SHORT = True  # When the regime gate blocks a mean-reversion
+                            # LONG in a confirmed downtrend, OPEN A SHORT on the
+                            # same down-tape instead of only doing nothing.  A
+                            # gated MR-BUY means the instrument is oversold AND
+                            # still below the MA — a falling knife; shorting it
+                            # monetizes the downside the gate is refusing to buy.
+                            # Shares the momentum short machinery (_handle_short_sell
+                            # → inverted stop above entry), the "never double up"
+                            # guard, and the max-1-entry-per-tick rule.
 
 # Market close in UTC (4 PM ET = 20:00 UTC standard, 20:00 UTC year-round
 # for simplicity — Alpaca clock is the final authority for is_market_open)
@@ -703,9 +712,14 @@ class TurboTrader:
                         await self._handle_sell(symbol, current_price, best_signal.confidence, strategy_name)
                         self._ls_symbols.discard(symbol.upper())
                     else:
-                        # ── Regime gate: block mean-reversion LONGs in a
-                        #    confirmed downtrend (price < MA10 AND RSI < 40) ──
-                        if ENABLE_REGIME_GATE and strategy_name == "mean_reversion":
+                        # ── Regime gate: in a confirmed downtrend (price <
+                        #    MA10 AND RSI < 40) NO LONG may enter — neither a
+                        #    mean-reversion dip-buy (falling knife) nor a
+                        #    momentum long fighting the trend.  When the gate
+                        #    blocks a mean-reversion LONG, we OPEN A SHORT on
+                        #    the same down-tape instead of only doing nothing. ──
+                        if ENABLE_REGIME_GATE and \
+                                strategy_name in ("mean_reversion", "momentum"):
                             allow, reason = _regime_gate_allows_long(
                                 data,
                                 ma_period=MOMENTUM_CONFIG["ma_period"],
@@ -713,10 +727,27 @@ class TurboTrader:
                                 rsi_threshold=MOMENTUM_CONFIG["rsi_threshold"],
                             )
                             if not allow:
-                                logger.info(
-                                    "🚫 REGIME GATE %s: skipping mean-reversion LONG — %s",
-                                    symbol, reason,
-                                )
+                                if strategy_name == "mean_reversion" and \
+                                        ENABLE_SHORT_SELLING and \
+                                        ENABLE_MEAN_REVERSION_SHORT:
+                                    # Falling knife: confirmed downtrend + MR
+                                    # oversold dip.  Monetize the downside the
+                                    # gate is refusing to buy.
+                                    logger.info(
+                                        "🔻 MR-SHORT %s: gate blocked the LONG — "
+                                        "opening SHORT instead (%s)",
+                                        symbol, reason,
+                                    )
+                                    await self._handle_short_sell(
+                                        symbol, current_price,
+                                        best_signal.confidence, strategy_name,
+                                    )
+                                    entered_this_tick = True  # max 1 new entry per tick
+                                else:
+                                    logger.info(
+                                        "🚫 REGIME GATE %s: skipping %s LONG — %s",
+                                        symbol, strategy_name, reason,
+                                    )
                                 continue
                         await self._handle_buy(symbol, current_price, best_signal.confidence, strategy_name)
                         entered_this_tick = True  # max 1 entry per tick
