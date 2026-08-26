@@ -11,8 +11,11 @@ Logs: /home/team/shared/engine/logs/trades_YYYYMMDD.log
 import asyncio
 import logging
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pandas as pd
 
 # ── Project imports ────────────────────────────────────────────────
 import src.strategies  # registers strategies
@@ -24,6 +27,7 @@ from src.execution.position_manager import PositionManager
 from src.execution.session_state import load_start_equity, save_start_equity
 from src.strategies.base import SignalType, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
+from src.strategies.indicators import sma
 
 # ── Configuration ──────────────────────────────────────────────────
 SYMBOLS = ["NVDA", "META", "QQQ", "TSLA", "COIN", "AVGO"]
@@ -49,6 +53,17 @@ STRATEGY_CONFIG = StrategyConfig(
     extra={"lookback": 20, "std_dev_multiplier": 2.0},
 )
 
+# ── Regime gate (Recommendation: stop bleeding into falling markets) ──
+# The main trader is pure mean reversion — it buys oversold dips, which is
+# exactly the wrong thing to do in a confirmed downtrend (falling knives).
+# This gate mirrors the turbo trader's `_regime_gate_allows_long`: it SKIPS
+# the mean-reversion LONG when price is below the 10-bar MA AND RSI(14) < 40
+# (a confirmed downtrend).  Flippable for paper-trading A/B comparison.
+ENABLE_REGIME_GATE = True   # False → restore unconditional dip-buying
+REGIME_MA_PERIOD = 10       # short MA that defines the trend reference
+REGIME_RSI_PERIOD = 14      # RSI period used by the weakness filter
+REGIME_RSI_THRESHOLD = 40.0 # RSI below this = oversold/weak → block the long
+
 # ── Logging ────────────────────────────────────────────────────────
 log_dir = Path("/home/team/shared/engine/logs")
 log_dir.mkdir(parents=True, exist_ok=True)
@@ -67,6 +82,60 @@ logger = logging.getLogger("live_trader")
 
 
 # ── Trading logic ──────────────────────────────────────────────────
+
+def _compute_rsi(close: "pd.Series", period: int = 14) -> "pd.Series":
+    """Compute RSI (Relative Strength Index) over *period* bars.
+
+    Mirrors the turbo trader's RSI so both engines use identical regime
+    math.  RSI < REGIME_RSI_THRESHOLD means the instrument is weak/oversold.
+    """
+    import pandas as pd
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
+
+
+def _regime_gate_allows_long(
+    data: "pd.DataFrame",
+    ma_period: int = 10,
+    rsi_period: int = 14,
+    rsi_threshold: float = 40.0,
+) -> "tuple[bool, str]":
+    """Return ``(allow, reason)`` for a mean-reversion LONG on *data*.
+
+    A long is BLOCKED only in a confirmed downtrend — price below the
+    *ma_period*-bar MA AND RSI(*rsi_period*) below *rsi_threshold*.  This is
+    the #1 bleeding source on down days: the main trader unconditionally
+    buys mean-reversion dips, catching falling knives (e.g. -$351 COIN,
+    -$116 AVGO on 2026-08-26).  When either condition is healthy (price
+    above the MA, or RSI recovering), the long is allowed — this is a
+    filter, not a trend follower.  ``reason`` is human-readable for audit
+    logging (empty string when allowed).
+    """
+    close = data["close"]
+    if len(close) < max(ma_period, rsi_period) + 1:
+        return True, "insufficient data"
+    ma = sma(close, period=ma_period)
+    rsi = _compute_rsi(close, period=rsi_period)
+    cur = float(close.iloc[-1])
+    cur_ma = float(ma.iloc[-1])
+    cur_rsi = float(rsi.iloc[-1])
+    if pd.isna(cur_ma) or pd.isna(cur_rsi):
+        return True, "insufficient indicator history"
+    below_ma = cur < cur_ma
+    weak_rsi = cur_rsi < rsi_threshold
+    if below_ma and weak_rsi:
+        return False, (
+            f"downtrend: price {cur:.2f} < MA{ma_period} {cur_ma:.2f} "
+            f"AND RSI {cur_rsi:.1f} < {rsi_threshold}"
+        )
+    return True, ""
+
 
 class LiveTrader:
     def __init__(self):
@@ -318,6 +387,23 @@ class LiveTrader:
                 current_price = float(data["close"].iloc[-1])
 
                 if latest.signal_type == SignalType.BUY:
+                    # ── Regime gate: skip the mean-reversion LONG in a
+                    #    confirmed downtrend (price < MA10 AND RSI < 40) so we
+                    #    stop catching falling knives.  This is the #1 bleeding
+                    #    source on down days. ──
+                    if ENABLE_REGIME_GATE:
+                        allow, reason = _regime_gate_allows_long(
+                            data,
+                            ma_period=REGIME_MA_PERIOD,
+                            rsi_period=REGIME_RSI_PERIOD,
+                            rsi_threshold=REGIME_RSI_THRESHOLD,
+                        )
+                        if not allow:
+                            logger.info(
+                                "🚫 REGIME GATE %s: skipping mean-reversion LONG — %s",
+                                symbol, reason,
+                            )
+                            continue
                     await self._handle_buy(symbol, current_price, latest.confidence)
                 elif latest.signal_type == SignalType.SELL:
                     await self._handle_sell(symbol, current_price, latest.confidence)
