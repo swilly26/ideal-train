@@ -267,9 +267,14 @@ class BacktestEngine:
         equity_curve = pd.Series(equity_values, index=data.index.insert(0, data.index[0] - pd.Timedelta("1min")), dtype=float)
         # Fix: align equity with data index properly — first value is initial capital
         # at a synthetic pre-first-bar timestamp. Re-index to data.index.
+        first_step = (
+            (data.index[1] - data.index[0])
+            if len(data.index) > 1
+            else pd.Timedelta(minutes=1)
+        )
         equity_curve = pd.Series(
             equity_values,
-            index=[data.index[0] - (data.index[1] - data.index[0])] + list(data.index),
+            index=[data.index[0] - first_step] + list(data.index),
             dtype=float,
         )
 
