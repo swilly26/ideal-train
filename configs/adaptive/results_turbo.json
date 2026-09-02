@@ -1,0 +1,243 @@
+{
+  "trader": "turbo",
+  "strategy": "mean_reversion",
+  "split": {
+    "is": 13,
+    "oos": 6,
+    "holdout": 7,
+    "is_days": 13,
+    "oos_days": 6,
+    "holdout_days": 7
+  },
+  "split_days": {
+    "is": [
+      "2026-07-24",
+      "2026-07-27",
+      "2026-07-28",
+      "2026-07-29",
+      "2026-07-30",
+      "2026-07-31",
+      "2026-08-03",
+      "2026-08-04",
+      "2026-08-05",
+      "2026-08-06",
+      "2026-08-07",
+      "2026-08-10",
+      "2026-08-11"
+    ],
+    "oos": [
+      "2026-08-12",
+      "2026-08-13",
+      "2026-08-14",
+      "2026-08-17",
+      "2026-08-18",
+      "2026-08-19"
+    ],
+    "holdout": [
+      "2026-08-20",
+      "2026-08-21",
+      "2026-08-24",
+      "2026-08-25",
+      "2026-08-26",
+      "2026-08-27",
+      "2026-08-28"
+    ]
+  },
+  "baseline_realized": {
+    "is": {
+      "n_trades": 26,
+      "gross_win": 9128.54,
+      "gross_loss": 4031.75,
+      "profit_factor": 2.2642,
+      "win_rate": 0.4231,
+      "avg_pct": 0.4923,
+      "net_pnl": 5096.79,
+      "expectancy_pct": 0.4923,
+      "days": [
+        "2026-07-24",
+        "2026-07-27",
+        "2026-07-28",
+        "2026-07-29",
+        "2026-07-30",
+        "2026-07-31",
+        "2026-08-03",
+        "2026-08-04",
+        "2026-08-05",
+        "2026-08-06",
+        "2026-08-07",
+        "2026-08-10",
+        "2026-08-11"
+      ]
+    },
+    "oos": {
+      "n_trades": 2,
+      "gross_win": 6246.71,
+      "gross_loss": 0.0,
+      "profit_factor": 3.0,
+      "win_rate": 1.0,
+      "avg_pct": 5.39,
+      "net_pnl": 6246.71,
+      "expectancy_pct": 5.39,
+      "days": [
+        "2026-08-12",
+        "2026-08-13",
+        "2026-08-14",
+        "2026-08-17",
+        "2026-08-18",
+        "2026-08-19"
+      ]
+    },
+    "holdout": {
+      "n_trades": 7,
+      "gross_win": 2376.34,
+      "gross_loss": 1191.28,
+      "profit_factor": 1.9948,
+      "win_rate": 0.5714,
+      "avg_pct": 0.2543,
+      "net_pnl": 1185.06,
+      "expectancy_pct": 0.2543,
+      "days": [
+        "2026-08-20",
+        "2026-08-21",
+        "2026-08-24",
+        "2026-08-25",
+        "2026-08-26",
+        "2026-08-27",
+        "2026-08-28"
+      ]
+    }
+  },
+  "baseline_price_backtest": {
+    "is_score": 1.3483309658129106,
+    "is_n_trades": 188,
+    "oos_score": 0.7092049940677501,
+    "oos_n_trades": 90,
+    "holdout_score": 1.7495543969698875,
+    "holdout_n_trades": 112,
+    "holdout_metrics": {
+      "n_trades": 112,
+      "gross_win": 26439.72,
+      "gross_loss": 15112.26,
+      "profit_factor": 1.7496,
+      "win_rate": 0.7143,
+      "avg_pct": 0.002,
+      "net_pnl": 11327.46,
+      "expectancy_pct": 0.002
+    }
+  },
+  "rankings": [
+    {
+      "config": "entry_threshold=0.7,lookback=20,stop_loss_pct=0.04,take_profit_pct=0.12",
+      "is_score": 1.6683780576403746,
+      "is_n_trades": 170,
+      "oos_score": 0.7145698113018158,
+      "oos_n_trades": 88,
+      "degradation": 0.5716979086188365,
+      "grade": "F",
+      "passed": false,
+      "holdout_score": 2.129725505007022,
+      "holdout_n_trades": 100,
+      "reason": "F: out-of-sample profit factor below breakeven (1.0) \u2014 the edge does not survive out-of-sample"
+    },
+    {
+      "config": "entry_threshold=0.7,lookback=20,stop_loss_pct=0.04,take_profit_pct=0.06",
+      "is_score": 1.6383229366105339,
+      "is_n_trades": 175,
+      "oos_score": 0.7145698113018158,
+      "oos_n_trades": 88,
+      "degradation": 0.5638406840716257,
+      "grade": "F",
+      "passed": false,
+      "holdout_score": 2.089869049860382,
+      "holdout_n_trades": 100,
+      "reason": "F: out-of-sample profit factor below breakeven (1.0) \u2014 the edge does not survive out-of-sample"
+    },
+    {
+      "config": "entry_threshold=0.7,lookback=20,stop_loss_pct=0.04,take_profit_pct=0.08",
+      "is_score": 1.6032714944014645,
+      "is_n_trades": 170,
+      "oos_score": 0.7145698113018158,
+      "oos_n_trades": 88,
+      "degradation": 0.5543051730183851,
+      "grade": "F",
+      "passed": false,
+      "holdout_score": 2.129725505007022,
+      "holdout_n_trades": 100,
+      "reason": "F: out-of-sample profit factor below breakeven (1.0) \u2014 the edge does not survive out-of-sample"
+    },
+    {
+      "config": "BASELINE (current fixed)",
+      "is_score": 1.3483309658129106,
+      "is_n_trades": 188,
+      "oos_score": 0.7092049940677501,
+      "oos_n_trades": 90,
+      "degradation": 0.4740126778589785,
+      "grade": "F",
+      "passed": false,
+      "holdout_score": 1.7495543969698875,
+      "holdout_n_trades": 112,
+      "reason": "F: out-of-sample profit factor below breakeven (1.0) \u2014 the edge does not survive out-of-sample"
+    },
+    {
+      "config": "entry_threshold=0.7,lookback=20,stop_loss_pct=0.09,take_profit_pct=0.06",
+      "is_score": 1.6764670453343784,
+      "is_n_trades": 158,
+      "oos_score": 0.6014622004622889,
+      "oos_n_trades": 82,
+      "degradation": 0.6412323152213679,
+      "grade": "F",
+      "passed": false,
+      "holdout_score": 1.9252581805302837,
+      "holdout_n_trades": 98,
+      "reason": "F: out-of-sample profit factor below breakeven (1.0) \u2014 the edge does not survive out-of-sample"
+    },
+    {
+      "config": "entry_threshold=0.7,lookback=20,stop_loss_pct=0.09,take_profit_pct=0.12",
+      "is_score": 1.6493659750391367,
+      "is_n_trades": 155,
+      "oos_score": 0.6014622004622889,
+      "oos_n_trades": 82,
+      "degradation": 0.6353373298803395,
+      "grade": "F",
+      "passed": false,
+      "holdout_score": 1.9627126678310627,
+      "holdout_n_trades": 98,
+      "reason": "F: out-of-sample profit factor below breakeven (1.0) \u2014 the edge does not survive out-of-sample"
+    },
+    {
+      "config": "entry_threshold=0.7,lookback=20,stop_loss_pct=0.09,take_profit_pct=0.08",
+      "is_score": 1.5890508171830096,
+      "is_n_trades": 155,
+      "oos_score": 0.6014622004622889,
+      "oos_n_trades": 82,
+      "degradation": 0.6214959308044463,
+      "grade": "F",
+      "passed": false,
+      "holdout_score": 1.9627126678310627,
+      "holdout_n_trades": 98,
+      "reason": "F: out-of-sample profit factor below breakeven (1.0) \u2014 the edge does not survive out-of-sample"
+    }
+  ],
+  "best_config_kwargs": {
+    "entry_threshold": 0.7,
+    "stop_loss_pct": 0.04,
+    "take_profit_pct": 0.12,
+    "lookback": 20
+  },
+  "best_grade": "F",
+  "regime_summary": [],
+  "regime_configs": {},
+  "suggestions": {
+    "ref_atr_pct": 0.003,
+    "base_stop_pct": 0.04,
+    "base_tp_pct": 0.12,
+    "rule": "Scale stop/TP by ATR%: stop = clip(0.04 * atr_pct/0.003, 1%, 12%), tp = clip(0.12 * atr_pct/0.003, 1.5%, 25%). Regime configs are experimental \u2014 validate on a fresh window before runtime adoption.",
+    "holdout_not_used": true
+  },
+  "algorithm": {
+    "walk_forward": "IS/OOS/holdout over unique trading days",
+    "grading": "S/A/B/C/F by absolute OOS PF + IS\u2192OOS degradation",
+    "min_oos_trades": 8,
+    "note": "Holdout window never used for search or selection."
+  }
+}

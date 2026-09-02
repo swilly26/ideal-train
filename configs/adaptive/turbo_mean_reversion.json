@@ -1,0 +1,13 @@
+{
+  "entry_threshold": 0.7,
+  "exit_threshold": 0.3,
+  "max_position_pct": 0.1,
+  "min_position_pct": 0.01,
+  "stop_loss_pct": 0.04,
+  "take_profit_pct": 0.12,
+  "weight": 1.0,
+  "extra": {
+    "lookback": 20,
+    "symbol": "GENERIC"
+  }
+}
