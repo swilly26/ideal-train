@@ -79,3 +79,14 @@ class Broker(ABC):
     async def close(self) -> None:
         """Release broker resources."""
         ...
+
+    async def is_shortable(self, symbol: str) -> bool | None:
+        """Return whether *symbol* may be sold short on this account.
+
+        ``True`` = shortable, ``False`` = not shortable, ``None`` = unknown
+        (broker cannot answer — callers should treat as "no evidence it is
+        blocked" and let the order attempt proceed so behavior is unchanged).
+        The default implementation returns ``None`` so existing
+        broker implementations keep working without modification.
+        """
+        return None
