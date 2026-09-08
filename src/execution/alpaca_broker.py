@@ -531,6 +531,11 @@ class AlpacaBroker(Broker):
         sentinel with ``equity: None`` and ``available: False`` — never a
         fabricated ``0.0``.  Callers must treat the sentinel as "unknown" and
         NOT compute P&L / sizing from it.
+
+        Carries ``shorting_enabled`` through from Alpaca when present so
+        callers can gate short-sale attempts behind account capability
+        instead of burning rejected orders (e.g. a cash/no-margin account
+        that fundamentally cannot short).
         """
         try:
             acct = await self._run_with_timeout(self._trading_client.get_account)
@@ -549,7 +554,28 @@ class AlpacaBroker(Broker):
             "cash": float(acct.cash or 0),
             "portfolio_value": float(acct.portfolio_value or 0),
             "available": True,
+            "shorting_enabled": getattr(acct, "shorting_enabled", None),
         }
+
+    async def is_shortable(self, symbol: str) -> bool | None:
+        """Return whether *symbol* may be sold short (Alpaca asset flags).
+
+        ``True`` = ``shortable`` per Alpaca, ``False`` = flagged not
+        shortable (e.g. SOXL/TZA/LABD — leveraged ETFs Alpaca marks
+        ``shortable=False, easy_to_borrow=False``), ``None`` = lookup
+        failed (treat as unknown — let the order attempt proceed).
+        """
+        try:
+            asset = await self._run_with_timeout(
+                self._trading_client.get_asset, symbol.upper()
+            )
+        except Exception as exc:
+            logger.debug("Shortability lookup failed for %s: %s", symbol, exc)
+            return None
+        try:
+            return bool(asset.shortable)
+        except (AttributeError, TypeError, ValueError):
+            return None
     async def close(self) -> None:
         """Release broker resources (no persistent connections to close)."""
         self._client = None

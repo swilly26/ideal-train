@@ -130,6 +130,34 @@ ENABLE_MEAN_REVERSION_SHORT = True  # When the regime gate blocks a mean-reversi
                             # Shares the momentum short machinery (_handle_short_sell
                             # → inverted stop above entry), the "never double up"
                             # guard, and the max-1-entry-per-tick rule.
+# ── Execution guards (short-fill + buying-power fixes) ──────────────
+# All conservative knobs; flip via env to A/B without code changes.
+# Every default preserves legacy behavior unless the fix it gates proves
+# necessary — see each flag's comment.
+import os as _os
+# Cap an entry's notional at this fraction of AVAILABLE buying power (not
+# just equity), so a 50%-of-equity order can never exceed what the account
+# can actually fill (8/28: TZA $49k cost vs $12k BP → rejected).  0.95
+# leaves headroom for price drift between sizing and fill.
+BUYING_POWER_USAGE_PCT = float(_os.getenv("TURBO_BP_USAGE_PCT", "0.95"))
+# Round SHORT quantities DOWN to whole shares.  Alpaca rejects fractional
+# short sales outright (42210000 "fractional orders cannot be sold short" —
+# the cause of all 9 SOXL short rejections on 8/28), so any fractional
+# short qty is floored; a floored qty < 1 share skips the entry.
+SHORT_WHOLE_SHARES_ONLY = _os.getenv("TURBO_SHORT_WHOLE_SHARES", "true").lower() != "false"
+# Gate short-sale attempts behind broker shortability.  When the broker
+# reports a symbol not shortable (SOXL/TZA/LABD: shortable=False on the
+# paper account), skip the order proactively instead of burning a reject.
+SHORT_REQUIRE_BROKER_SHORTABLE = _os.getenv("TURBO_SHORT_REQUIRE_SHORTABLE", "true").lower() != "false"
+# Rejection backoff: after this many same-session short rejections for one
+# symbol, disable that symbol's shorts for the rest of the session so a
+# structurally unfillable short (non-shortable / fractional) isn't
+# retried every 60s tick in a tight loop.
+SHORT_REJECTIONS_DISABLE_AFTER = int(_os.getenv("TURBO_SHORT_DISABLE_AFTER", "3"))
+# Same backoff for insufficient-buying-power rejections on the long side:
+# after N same-session BP rejections, stop attempting new longs for the
+# session (sizing already caps to BP; this covers the residual race).
+BUY_BP_REJECTIONS_DISABLE_AFTER = int(_os.getenv("TURBO_BUY_BP_DISABLE_AFTER", "3"))
 
 # Market close in UTC (4 PM ET = 20:00 UTC standard, 20:00 UTC year-round
 # for simplicity — Alpaca clock is the final authority for is_market_open)
@@ -346,6 +374,102 @@ def _turbo_stop_client_id(symbol: str) -> str:
     return f"algoflow_TURBO_{symbol.upper()}_STOP_{time.monotonic_ns()}"
 
 
+def _rejection_kind(error_message: str | None) -> str:
+    """Classify a broker rejection into a coarse bucket for backoff.
+
+    Buckets: ``"short_not_allowed"`` (not shortable / shorting disabled /
+    borrow problems), ``"fractional_short"`` (fractional short sale —
+    fixable by whole-share sizing), ``"buying_power"`` (insufficient
+    buying power / funds / margin), ``"other"``.
+    """
+    msg = (error_message or "").lower()
+    if "fractional" in msg and "short" in msg:
+        return "fractional_short"
+    if any(
+        phrase in msg
+        for phrase in (
+            "cannot be sold short",
+            "not shortable",
+            "shorting not allowed",
+            "shorting is not allowed",
+            "shorting is disabled",
+            "short sale",
+            "no shares available",
+            "hard to borrow",
+            "not borrowable",
+            "borrow",
+        )
+    ):
+        return "short_not_allowed"
+    if any(
+        phrase in msg
+        for phrase in (
+            "insufficient buying power",
+            "insufficient funds",
+            "insufficient margin",
+            "insufficient balance",
+            "exceeds buying power",
+        )
+    ):
+        return "buying_power"
+    return "other"
+
+
+def _size_entry_qty(
+    *,
+    equity: float,
+    buying_power: float | None,
+    price: float,
+    size_pct: float,
+    bp_usage_pct: float = BUYING_POWER_USAGE_PCT,
+    whole_shares: bool = False,
+) -> tuple[float, bool]:
+    """Compute an entry quantity capped by AVAILABLE buying power.
+
+    ``equity * size_pct`` is the desired notional; it is additionally capped
+    at ``buying_power * bp_usage_pct`` so the order can never exceed what the
+    account can fill (8/28: TZA $49k cost vs $12k BP → rejected).  When
+    ``buying_power`` is ``None`` (unknown — account fetch failed), the BP
+    cap cannot be applied: returns ``(0.0, True)`` (skip entry, BP unknown)
+    so no order goes out on an unreadable account.
+
+    Returns ``(qty, capped)`` where ``capped`` is True when the BP cap (or
+    the unknown-BP skip) engaged.  With ``whole_shares=True`` the qty is
+    floored to whole shares (shorts — Alpaca rejects fractional shorts).
+    """
+    if price <= 0 or equity <= 0:
+        return 0.0, False
+    desired = equity * size_pct
+    if buying_power is None:
+        return 0.0, True
+    bp_cap = max(0.0, buying_power) * bp_usage_pct
+    capped = desired > bp_cap
+    notional = min(desired, bp_cap)
+    qty = notional / price
+    if whole_shares:
+        import math
+
+        qty = math.floor(qty)
+    return qty, capped
+
+
+def _account_buying_power(account: dict) -> float | None:
+    """Extract buying power from a ``get_account()`` result.
+
+    Returns ``None`` when the account is unavailable (sentinel) or the
+    payload lacks a numeric buying power — never a fabricated number.
+    """
+    if not isinstance(account, dict) or account.get("available") is False:
+        return None
+    bp = account.get("buying_power")
+    if bp is None:
+        return None
+    try:
+        return float(bp)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── TurboTrader ────────────────────────────────────────────────────
 
 class TurboTrader:
@@ -364,6 +488,22 @@ class TurboTrader:
         self.pm = PositionManager(STRATEGY_CONFIG)
         self.day_trades: list[dict] = []
         self.start_equity = 0.0
+        # ── Rejection backoff (session-scoped, reset per process start) ──
+        # Counts of same-session short rejections per symbol; a symbol that
+        # keeps rejecting (structurally unfillable short) is disabled for
+        # the rest of the session after SHORT_REJECTIONS_DISABLE_AFTER.
+        self._short_rejections: dict[str, int] = {}
+        self._shorts_disabled: set[str] = set()
+        # Same-session insufficient-buying-power rejections on the long
+        # side; after BUY_BP_REJECTIONS_DISABLE_AFTER, new longs stop for
+        # the session (the BP cap should already prevent these — this is
+        # the residual-race backstop).
+        self._buy_bp_rejections: int = 0
+        self._buys_disabled_bp: bool = False
+        # Per-symbol shortability cache: symbol → True/False/None(unknown).
+        # Only a definitive False gates; unknown/lookup-failure lets the
+        # order attempt proceed (legacy behavior).
+        self._shortable_cache: dict[str, bool | None] = {}
 
     # ── Market open wait ─────────────────────────────────────────────
 
@@ -806,6 +946,12 @@ class TurboTrader:
             return
         if self.pm.get_open_count() >= MAX_POSITIONS:
             return
+        if getattr(self, "_buys_disabled_bp", False):
+            logger.debug(
+                "BUY %s skipped — longs disabled this session after %d "
+                "buying-power rejections", symbol, self._buy_bp_rejections,
+            )
+            return
 
         account = await self.broker.get_account()
         equity = account_equity(account)
@@ -815,8 +961,32 @@ class TurboTrader:
         if not self.pm.can_open(symbol, equity):
             return
 
-        value = equity * _position_size_pct_for(symbol)  # tier-aware: 50% base / 40% violence
-        qty = value / price if price > 0 else 0
+        # ── Buying-power cap ──────────────────────────────────────
+        # Size off equity AND available buying power: a 50%-of-equity order
+        # can exceed BP when capital is tied up (8/28: TZA $49k cost vs
+        # $12k BP → rejected).  Unknown BP (sentinel) → skip the entry.
+        bp = _account_buying_power(account)
+        if bp is None:
+            logger.warning(f"⚠️  {symbol}: buying power unavailable — skipping entry")
+            return
+        size_pct = _position_size_pct_for(symbol)  # tier-aware: 50% base / 40% violence
+        qty, bp_capped = _size_entry_qty(
+            equity=equity, buying_power=bp, price=price, size_pct=size_pct,
+        )
+        if bp_capped and qty <= 0:
+            logger.warning(
+                "BUY %s skipped — buying-power cap leaves no room "
+                "(equity=$%s BP=$%s)",
+                symbol, f"{equity:,.0f}", f"{bp:,.0f}",
+            )
+            return
+        value = qty * price
+        if bp_capped:
+            logger.info(
+                "BUY %s sized DOWN to buying power: $%s → $%s "
+                "(BP=$%s)", symbol, f"{equity * size_pct:,.0f}",
+                f"{value:,.0f}", f"{bp:,.0f}",
+            )
         if qty < 1:
             return
 
@@ -868,7 +1038,106 @@ class TurboTrader:
             # ── Place GTC protective stop at broker ─────────────────
             await self._place_protective_stop(symbol, filled_qty, fill_price)
         else:
-            logger.warning(f"❌ BUY {symbol} REJECTED: {result.status}")
+            kind = _rejection_kind(getattr(result, "error_message", None))
+            if kind == "buying_power":
+                self._buy_bp_rejections = (
+                    getattr(self, "_buy_bp_rejections", 0) + 1
+                )
+                logger.warning(
+                    "❌ BUY %s REJECTED: insufficient buying power "
+                    "(rejection %d/%d this session) — %s",
+                    symbol, self._buy_bp_rejections,
+                    BUY_BP_REJECTIONS_DISABLE_AFTER,
+                    getattr(result, "error_message", "") or result.status,
+                )
+                if (self._buy_bp_rejections >= BUY_BP_REJECTIONS_DISABLE_AFTER
+                        and not getattr(self, "_buys_disabled_bp", False)):
+                    self._buys_disabled_bp = True
+                    logger.warning(
+                        "⛔ BUY entries disabled for the rest of the session "
+                        "after %d buying-power rejections",
+                        self._buy_bp_rejections,
+                    )
+            else:
+                logger.warning(f"❌ BUY {symbol} REJECTED: {result.status}")
+
+    async def _short_capability_allows(self, symbol: str, account: dict) -> bool:
+        """Gate a short-sale attempt behind account + instrument capability.
+
+        Returns ``False`` (and logs why) when the attempt is known-doomed:
+        account-level ``shorting_enabled is False``, or the broker flags the
+        symbol not shortable.  A broker without the ``is_shortable`` method
+        (or a failed lookup → ``None``) is treated as unknown → allowed, so
+        legacy/custom brokers keep legacy behavior.  Results are cached per
+        symbol for the session (``False`` sticks; ``None`` retries next
+        tick so a transient lookup failure doesn't permanently block).
+        """
+        sym = symbol.upper()
+        if not hasattr(self, "_shortable_cache"):
+            self._shortable_cache = {}
+        if not hasattr(self, "_shorts_disabled"):
+            self._shorts_disabled = set()
+        if not hasattr(self, "_short_rejections"):
+            self._short_rejections = {}
+        account_flag = account.get("shorting_enabled") if isinstance(account, dict) else None
+        if account_flag is False:
+            logger.warning(
+                "SHORT %s skipped — account reports shorting disabled",
+                symbol,
+            )
+            return False
+        if sym in self._shortable_cache and self._shortable_cache[sym] is False:
+            logger.debug("SHORT %s skipped — broker flags symbol not shortable", symbol)
+            return False
+        if not SHORT_REQUIRE_BROKER_SHORTABLE:
+            return True
+        is_shortable = getattr(self.broker, "is_shortable", None)
+        if is_shortable is None:
+            return True
+        try:
+            shortable = await is_shortable(symbol)
+        except Exception as exc:
+            logger.debug("SHORT %s: shortability lookup errored (%s) — attempting anyway", symbol, exc)
+            return True
+        if shortable is False:
+            self._shortable_cache[sym] = False
+            logger.warning(
+                "SHORT %s skipped — broker flags symbol NOT SHORTABLE "
+                "(Alpaca shortable=False; e.g. leveraged ETFs SOXL/TZA/LABD)",
+                symbol,
+            )
+            return False
+        if shortable is True:
+            self._shortable_cache[sym] = True
+        return True
+
+    def _record_short_rejection(self, symbol: str, kind: str, error_message: str | None) -> None:
+        """Count a short rejection; disable the symbol's shorts past the limit."""
+        sym = symbol.upper()
+        if not hasattr(self, "_short_rejections"):
+            self._short_rejections = {}
+        if not hasattr(self, "_shorts_disabled"):
+            self._shorts_disabled = set()
+        if not hasattr(self, "_shortable_cache"):
+            self._shortable_cache = {}
+        count = self._short_rejections.get(sym, 0) + 1
+        self._short_rejections[sym] = count
+        logger.warning(
+            "❌ SHORT %s REJECTED (%s — rejection %d/%d this session) — %s",
+            symbol, kind, count, SHORT_REJECTIONS_DISABLE_AFTER,
+            error_message or "no broker message",
+        )
+        # A definitive "not shortable" verdict sticks immediately — no point
+        # retrying the same symbol even once more this session.
+        if kind == "short_not_allowed":
+            self._shortable_cache[sym] = False
+        if count >= SHORT_REJECTIONS_DISABLE_AFTER and sym not in self._shorts_disabled:
+            self._shorts_disabled.add(sym)
+            logger.warning(
+                "⛔ SHORT %s disabled for the rest of the session after %d "
+                "rejections (avoids tight retry loop)",
+                symbol, count,
+            )
 
     async def _handle_short_sell(self, symbol: str, price: float, confidence: float, strategy: str = ""):
         """Open a SHORT position when momentum SELL fires in a downtrend.
@@ -876,11 +1145,20 @@ class TurboTrader:
         Submits a SELL market order (Alpaca opens a short when flat), records
         the position with a NEGATIVE quantity in the PositionManager, and
         attaches a GTC BUY stop ABOVE entry (the stop-loss side for shorts).
-        Sizing mirrors ``_handle_buy``: ``POSITION_SIZE_PCT`` of equity.
+        Sizing mirrors ``_handle_buy``: ``POSITION_SIZE_PCT`` of equity,
+        additionally capped at ``BUYING_POWER_USAGE_PCT`` of available
+        buying power, and floored to whole shares (Alpaca rejects fractional
+        short sales outright).
         """
         if self.pm.has_position(symbol):
             return
         if self.pm.get_open_count() >= MAX_POSITIONS:
+            return
+        if symbol.upper() in getattr(self, "_shorts_disabled", set()):
+            logger.debug(
+                "SHORT %s skipped — shorts disabled this session after %d rejections",
+                symbol, self._short_rejections.get(symbol.upper(), 0),
+            )
             return
         account = await self.broker.get_account()
         equity = account_equity(account)
@@ -889,10 +1167,31 @@ class TurboTrader:
             return
         if not self.pm.can_open(symbol, equity):
             return
-        value = equity * _position_size_pct_for(symbol)  # tier-aware: 50% base / 40% violence
-        qty = value / price if price > 0 else 0
-        if qty < 1:
+        if not await self._short_capability_allows(symbol, account):
             return
+        bp = _account_buying_power(account)
+        if bp is None:
+            logger.warning(f"⚠️  {symbol}: buying power unavailable — skipping short entry")
+            return
+        size_pct = _position_size_pct_for(symbol)  # tier-aware: 50% base / 40% violence
+        qty, bp_capped = _size_entry_qty(
+            equity=equity, buying_power=bp, price=price, size_pct=size_pct,
+            whole_shares=SHORT_WHOLE_SHARES_ONLY,
+        )
+        if qty < 1:
+            logger.warning(
+                "SHORT %s skipped — %s", symbol,
+                "whole-share floor leaves < 1 share"
+                if SHORT_WHOLE_SHARES_ONLY else "quantity < 1 share",
+            )
+            return
+        value = qty * price
+        if bp_capped:
+            logger.info(
+                "SHORT %s sized DOWN to buying power: $%s → $%s "
+                "(BP=$%s)", symbol, f"{equity * size_pct:,.0f}",
+                f"{value:,.0f}", f"{bp:,.0f}",
+            )
         order = Order(
             symbol=symbol,
             side=OrderSide.SELL,  # short sell — opens a short when flat
@@ -940,7 +1239,8 @@ class TurboTrader:
             # ── Place GTC protective BUY stop ABOVE entry ────────────
             await self._place_protective_stop(symbol, filled_qty, fill_price, is_short=True)
         else:
-            logger.warning(f"❌ SHORT {symbol} REJECTED: {result.status}")
+            err = getattr(result, "error_message", None)
+            self._record_short_rejection(symbol, _rejection_kind(err), err)
 
     async def _handle_sell(self, symbol: str, price: float, confidence: float, strategy: str = ""):
         if not self.pm.has_position(symbol):
