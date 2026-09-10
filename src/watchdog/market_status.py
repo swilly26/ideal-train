@@ -40,3 +40,12 @@ def market_closed_by_schedule(now: datetime | None = None) -> bool:
     """Inverse of :func:`in_rth_schedule` — True when the market is
     closed per the RTH schedule."""
     return not in_rth_schedule(now)
+
+
+if __name__ == "__main__":
+    # Tiny CLI for session-independent supervisors (cron): print "OPEN" or
+    # "CLOSED" per the DST-aware RTH schedule.  Pure stdlib, no network —
+    # the supervisor must never depend on the same external API that an
+    # outage could take down.
+    import sys
+    sys.stdout.write("OPEN\n" if in_rth_schedule() else "CLOSED\n")
