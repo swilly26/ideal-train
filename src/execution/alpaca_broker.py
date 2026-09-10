@@ -576,6 +576,51 @@ class AlpacaBroker(Broker):
             return bool(asset.shortable)
         except (AttributeError, TypeError, ValueError):
             return None
+    async def get_last_fill_price(self, symbol: str) -> float | None:
+        """Return the average fill price of the most recent FILLED order
+        for *symbol*, or ``None`` if none exists / the lookup failed.
+
+        Used by the position sync to reconcile realised P&L when a tracked
+        position disappears from the broker between syncs (e.g. a pending
+        cleanup MARKET SELL filled at the next open): the true exit price
+        comes from the broker's fill, never the last mark.
+        """
+        sym = symbol.upper()
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+
+            orders = await self._run_with_timeout(
+                self._trading_client.get_orders,
+                GetOrdersRequest(
+                    status=QueryOrderStatus.CLOSED,
+                    symbols=[sym],
+                    limit=5,
+                ),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Fill history fetch for %s timed out after %.1fs", sym, _API_TIMEOUT_SECONDS
+            )
+            return None
+        except Exception as exc:
+            logger.warning("Could not fetch fill history for %s: %s", sym, exc)
+            return None
+        for order in orders or []:
+            status = str(getattr(order, "status", "")).lower().removeprefix("orderstatus.")
+            if status not in ("filled", "done_for_day"):
+                continue
+            avg = getattr(order, "filled_avg_price", None)
+            if not avg:
+                continue
+            try:
+                price = float(avg)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                return price
+        return None
+
     async def close(self) -> None:
         """Release broker resources (no persistent connections to close)."""
         self._client = None

@@ -54,6 +54,11 @@ class PositionManager:
         self._positions: dict[str, PositionRecord] = {}
         self._closed_trades: list[ClosedTrade] = []
         self._realized_pnl: float = 0.0
+        # Symbols with a close order placed at the broker whose fill is not
+        # yet confirmed.  While a symbol is pending, no new close order is
+        # submitted (prevents double-sell / oversell) and NO realised P&L is
+        # booked — the fill is resolved by a broker sync.
+        self._pending_closes: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -164,6 +169,7 @@ class PositionManager:
         if record is None:
             logger.warning("Attempted to close non-existent position: %s", sym)
             return None
+        self._pending_closes.discard(sym)
 
         # P&L is direction-aware: a short position stores a NEGATIVE quantity,
         # so ``qty * (exit - entry)`` is already correct (a short profits when
@@ -206,6 +212,7 @@ class PositionManager:
         record = self._positions.pop(sym, None)
         if record is not None:
             logger.warning("Removed phantom position %s (%s)", sym, reason)
+        self._pending_closes.discard(sym)
         return record
 
     def update_price(self, symbol: str, price: float) -> None:
@@ -239,6 +246,26 @@ class PositionManager:
         """Return list of symbols with open positions."""
         return sorted(self._positions.keys())
 
+    # ------------------------------------------------------------------
+    # Pending closes (fill not yet confirmed by the broker)
+    # ------------------------------------------------------------------
+
+    def mark_pending_close(self, symbol: str) -> None:
+        """Record that a close order for *symbol* is live but unfilled.
+
+        While marked, no new close order is submitted for the symbol and no
+        realised P&L is booked — the fill is resolved by a broker sync.
+        """
+        self._pending_closes.add(symbol.upper())
+
+    def clear_pending_close(self, symbol: str) -> None:
+        """Forget the pending-close marker for *symbol* (e.g. after sync)."""
+        self._pending_closes.discard(symbol.upper())
+
+    def has_pending_close(self, symbol: str) -> bool:
+        """Return ``True`` if a close for *symbol* is awaiting fill."""
+        return symbol.upper() in self._pending_closes
+
     def get_open_count(self) -> int:
         """Return number of distinct symbols with open positions."""
         return len(self._positions)
@@ -269,3 +296,4 @@ class PositionManager:
         self._positions.clear()
         self._closed_trades.clear()
         self._realized_pnl = 0.0
+        self._pending_closes.clear()

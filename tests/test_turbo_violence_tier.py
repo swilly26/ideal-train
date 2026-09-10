@@ -58,13 +58,15 @@ def _flat_df(n=10, price=50.0):
 class FakeBroker:
     """In-memory broker stand-in (same shape as the turbo short tests)."""
 
-    def __init__(self, fill_result=None, status="accepted", positions=None):
+    def __init__(self, fill_result=None, status="accepted", positions=None,
+                 fill_price=None):
         self.orders = []
         self.stop_requests = []  # (symbol, qty, stop_price, client_id, side)
         self._open_orders = []
         self.fill_result = fill_result
         self.status = status
         self.positions = list(positions or [])
+        self.fill_price = fill_price
 
     async def get_account(self):
         return {"equity": 200_000.0, "buying_power": 400_000.0,
@@ -75,13 +77,14 @@ class FakeBroker:
 
     async def place_order(self, order):
         self.orders.append(order)
+        filled = self.status in ("filled", "done_for_day")
         return OrderResult(
             order_id="order-1",
             symbol=order.symbol,
             side=order.side,
             quantity=order.quantity,
-            filled_quantity=0.0,
-            filled_avg_price=None,
+            filled_quantity=order.quantity if filled else 0.0,
+            filled_avg_price=self.fill_price if filled else None,
             status=self.status,
             created_at=datetime.now(timezone.utc),
         )
@@ -240,7 +243,7 @@ class TestRiskStopsTierAware:
     @pytest.mark.asyncio
     async def test_violence_long_stop_loss_wider(self):
         """TNA -10% → beyond the 9% violence stop → closed."""
-        broker = FakeBroker()
+        broker = FakeBroker(status="filled", fill_price=45.0)  # confirmed stop fill
         trader = _make_trader(broker)
         trader.pm.open_position("TNA", 100, 50.0)
         trader._entry_times["TNA"] = datetime.now(timezone.utc)
@@ -275,7 +278,7 @@ class TestRiskStopsTierAware:
     @pytest.mark.asyncio
     async def test_base_symbol_keeps_base_stop(self):
         """SOXL -7% → beyond the 6% base stop → closed (base params intact)."""
-        broker = FakeBroker()
+        broker = FakeBroker(status="filled", fill_price=46.5)  # confirmed stop fill
         trader = _make_trader(broker)
         trader.pm.open_position("SOXL", 100, 50.0)
         trader._entry_times["SOXL"] = datetime.now(timezone.utc)
