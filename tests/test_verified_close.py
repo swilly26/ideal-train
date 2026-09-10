@@ -77,6 +77,15 @@ class FakeBroker:
             return False
         return None  # timeout — still pending
 
+    # Protective-stop interface (live_trader._handle_sell cancels stops
+    # before closing; this stand-in holds no stop orders, so the cancel is
+    # a trivially-confirmed no-op).
+    async def get_open_orders(self, symbol=None):
+        return []
+
+    async def cancel_order_and_wait(self, order_id, timeout=10.0, poll_interval=0.25):
+        return True
+
 
 def _pm_with(symbol, qty, entry):
     pm = PositionManager()
