@@ -10,6 +10,7 @@ Logs: /home/team/shared/engine/logs/trades_YYYYMMDD.log
 """
 import asyncio
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,23 @@ ENABLE_REGIME_GATE = True   # False → restore unconditional dip-buying
 REGIME_MA_PERIOD = 10       # short MA that defines the trend reference
 REGIME_RSI_PERIOD = 14      # RSI period used by the weakness filter
 REGIME_RSI_THRESHOLD = 40.0 # RSI below this = oversold/weak → block the long
+
+# ── Broker-side protective stops ────────────────────────────────────
+# Every held AND every newly-opened main position also gets a GTC
+# stop-loss order at the broker (Alpaca holds it even if every process on
+# this machine dies — the whole point: positions must be protected with
+# zero processes running).  The in-process 3% risk stop fires first while
+# the process is alive; the broker stop is the hard backstop at
+# entry − PROTECTIVE_STOP_PCT (6% default, mirroring the turbo trader's
+# protective-stop band for the mean-reversion profile).  Configurable via
+# MAIN_PROTECTIVE_STOP_PCT (e.g. 0.03 = 3%).
+PROTECTIVE_STOP_PCT = float(os.environ.get("MAIN_PROTECTIVE_STOP_PCT", "0.06"))
+# Stop-placement retry: submitting the stop while the entry order is still
+# open makes Alpaca reject it as a "potential wash trade" (opposite-side
+# market/stop order exists), which previously left positions running with
+# no broker-side protection.  Same policy as the turbo trader.
+STOP_PLACEMENT_MAX_ATTEMPTS = 4
+STOP_PLACEMENT_INITIAL_DELAY = 2.0
 
 # ── Logging ────────────────────────────────────────────────────────
 log_dir = Path("/home/team/shared/engine/logs")
@@ -136,6 +154,18 @@ def _regime_gate_allows_long(
             f"AND RSI {cur_rsi:.1f} < {rsi_threshold}"
         )
     return True, ""
+
+
+def _main_stop_client_id(symbol: str) -> str:
+    """Generate a unique idempotency key for main protective stop orders.
+
+    Format: ``algoflow_MAIN_{SYMBOL}_STOP_{timestamp_ns}`` — the
+    ``algoflow_MAIN_`` prefix keeps stale stops inside the boot-time
+    stale-order cancellation window (``cancel_orders_by_client_id_prefix``
+    in ``run()``), while the ``_STOP_`` infix distinguishes them from
+    entry/exit fill orders.
+    """
+    return f"algoflow_MAIN_{symbol.upper()}_STOP_{time.monotonic_ns()}"
 
 
 class LiveTrader:
@@ -302,6 +332,13 @@ class LiveTrader:
         # ── Post-startup stale position cleanup ──────────────────────
         await self._post_startup_cleanup()
 
+        # ── Ensure every held position has a broker-side GTC stop ────
+        # Placed right here — immediately after sync — so positions are
+        # protected at the broker even if every process on this box dies
+        # minutes later (the exact failure mode this trader must survive).
+        logger.info("STEP 1/3: Ensuring protective stops on held positions…")
+        await self._ensure_protective_stops()
+
         # Keep the process alive between sessions.  Each iteration waits for
         # the next market open, trades one session, reports its summary, then
         # resets local state before waiting for the following trading day.
@@ -457,11 +494,34 @@ class LiveTrader:
             self._entry_times[symbol.upper()] = datetime.now(timezone.utc)  # time-based exit
             logger.info(f"📈 BUY  {symbol}: {qty:.1f} shares @ ${price:.2f} = ${value:,.2f} | "
                         f"conf={confidence:.2f} | order={result.order_id[:8]}")
+            # ── Place GTC protective stop at broker ─────────────────
+            # The stop-placement retry machinery handles the case where the
+            # entry BUY is still open (wash-trade reject) by waiting and
+            # retrying; the position is never left broker-unprotected.
+            await self._place_protective_stop(symbol, qty, price)
         else:
             logger.warning(f"❌ BUY {symbol} REJECTED: {result.status}")
 
     async def _handle_sell(self, symbol: str, price: float, confidence: float):
         if not self.pm.has_position(symbol):
+            return
+
+        pos = self.pm.get_positions().get(symbol.upper())
+        if pos is None:
+            return
+        abs_qty = abs(pos.quantity)
+        is_short = pos.quantity < 0
+
+        # ── Cancel the GTC protective stop before closing ────────────
+        # Otherwise the stop stays open (GTC) after the position closes and
+        # could later trigger as an accidental short.  If the cancellation
+        # is not confirmed, defer the close — the position remains tracked
+        # AND protected, the safest state.
+        if not await self._cancel_protective_stops(symbol):
+            logger.warning(
+                "SELL %s deferred: protective-order cancellation was not confirmed",
+                symbol,
+            )
             return
 
         outcome = await close_position_verified(
@@ -493,7 +553,13 @@ class LiveTrader:
                 self._entry_times.pop(symbol.upper(), None)
                 logger.warning("SELL %s rejected as phantom position; removed from tracking", symbol)
             else:
-                logger.warning("SELL %s rejected (%s); keeping position tracked", symbol, outcome.message)
+                # The protective stop was cancelled above — restore it so the
+                # position doesn't run naked because of a rejected exit.
+                logger.warning(
+                    "SELL %s rejected (%s); keeping position tracked — restoring protective stop",
+                    symbol, outcome.message,
+                )
+                await self._place_protective_stop(symbol, abs_qty, pos.entry_price, is_short=is_short)
 
     async def _sync_positions_from_broker(self):
         """Reconcile local PositionManager with Alpaca's actual positions.
@@ -582,6 +648,11 @@ class LiveTrader:
                 sym = p.get("symbol")
                 qty = float(p.get("qty", 0))
                 if qty > 0:
+                    # Cancel the GTC protective stop before liquidating so it
+                    # can't outlive the position.
+                    if not await self._cancel_protective_stops(sym):
+                        logger.warning("🧹 Cleanup SELL %s deferred: cancellation not confirmed", sym)
+                        continue
                     logger.info("🧹 Cleanup SELL %s: %s shares", sym, qty)
                     outcome = await close_position_verified(
                         self.pm, self.broker, sym,
@@ -597,8 +668,11 @@ class LiveTrader:
                         )
                     else:
                         logger.warning(
-                            "🧹 Cleanup SELL %s rejected (%s); keeping position tracked",
+                            "🧹 Cleanup SELL %s rejected (%s); restoring protective stop and keeping position",
                             sym, outcome.message,
+                        )
+                        await self._place_protective_stop(
+                            sym, qty, float(p.get("avg_entry_price", 0)) or 0,
                         )
             logger.info(
                 "🧹 Post-close cleanup complete — %d position(s) liquidated",
@@ -639,6 +713,13 @@ class LiveTrader:
             sym = p.get("symbol")
             qty = float(p.get("qty", 0))
             if qty > 0:
+                # ── Cancel the GTC protective stop before liquidating ──
+                # If the cancellation is not confirmed, defer: the position
+                # stays tracked AND protected overnight — safer than a naked
+                # position or an orphaned stop.
+                if not await self._cancel_protective_stops(sym):
+                    logger.warning("⏰ EOD SELL %s deferred: cancellation not confirmed", sym)
+                    continue
                 logger.info(f"⏰ EOD closing {sym}: {qty} shares...")
                 outcome = await close_position_verified(
                     self.pm, self.broker, sym, exit_reason="eod",
@@ -652,11 +733,202 @@ class LiveTrader:
                     )
                 else:
                     logger.warning(
-                        "⏰ EOD SELL %s rejected (%s); keeping position tracked",
+                        "⏰ EOD SELL %s rejected (%s); restoring protective stop and keeping position",
                         sym, outcome.message,
+                    )
+                    await self._place_protective_stop(
+                        sym, qty, float(p.get("avg_entry_price", 0)) or 0,
                     )
 
         logger.info(f"⏰ Mandatory EOD liquidation — {liquidated} positions closed.")
+
+    # ── Broker-level protective stops ────────────────────────────────
+
+    async def _place_protective_stop(
+        self,
+        symbol: str,
+        qty: float,
+        entry_price: float,
+        max_attempts: int = STOP_PLACEMENT_MAX_ATTEMPTS,
+        initial_delay: float = STOP_PLACEMENT_INITIAL_DELAY,
+        is_short: bool = False,
+    ) -> bool:
+        """Place a GTC protective stop-loss order at the broker.
+
+        This order survives process death and sandbox cycling — Alpaca holds
+        it until triggered or cancelled.  For LONG positions the stop is a
+        SELL at ``entry_price * (1 - PROTECTIVE_STOP_PCT)`` (6% below entry);
+        for SHORT positions it is a BUY at ``entry_price * (1 + pct)`` (6%
+        ABOVE entry — a short loses money when price rises).  GTC orders
+        require whole shares, so *qty* is floored to an integer (the
+        fractional remainder is still covered by in-process risk checks).
+
+        Retries with backoff: submitting the stop while the entry order is
+        still open makes Alpaca reject it as a "potential wash trade"
+        (``opposite side market/stop order exists``).  Each attempt
+        re-checks the symbol's open orders so the stop is never submitted
+        while an opposite-side order is live.
+        """
+        sym = symbol.upper()
+        qty = int(qty)
+        if qty <= 0:
+            logger.warning("🛡️  STOP %s: position too small for protective stop (qty < 1 share)", sym)
+            return False
+
+        stop_loss_pct = PROTECTIVE_STOP_PCT
+        stop_price = round(
+            entry_price * (1 + stop_loss_pct) if is_short
+            else entry_price * (1 - stop_loss_pct),
+            2,
+        )
+        stop_side = "BUY" if is_short else "SELL"
+        opposite_open = "BUY" if is_short else "SELL"
+
+        for attempt in range(1, max_attempts + 1):
+            # ── Re-check the symbol's open orders before each attempt ──
+            # Another process may have placed a stop order during the
+            # entry-to-stop window, and an open opposite-side order would
+            # make the stop bounce off Alpaca's wash-trade filter.
+            try:
+                existing = await self.broker.get_open_orders(symbol=sym)
+                # For a long, an existing SELL order means the stop is already
+                # there.  For a short, an existing BUY order plays that role
+                # (the short's entry is a SELL, so it can't be confused).
+                if any(str(getattr(o, "side", "")).upper().endswith(stop_side) for o in existing):
+                    logger.info("🛡️  STOP %s: existing %s order found; not submitting duplicate",
+                                sym, stop_side)
+                    return True
+                if any(str(getattr(o, "side", "")).upper().endswith(opposite_open) for o in existing):
+                    if attempt < max_attempts:
+                        logger.info(
+                            "🛡️  STOP %s: entry %s still open — waiting %.0fs before retry (%d/%d)",
+                            sym, opposite_open, initial_delay, attempt, max_attempts,
+                        )
+                        await asyncio.sleep(initial_delay)
+                        continue
+            except Exception as exc:
+                logger.warning(
+                    "🛡️  STOP %s: cannot verify open orders (attempt %d/%d): %s",
+                    sym, attempt, max_attempts, exc,
+                )
+
+            client_id = _main_stop_client_id(sym)
+            try:
+                await self.broker.place_stop_order(
+                    symbol=sym,
+                    qty=qty,
+                    stop_price=stop_price,
+                    client_id=client_id,
+                    side=stop_side,
+                )
+                direction = "+" if is_short else "-"
+                logger.info(
+                    "🛡️  STOP %s: GTC %s stop-loss at $%.2f (entry=%.2f, %s%.0f%%)",
+                    sym, stop_side, stop_price, entry_price, direction,
+                    stop_loss_pct * 100,
+                )
+                return True
+            except Exception as exc:
+                if attempt < max_attempts:
+                    delay = initial_delay * attempt
+                    logger.warning(
+                        "🛡️  STOP %s: placement rejected (attempt %d/%d) — %s; retrying in %.0fs",
+                        sym, attempt, max_attempts, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "🛡️  STOP %s: FAILED after %d attempts — %s. Position has NO "
+                        "broker-level stop; in-process risk checks still active.",
+                        sym, max_attempts, exc,
+                    )
+        return False
+
+    async def _cancel_protective_stops(self, symbol: str) -> bool:
+        """Cancel all open orders for *symbol* (protective stops).
+
+        Called before closing a position so the GTC stop doesn't remain
+        open after the position is gone (an orphaned SELL stop could later
+        trigger as an accidental short).  Returns True only when every
+        previously-open order for the symbol is confirmed gone.
+        """
+        sym = symbol.upper()
+        try:
+            open_orders = await self.broker.get_open_orders(symbol=sym)
+        except Exception as exc:
+            logger.warning("Failed to fetch open orders for %s: %s", sym, exc)
+            return False
+
+        cancelled = 0
+        for o in open_orders:
+            try:
+                if await self.broker.cancel_order_and_wait(str(o.id)):
+                    cancelled += 1
+                    logger.debug("  Cancelled order %s for %s", str(o.id)[:8], sym)
+                else:
+                    logger.warning("  Cancellation not confirmed for order %s", str(o.id)[:8])
+            except Exception as exc:
+                logger.warning("  Failed to cancel order %s: %s", str(o.id)[:8], exc)
+
+        if cancelled:
+            logger.info("🗑️  Cancelled %d protective order(s) for %s", cancelled, sym)
+        remaining = await self.broker.get_open_orders()
+        remaining_ids = {str(getattr(order, "id", "")) for order in remaining}
+        return not any(str(o.id) in remaining_ids for o in open_orders)
+
+    async def _ensure_protective_stops(self):
+        """Ensure every inherited main position has a GTC protective stop.
+
+        Called right after ``_sync_positions_from_broker()`` at startup, so
+        positions that survived a process-group kill / sandbox cycle are
+        protected within seconds of boot.  For each tracked main symbol we
+        check whether a stop order already exists at Alpaca; if not, we
+        place a fresh one (entry − PROTECTIVE_STOP_PCT).  Only symbols in
+        the main trader's ``SYMBOLS`` set are touched: the account is shared
+        with the turbo trader, and we must never place our own stops on its
+        leveraged-ETF positions.
+        """
+        main_set = {s.upper() for s in SYMBOLS}
+        if not self.pm.get_open_symbols():
+            logger.info("🛡️  No inherited positions — skipping protective stop check")
+            return
+
+        # Fetch all open orders once so we can check stop coverage
+        try:
+            open_orders = await self.broker.get_open_orders()
+        except Exception as exc:
+            logger.warning("Cannot verify protective stops — order fetch failed: %s", exc)
+            return
+
+        # Build a set of symbols that already have an open stop order
+        # (SELL stop for longs, BUY stop for shorts — either means covered).
+        covered_symbols: set[str] = set()
+        for o in open_orders:
+            o_sym = str(o.symbol).upper()
+            o_side = str(o.side).upper()
+            if o_sym in main_set and o_side in ("SELL", "BUY"):
+                covered_symbols.add(o_sym)
+
+        for sym in list(self.pm.get_open_symbols()):
+            if sym not in main_set:
+                continue
+            pos = self.pm.get_positions().get(sym)
+            if pos is None:
+                continue
+
+            if sym in covered_symbols:
+                logger.info("🛡️  %s: existing stop order found — covered", sym)
+                continue
+
+            is_short = pos.quantity < 0
+            logger.warning(
+                "🛡️  %s: NO protective stop found for inherited position "
+                "(%s shares @ $%.2f%s) — placing one now",
+                sym, abs(pos.quantity), pos.entry_price, " [short]" if is_short else "",
+            )
+            await self._place_protective_stop(
+                sym, int(abs(pos.quantity)), pos.entry_price, is_short=is_short,
+            )
 
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
@@ -713,6 +985,13 @@ class LiveTrader:
             qty = float(p.get("qty", 0))
             if qty > 0:
                 logger.info(f"Closing {sym}: {qty} shares...")
+                # Cancel the GTC protective stop so it can't outlive the
+                # position (best-effort on this path — shutdown is a last
+                # resort; positions should already be flat from EOD).
+                try:
+                    await self._cancel_protective_stops(sym)
+                except Exception:
+                    logger.exception("Failed to cancel protective stop for %s during shutdown", sym)
                 order = Order(symbol=sym, side=OrderSide.SELL, quantity=qty, order_type=OrderType.MARKET)
                 await self.broker.place_order(order)
 
