@@ -90,3 +90,16 @@ class Broker(ABC):
         broker implementations keep working without modification.
         """
         return None
+
+    async def get_last_fill_price(self, symbol: str) -> float | None:
+        """Return the average fill price of the most recent FILLED order
+        for *symbol*, or ``None`` if there is none / it cannot be determined.
+
+        Used to reconcile realised P&L when a tracked position disappears
+        from the broker between syncs (e.g. a pending cleanup MARKET SELL
+        filled at the next open).  The default implementation returns
+        ``None`` so existing broker implementations keep working without
+        modification, but callers then cannot price the removal and must
+        drop the position WITHOUT booking P&L (never a fabricated loss).
+        """
+        return None

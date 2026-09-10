@@ -25,6 +25,7 @@ from src.execution.broker import Order, OrderSide, OrderType
 import time
 from src.execution.position_manager import PositionManager
 from src.execution.session_state import load_start_equity, save_start_equity
+from src.execution.verified_close import close_position_verified
 from src.strategies.base import SignalType, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
 from src.strategies.indicators import sma
@@ -463,31 +464,36 @@ class LiveTrader:
         if not self.pm.has_position(symbol):
             return
 
-        pos = self.pm.get_positions().get(symbol.upper())
-        if pos is None:
-            return
-        qty = pos.quantity
-        entry = pos.entry_price
-        order = Order(symbol=symbol, side=OrderSide.SELL, quantity=qty, order_type=OrderType.MARKET,
-                      client_id=f"algoflow_MAIN_{symbol.upper()}_SELL_{time.monotonic_ns()}")
-        result = await self.broker.place_order(order)
-
-        if not is_order_alive(result.status):
-            error = (getattr(result, "error_message", None) or "").lower()
+        outcome = await close_position_verified(
+            self.pm,
+            self.broker,
+            symbol,
+            exit_reason="signal",
+            client_id=f"algoflow_MAIN_{symbol.upper()}_SELL_{time.monotonic_ns()}",
+        )
+        if outcome.status == "filled" and outcome.trade is not None:
+            self._entry_times.pop(symbol.upper(), None)
+            trade = outcome.trade
+            logger.info(
+                f"📉 SELL {symbol}: {abs(trade.quantity):.1f} shares @ ${outcome.fill_price:.2f} | "
+                f"P&L: ${trade.pnl:,.2f} | conf={confidence:.2f} | order={outcome.order_id[:8]}"
+            )
+        elif outcome.status == "pending":
+            # The close order is live but the broker has not confirmed a fill.
+            # We keep the position tracked and book NO P&L; the next position
+            # sync reconciles the fill from broker fill history.
+            logger.info(
+                f"⏳ SELL {symbol}: close pending (fill not confirmed) — no P&L booked | "
+                f"conf={confidence:.2f}"
+            )
+        elif outcome.status == "rejected":
+            error = (outcome.message or "").lower()
             if "cannot be sold short" in error:
                 self.pm.discard_position(symbol, reason="broker says position is not held")
                 self._entry_times.pop(symbol.upper(), None)
                 logger.warning("SELL %s rejected as phantom position; removed from tracking", symbol)
             else:
-                logger.warning("SELL %s rejected (%s); keeping position tracked", symbol, result.status)
-            return
-
-        pnl = (price - entry) * qty if entry else 0
-        self.pm.close_position(symbol, price)
-        self._entry_times.pop(symbol.upper(), None)
-
-        logger.info(f"📉 SELL {symbol}: {qty:.1f} shares @ ${price:.2f} | "
-                    f"P&L: ${pnl:,.2f} | conf={confidence:.2f} | order={result.order_id[:8]}")
+                logger.warning("SELL %s rejected (%s); keeping position tracked", symbol, outcome.message)
 
     async def _sync_positions_from_broker(self):
         """Reconcile local PositionManager with Alpaca's actual positions.
@@ -522,10 +528,27 @@ class LiveTrader:
                 )
                 added += 1
 
-        # Remove positions we track but broker doesn't have
+        # Remove positions we track but broker doesn't have.  A tracked
+        # position that vanishes from the broker (e.g. a pending cleanup
+        # MARKET SELL that filled in the background, or an external sale) is
+        # booked at the broker's true last fill price.  If no fill price can
+        # be determined, the position is DROPPED without booking P&L — never
+        # fabricate a mark-based loss.
         for sym in pm_symbols - set(broker_symbols):
-            self.pm.close_position(sym, exit_price=0, exit_reason="sync_removed")
-            logger.info("  - Removed stale %s (not on broker)", sym)
+            fill_price = await self.broker.get_last_fill_price(sym)
+            if fill_price is not None:
+                self.pm.close_position(sym, exit_price=fill_price, exit_reason="sync_removed")
+                logger.info(
+                    "  - Removed %s (not on broker) — P&L booked at broker fill $%.2f",
+                    sym, fill_price,
+                )
+            else:
+                self.pm.discard_position(sym, reason="sync_removed_no_fill")
+                logger.info(
+                    "  - Removed stale %s (not on broker) — no fill price available; "
+                    "dropped WITHOUT booking P&L",
+                    sym,
+                )
             removed += 1
 
         logger.info(
@@ -554,29 +577,32 @@ class LiveTrader:
                 "🧹 Post-close cleanup: liquidating %d stale position(s) from previous session",
                 len(positions),
             )
+            liquidated = 0
             for p in positions:
                 sym = p.get("symbol")
                 qty = float(p.get("qty", 0))
                 if qty > 0:
                     logger.info("🧹 Cleanup SELL %s: %s shares", sym, qty)
-                    order = Order(
-                        symbol=sym,
-                        side=OrderSide.SELL,
-                        quantity=qty,
-                        order_type=OrderType.MARKET,
+                    outcome = await close_position_verified(
+                        self.pm, self.broker, sym,
+                        exit_reason="post_close_cleanup",
                     )
-                    result = await self.broker.place_order(order)
-                    if is_order_alive(result.status):
-                        self.pm.close_position(
+                    if outcome.status == "filled":
+                        liquidated += 1
+                    elif outcome.status == "pending":
+                        logger.info(
+                            "🧹 Cleanup SELL %s: close pending (fill not confirmed) — "
+                            "no P&L booked, will reconcile at next sync",
                             sym,
-                            exit_price=float(p.get("current_price", 0)),
-                            exit_reason="post_close_cleanup",
                         )
                     else:
-                        logger.warning("🧹 Cleanup SELL %s rejected (%s); keeping position tracked", sym, result.status)
+                        logger.warning(
+                            "🧹 Cleanup SELL %s rejected (%s); keeping position tracked",
+                            sym, outcome.message,
+                        )
             logger.info(
                 "🧹 Post-close cleanup complete — %d position(s) liquidated",
-                len(positions),
+                liquidated,
             )
         except Exception:
             logger.exception("🧹 Post-close cleanup failed — continuing startup")
@@ -608,19 +634,29 @@ class LiveTrader:
             logger.info("⏰ Mandatory EOD liquidation — no positions to close")
             return
 
+        liquidated = 0
         for p in positions:
             sym = p.get("symbol")
             qty = float(p.get("qty", 0))
             if qty > 0:
                 logger.info(f"⏰ EOD closing {sym}: {qty} shares...")
-                order = Order(symbol=sym, side=OrderSide.SELL, quantity=qty, order_type=OrderType.MARKET)
-                result = await self.broker.place_order(order)
-                if is_order_alive(result.status):
-                    self.pm.close_position(sym, exit_price=float(p.get("current_price", 0)), exit_reason="eod")
+                outcome = await close_position_verified(
+                    self.pm, self.broker, sym, exit_reason="eod",
+                )
+                if outcome.status == "filled":
+                    liquidated += 1
+                elif outcome.status == "pending":
+                    logger.info(
+                        "⏰ EOD SELL %s: close pending (fill not confirmed) — no P&L booked",
+                        sym,
+                    )
                 else:
-                    logger.warning("⏰ EOD SELL %s rejected (%s); keeping position tracked", sym, result.status)
+                    logger.warning(
+                        "⏰ EOD SELL %s rejected (%s); keeping position tracked",
+                        sym, outcome.message,
+                    )
 
-        logger.info(f"⏰ Mandatory EOD liquidation — {count} positions closed.")
+        logger.info(f"⏰ Mandatory EOD liquidation — {liquidated} positions closed.")
 
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""

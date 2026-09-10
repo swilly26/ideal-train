@@ -28,6 +28,7 @@ from src.execution.alpaca_broker import AlpacaBroker, account_equity, is_order_a
 from src.execution.broker import Order, OrderSide, OrderType
 from src.execution.position_manager import PositionManager
 from src.execution.session_state import load_start_equity, ny_today, save_start_equity
+from src.execution.verified_close import close_position_verified
 from src.strategies.base import Signal, SignalType, Strategy, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
 from src.strategies.liquidity_sweep import LiquiditySweepStrategy
@@ -1249,10 +1250,8 @@ class TurboTrader:
         pos = self.pm.get_positions().get(symbol.upper())
         if pos is None:
             return
-        qty = pos.quantity
-        entry = pos.entry_price
-        is_short = qty < 0
-        abs_qty = abs(qty)
+        abs_qty = abs(pos.quantity)
+        is_short = pos.quantity < 0
         # Closing a long = SELL; closing a short = BUY (buy to cover)
         side = OrderSide.BUY if is_short else OrderSide.SELL
         action = "COVER" if is_short else "SELL"
@@ -1263,17 +1262,34 @@ class TurboTrader:
                            action, symbol)
             return
 
-        order = Order(
-            symbol=symbol,
-            side=side,
-            quantity=abs_qty,
-            order_type=OrderType.MARKET,
+        # Only book realised P&L after the broker confirms a fill (at the
+        # broker's average fill price, never the last mark).  Unconfirmed
+        # closes stay pending: position tracked, P&L not booked, and no
+        # duplicate sell is re-submitted while pending.
+        outcome = await close_position_verified(
+            self.pm,
+            self.broker,
+            symbol,
+            exit_reason="signal",
             client_id=_turbo_client_id(symbol, side),
         )
-        result = await self.broker.place_order(order)
-
-        if not is_order_alive(result.status):
-            error = (getattr(result, "error_message", None) or "").lower()
+        strat_tag = f" [{strategy}]" if strategy else ""
+        if outcome.status == "filled" and outcome.trade is not None:
+            self._entry_times.pop(symbol.upper(), None)  # clean up time tracker
+            trade = outcome.trade
+            log_icon = "📗" if is_short else "📉"
+            logger.info(
+                f"{log_icon} {action} {symbol}: {abs_qty:.1f} shares @ ${outcome.fill_price:.2f} | "
+                f"P&L: ${trade.pnl:+,.2f} ({trade.pnl_pct*100:+.1f}%) | conf={confidence:.2f}{strat_tag} | "
+                f"order={outcome.order_id[:8]}"
+            )
+        elif outcome.status == "pending":
+            logger.info(
+                f"⏳ {action} {symbol}: close pending (fill not confirmed) — no P&L booked | "
+                f"conf={confidence:.2f}{strat_tag}"
+            )
+        elif outcome.status == "rejected":
+            error = (outcome.message or "").lower()
             if not is_short and "cannot be sold short" in error:
                 self.pm.discard_position(symbol, reason="broker says position is not held")
                 self._entry_times.pop(symbol.upper(), None)
@@ -1283,28 +1299,9 @@ class TurboTrader:
                 # position doesn't run naked because of a rejected exit.
                 logger.warning(
                     "%s %s rejected (%s); keeping position tracked — restoring protective stop",
-                    action, symbol, result.status,
+                    action, symbol, outcome.message,
                 )
-                await self._place_protective_stop(symbol, abs_qty, entry, is_short=is_short)
-            return
-
-        # Direction-aware P&L: a short profits when price falls.
-        if is_short:
-            pnl = (entry - price) * abs_qty
-            pnl_pct = ((entry / price) - 1.0) * 100 if price else 0
-        else:
-            pnl = (price - entry) * qty
-            pnl_pct = ((price / entry) - 1.0) * 100 if entry else 0
-        self.pm.close_position(symbol, price)
-        self._entry_times.pop(symbol.upper(), None)  # clean up time tracker
-
-        strat_tag = f" [{strategy}]" if strategy else ""
-        log_icon = "📗" if is_short else "📉"
-        logger.info(
-            f"{log_icon} {action} {symbol}: {abs_qty:.1f} shares @ ${price:.2f} | "
-            f"P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%) | conf={confidence:.2f}{strat_tag} | "
-            f"order={result.order_id[:8]}"
-        )
+                await self._place_protective_stop(symbol, abs_qty, pos.entry_price, is_short=is_short)
 
     async def _sync_positions_from_broker(self):
         """Reconcile local PositionManager with Alpaca's actual positions."""
@@ -1347,20 +1344,36 @@ class TurboTrader:
                             "🧹 Cleanup %s %s: inherited at $%.2f, now $%.2f = %.1f%%",
                             action, sym, entry_price, current_price, pnl_pct * 100,
                         )
-                        order = Order(
-                            symbol=sym,
-                            side=side,
-                            quantity=abs_qty,
-                            order_type=OrderType.MARKET,
+                        # Track the position FIRST so the verified close knows
+                        # the quantity and only books P&L at the broker's fill
+                        # (never the mark).  A pending close keeps the symbol
+                        # tracked with no P&L booked — no duplicate sell.
+                        self.pm.open_position(symbol=sym, quantity=qty, entry_price=entry_price)
+                        outcome = await close_position_verified(
+                            self.pm, self.broker, sym,
+                            exit_reason="cleanup_sync",
                             client_id=_turbo_client_id(sym, side),
                         )
-                        result = await self.broker.place_order(order)
-                        if is_order_alive(result.status):
-                            continue  # Don't add to PM — the exit was accepted
+                        if outcome.status == "filled":
+                            logger.info(
+                                "🧹 Cleanup %s %s: closed at broker fill $%.2f",
+                                action, sym, outcome.fill_price,
+                            )
+                            continue  # booked; do not re-add
+                        if outcome.status == "pending":
+                            logger.info(
+                                "🧹 Cleanup %s %s: close pending (fill not confirmed) — "
+                                "position tracked, no P&L booked; reconciled at next sync",
+                                action, sym,
+                            )
+                            added += 1
+                            continue
                         logger.warning(
                             "🧹 Cleanup %s %s rejected (%s); tracking position",
-                            action, sym, result.status,
+                            action, sym, outcome.message,
                         )
+                        added += 1
+                        continue
 
                 self.pm.open_position(
                     symbol=sym,
@@ -1376,8 +1389,23 @@ class TurboTrader:
         for sym in pm_symbols - set(broker_symbols):
             if sym not in turbo_set:
                 continue  # Never remove non-turbo positions from PM
-            self.pm.close_position(sym, exit_price=0, exit_reason="sync_removed")
-            logger.info("  - Removed stale %s (not on broker)", sym)
+            # A tracked turbo position that vanished from the broker is booked
+            # at the broker's true last fill price when one exists; otherwise
+            # it is dropped WITHOUT booking P&L (never fabricate a loss).
+            fill_price = await self.broker.get_last_fill_price(sym)
+            if fill_price is not None:
+                self.pm.close_position(sym, exit_price=fill_price, exit_reason="sync_removed")
+                logger.info(
+                    "  - Removed %s (not on broker) — P&L booked at broker fill $%.2f",
+                    sym, fill_price,
+                )
+            else:
+                self.pm.discard_position(sym, reason="sync_removed_no_fill")
+                logger.info(
+                    "  - Removed stale %s (not on broker) — no fill price available; "
+                    "dropped WITHOUT booking P&L",
+                    sym,
+                )
             removed += 1
 
         logger.info(
@@ -1413,6 +1441,7 @@ class TurboTrader:
                 "🧹 Post-close cleanup: liquidating %d stale turbo position(s) from previous session",
                 len(positions),
             )
+            liquidated = 0
             for p in positions:
                 sym = p.get("symbol")
                 qty = float(p.get("qty", 0))
@@ -1429,34 +1458,32 @@ class TurboTrader:
                     continue
                 logger.info("🧹 Cleanup %s %s: %s shares%s",
                             action, sym, abs_qty, " [short]" if is_short else "")
-                order = Order(
-                    symbol=sym,
-                    side=side,
-                    quantity=abs_qty,
-                    order_type=OrderType.MARKET,
+                outcome = await close_position_verified(
+                    self.pm, self.broker, sym,
+                    exit_reason="post_close_cleanup",
                     client_id=_turbo_client_id(sym, side),
                 )
-                result = await self.broker.place_order(order)
-                if not is_order_alive(result.status):
+                if outcome.status == "filled":
+                    liquidated += 1
+                elif outcome.status == "pending":
+                    logger.info(
+                        "🧹 Cleanup %s %s: close pending (fill not confirmed) — no P&L booked",
+                        action, sym,
+                    )
+                else:
                     # Stop was cancelled above — restore it so the stale
                     # position isn't left naked if the cleanup exit fails.
                     logger.warning(
                         "🧹 Cleanup %s %s rejected (%s); restoring protective stop and keeping position",
-                        action, sym, result.status,
+                        action, sym, outcome.message,
                     )
                     await self._place_protective_stop(
                         sym, abs_qty, float(p.get("avg_entry_price", 0)) or 0,
                         is_short=is_short,
                     )
-                    continue
-                self.pm.close_position(
-                    sym,
-                    exit_price=float(p.get("current_price", 0)),
-                    exit_reason="post_close_cleanup",
-                )
             logger.info(
                 "🧹 Post-close cleanup complete — %d turbo position(s) liquidated",
-                len(positions),
+                liquidated,
             )
         except Exception:
             logger.exception("🧹 Post-close cleanup failed — continuing startup")
@@ -1736,6 +1763,7 @@ class TurboTrader:
             logger.info("⏰ Mandatory EOD liquidation — no positions to close")
             return
 
+        liquidated = 0
         for p in positions:
             sym = p.get("symbol")
             qty = float(p.get("qty", 0))
@@ -1750,29 +1778,31 @@ class TurboTrader:
                 logger.warning("⏰ EOD %s %s deferred: cancellation not confirmed", action, sym)
                 continue
             logger.info(f"⏰ EOD closing {sym}: {abs_qty} shares ({'short' if is_short else 'long'})...")
-            order = Order(
-                symbol=sym,
-                side=side,
-                quantity=abs_qty,
-                order_type=OrderType.MARKET,
+            outcome = await close_position_verified(
+                self.pm, self.broker, sym,
+                exit_reason="eod",
                 client_id=_turbo_client_id(sym, side),
             )
-            result = await self.broker.place_order(order)
-            if not is_order_alive(result.status):
+            if outcome.status == "filled":
+                liquidated += 1
+            elif outcome.status == "pending":
+                logger.info(
+                    "⏰ EOD %s %s: close pending (fill not confirmed) — no P&L booked",
+                    action, sym,
+                )
+            else:
                 # Stop was cancelled above — restore it so the position
                 # doesn't sit naked overnight if the EOD exit fails.
                 logger.warning(
                     "⏰ EOD %s %s rejected (%s); restoring protective stop and keeping position",
-                    action, sym, result.status,
+                    action, sym, outcome.message,
                 )
                 await self._place_protective_stop(
                     sym, abs_qty, float(p.get("avg_entry_price", 0)) or 0,
                     is_short=is_short,
                 )
-                continue
-            self.pm.close_position(sym, exit_price=float(p.get("current_price", 0)), exit_reason="eod")
 
-        logger.info(f"⏰ Mandatory EOD liquidation — {count} positions closed.")
+        logger.info(f"⏰ Mandatory EOD liquidation — {liquidated} positions closed.")
 
     async def shutdown(self, close_broker: bool = True):
         """Liquidate all TURBO positions and report P&L; optionally retain broker."""

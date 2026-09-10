@@ -53,13 +53,15 @@ def _uptrend_df(n=40, start=90.0, step=0.3):
 class FakeBroker:
     """In-memory broker stand-in for short entry/exit paths."""
 
-    def __init__(self, fill_result=None, status="accepted", positions=None):
+    def __init__(self, fill_result=None, status="accepted", positions=None,
+                 fill_price=None):
         self.orders = []          # Order objects submitted via place_order
         self.stop_requests = []   # (symbol, qty, stop_price, client_id, side)
         self._open_orders = []
         self.fill_result = fill_result
         self.status = status
         self.positions = list(positions or [])
+        self.fill_price = fill_price
 
     async def get_account(self):
         return {"equity": 200_000.0, "buying_power": 400_000.0,
@@ -70,13 +72,14 @@ class FakeBroker:
 
     async def place_order(self, order):
         self.orders.append(order)
+        filled = self.status in ("filled", "done_for_day")
         return OrderResult(
             order_id="order-1",
             symbol=order.symbol,
             side=order.side,
             quantity=order.quantity,
-            filled_quantity=0.0,
-            filled_avg_price=None,
+            filled_quantity=order.quantity if filled else 0.0,
+            filled_avg_price=self.fill_price if filled else None,
             status=self.status,
             created_at=datetime.now(timezone.utc),
         )
@@ -287,7 +290,7 @@ class TestShortFlow:
 
     @pytest.mark.asyncio
     async def test_handle_sell_covers_short_with_buy_and_profit(self):
-        broker = FakeBroker()
+        broker = FakeBroker(status="filled", fill_price=30.0)  # confirmed cover fill: 32.50 → 30.00
         trader = _make_trader(broker)
         trader.pm.open_position("FNGU", -100.0, 32.50)
         trader._entry_times["FNGU"] = datetime.now(timezone.utc)
@@ -381,7 +384,7 @@ class TestShortFlow:
     @pytest.mark.asyncio
     async def test_eod_liquidation_covers_shorts(self):
         """EOD must buy-to-cover negative-qty broker positions."""
-        broker = FakeBroker(positions=[{
+        broker = FakeBroker(status="filled", fill_price=38.0, positions=[{
             "symbol": "SOXL", "qty": -50.0, "avg_entry_price": 40.0,
             "current_price": 38.0, "market_value": -1900.0, "unrealized_pl": 100.0,
         }])
@@ -413,7 +416,7 @@ class TestShortFlow:
 
     @pytest.mark.asyncio
     async def test_risk_stops_short_take_profit_on_fall(self):
-        broker = FakeBroker()
+        broker = FakeBroker(status="filled", fill_price=36.0)  # confirmed cover at the take-profit mark
         trader = _make_trader(broker)
         trader.pm.open_position("SOXL", -100.0, 40.0)
         trader._entry_times["SOXL"] = datetime.now(timezone.utc)
