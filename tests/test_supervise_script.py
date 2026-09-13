@@ -33,7 +33,14 @@ PATH_ENV = os.environ.get("PATH", "/usr/bin:/bin")
 
 
 def _run(env_extra, cwd="/", timeout=30):
-    """Run the supervise script with a scratch lockfile + log in tmp_path."""
+    """Run the supervise script with a scratch lockfile + log in tmp_path.
+
+    ``env_extra`` is COPIED at the top so repeated calls with the same dict
+    cannot KeyError (pre-fix: _LOG_PATH/_LOCK_PATH/_ENGINE_DIR are popped
+    out of the CALLER'S dict, so a second call with the same dict died).
+    The __pycache__-safe pattern is: ``_run(env, ...)`` twice in one test.
+    """
+    env_extra = dict(env_extra)
     log = env_extra.pop("_LOG_PATH")
     lock = env_extra.pop("_LOCK_PATH")
     env = {
@@ -102,15 +109,48 @@ def test_gate_resolves_from_foreign_cwd(tmp_path):
         "gate produced neither a pass nor a clean defer"
 
 
-def test_gate_defers_on_non_open_status(tmp_path):
-    """A gate that resolves to anything non-OPEN must defer (safe default)."""
-    engine_dir, _ = _make_fake_engine(tmp_path, gate_output="BROKEN")
+def test_gate_defers_on_confirmed_closed(tmp_path):
+    """A CONFIRMED closed market must defer (the only defer reason)."""
+    engine_dir, _ = _make_fake_engine(tmp_path, gate_output="CLOSED")
     log = _run({**_env_base(tmp_path),
                 "_ENGINE_DIR": engine_dir,
                 "SUPERVISE_DRYRUN": "1"}, cwd="/")
     assert "deferring until open" in log
-    assert "status=BROKEN" in log
     assert "dry-run: gate passed" not in log
+
+
+def test_gate_fails_open_on_unknown_status(tmp_path):
+    """Gate status unknown/errored must log LOUDLY and FAIL-OPEN.
+
+    Regression for drill #2's failure mode: when the gate cannot resolve
+    (cron cwd broke the import -> status=unknown -> deferred), the stack
+    stayed down with held positions unmanaged.  Any non-OPEN/non-CLOSED
+    verdict (garbage, traceback, empty) must log a WARN and still launch.
+    """
+    engine_dir, _ = _make_fake_engine(tmp_path, gate_output="BROKEN")
+    log = _run({**_env_base(tmp_path),
+                "_ENGINE_DIR": engine_dir,
+                "SUPERVISE_DRYRUN": "1"}, cwd="/")
+    assert "WARN: market-hours gate UNKNOWN/ERRORED" in log, \
+        "unknown gate status must be logged loudly"
+    assert "FAIL-OPEN" in log
+    assert "BROKEN" in log, "gate output should be echoed for diagnosis"
+    assert "dry-run: gate passed" in log, \
+        "unknown gate status must NOT defer — the stack must start"
+
+def test_run_helper_survives_repeated_calls_with_same_dict(tmp_path):
+    """Regression: _run must copy env_extra instead of popping the caller's
+    dict.  Two runs with the SAME dict must both work (pre-fix the second
+    call KeyError'd on the already-popped _LOG_PATH)."""
+    engine_dir, marker = _make_fake_engine(tmp_path, gate_output="OPEN")
+    env = {**_env_base(tmp_path),
+           "_ENGINE_DIR": engine_dir,
+           "SUPERVISE_DRYRUN": "1"}
+    log1 = _run(env, cwd="/")
+    assert "dry-run: gate passed" in log1
+    # Same dict again — must not KeyError (dict copy added in _run).
+    log2 = _run(env, cwd="/")
+    assert "dry-run: gate passed" in log2
 
 
 # ── 2. The launched watchdog must not pin the supervisor lock ──────
@@ -149,6 +189,12 @@ def test_noop_guard_holds_while_watchdog_alive(tmp_path):
         time.sleep(0.1)
     assert marker.exists(), "supervisor did not launch the fake watchdog"
     try:
+        # Settle: the setsid'd watchdog's /proc cmdline can lag a few ms
+        # behind its marker write, so a back-to-back run could miss it via
+        # pgrep (production ticks are 60s apart — this is purely a test
+        # cadence artifact, and the script's .supervise_last_pid fallback
+        # covers even that).  Give the process table a moment to settle.
+        time.sleep(0.5)
         log2 = _run(env, cwd="/", timeout=30)
         assert log2.strip() == "", "second run must be a silent no-op"
         assert _watchdog_count(engine_dir) == 1, "supervisor spawned a second watchdog"

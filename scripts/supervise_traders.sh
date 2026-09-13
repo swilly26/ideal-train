@@ -78,8 +78,21 @@ cd "$ENGINE_DIR"
 exec 9>"$LOCKFILE"
 flock -n 9 || { log "another supervisor run holds the lock — exiting"; exit 0; }
 # ── Already supervised? no-op (scoped to THIS engine's watchdog) ──
+# Primary check: pgrep on the engine-scoped watchdog cmdline.  Secondary:
+# the last pid THIS supervisor launched (`.supervise_last_pid`) if it is
+# still alive — covers the instant after launch when the setsid'd child's
+# /proc cmdline is not yet visible to a back-to-back pgrep (a cron-adjacent
+# race that otherwise double-launches the stack), and covers a watchdog
+# started with a relative path that the absolute-path pattern cannot see.
+# After a kill, the stale pid is dead (kill -0 fails) and the next tick
+# relaunches.
 WATCHDOG_RE="bash ${ENGINE_DIR}/watchdog[.]sh"
-if [[ "${SUPERVISE_DRYRUN:-0}" != "1" ]] && pgrep -f "$WATCHDOG_RE" >/dev/null; then
+LAST_PID_FILE="$LOG_DIR/.supervise_last_pid"
+last_pid="$(cat "$LAST_PID_FILE" 2>/dev/null || true)"
+if [[ "${SUPERVISE_DRYRUN:-0}" != "1" ]] && {
+    pgrep -f "$WATCHDOG_RE" >/dev/null \
+    || { [[ -n "$last_pid" ]] && kill -0 "$last_pid" 2>/dev/null; }
+}; then
     exit 0
 fi
 # ── Market-hours gate (DST-aware, pure stdlib, no network) ─────────
@@ -87,11 +100,23 @@ fi
 # state — the supervisor must keep functioning even before this branch is
 # merged, and must never depend on a file that a later checkout could
 # remove.  Runs from $ENGINE_DIR (cd'd above), so it is cwd-independent.
+# FAIL-OPEN on unknown/error: the ONLY reason to defer is a CONFIRMED
+# closed market.  If the gate cannot run (broken tree, import error,
+# garbage output) the stack must still start — a rare pre-open boot is the
+# lesser risk compared to leaving held positions unmanaged (their GTC
+# broker stops cover the pre-open window; the traders re-place them on
+# boot).  This is the exact mode that broke drill #2: a gate that could
+# not import from cron's cwd looked "closed" and the stack stayed down.
 if [[ "${SUPERVISE_FORCE:-0}" != "1" ]]; then
-    status="$("$PYTHON_BIN" -c 'from src.watchdog.market_status import in_rth_schedule; print("OPEN" if in_rth_schedule() else "CLOSED")' 2>/dev/null)"
-    if [[ "$status" != "OPEN" ]]; then
-        log "watchdog down but market closed (status=${status:-unknown}) — deferring until open"
+    gate_out="$("$PYTHON_BIN" -c 'from src.watchdog.market_status import in_rth_schedule; print("OPEN" if in_rth_schedule() else "CLOSED")' 2>&1)"
+    status="$(printf '%s\n' "$gate_out" | tail -n 1)"
+    if [[ "$status" == "CLOSED" ]]; then
+        log "watchdog down but market closed (status=CLOSED) — deferring until open"
         exit 0
+    fi
+    if [[ "$status" != "OPEN" ]]; then
+        log "WARN: market-hours gate UNKNOWN/ERRORED (status=${status:-empty}) — FAIL-OPEN: starting stack; positions must stay managed"
+        log "gate output: ${gate_out}"
     fi
 fi
 # ── Test hook: dry-run reports the gate verdict without launching ──
