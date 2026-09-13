@@ -313,9 +313,25 @@ class LiveTrader:
         cancelled = await self.broker.cancel_orders_by_client_id_prefix("algoflow_MAIN_")
         logger.info(f"Cancelled {cancelled} stale order(s)")
         remaining = await self.broker.get_open_orders()
-        if any(str(getattr(o, "client_order_id", "")).startswith("algoflow_MAIN_") for o in remaining):
-            logger.error("Stale order cancellation was not confirmed; deferring position cleanup")
-            return
+        stale_cancel_unconfirmed = any(
+            str(getattr(o, "client_order_id", "")).startswith("algoflow_MAIN_")
+            for o in remaining
+        )
+        if stale_cancel_unconfirmed:
+            # A leftover order the broker pins as "pending cancel" (e.g. a
+            # cancel was in flight when a previous host died) answers every
+            # cancel attempt with 42210000 and can stay visible for days.
+            # That must NOT kill the boot: the order is already being
+            # cancelled at the broker, so we skip only the post-startup
+            # position-cleanup step (its intent was to liquidate leftovers
+            # whose orders we expected to be gone) and continue the normal
+            # boot — sync positions, re-place protective stops, wait for
+            # market. Mirror of the turbo trader's tolerant handling.
+            logger.warning(
+                "Stale order cancellation was not confirmed — deferring post-startup "
+                "position cleanup; continuing boot (positions will be synced and "
+                "protective stops re-placed)"
+            )
 
         # ── Layer 2: Sync positions from Alpaca at startup ───────────
         logger.info("STEP 1/3: Syncing positions from broker…")
@@ -330,7 +346,13 @@ class LiveTrader:
                 logger.info("  Inherited: %s x %s @ $%.2f", pos.quantity, sym, pos.entry_price)
 
         # ── Post-startup stale position cleanup ──────────────────────
-        await self._post_startup_cleanup()
+        if stale_cancel_unconfirmed:
+            logger.warning(
+                "Post-startup stale position cleanup DEFERRED (stale order "
+                "cancellation unconfirmed)"
+            )
+        else:
+            await self._post_startup_cleanup()
 
         # ── Ensure every held position has a broker-side GTC stop ────
         # Placed right here — immediately after sync — so positions are
