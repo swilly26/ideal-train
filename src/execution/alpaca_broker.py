@@ -265,7 +265,18 @@ class AlpacaBroker(Broker):
         return self._map_order_result(alpaca_order)
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Request cancellation of an open order (completion is asynchronous)."""
+        """Request cancellation of an open order (completion is asynchronous).
+
+        An Alpaca 42210000 "order pending cancel" response is NOT a failure:
+        it means the broker is already processing a cancel for this order
+        (e.g. the order was left in ``pending_cancel`` by a prior crash /
+        host migration).  Retrying such an order is pointless — every cancel
+        request returns the same code until the broker resolves it — so we
+        treat it as handled (the cancel is already in flight) and let
+        :meth:`cancel_order_and_wait` bound how long we wait for it to leave
+        the open-order book.  Keeps crash-recovery boots from dying on a
+        stuck order.
+        """
         logger.info("Cancelling order %s", order_id)
         try:
             await self._run_with_timeout(
@@ -273,6 +284,13 @@ class AlpacaBroker(Broker):
             )
             return True
         except Exception as exc:
+            if _is_pending_cancel_error(exc):
+                logger.info(
+                    "Order %s is already pending cancel at the broker (42210000) — "
+                    "cancel is in flight; leaving it alone",
+                    order_id,
+                )
+                return True
             logger.error("Cancel order %s failed: %s", order_id, exc)
             return False
 
@@ -699,3 +717,19 @@ def _is_duplicate_client_order_id_error(exc: Exception) -> bool:
     """Return ``True`` if *exc* is an Alpaca "duplicate client order id" error."""
     msg = str(exc).lower()
     return "duplicate" in msg and "client_order_id" in msg
+
+
+def _is_pending_cancel_error(exc: Exception) -> bool:
+    """Return ``True`` if *exc* is an Alpaca 42210000 "order pending cancel" error.
+
+    The broker returns this when a cancel request arrives for an order that is
+    already transitioning to ``pending_cancel`` (often a leftover from a crash
+    or host migration).  The cancel is already in flight — retrying cannot
+    speed it up and merely re-fails with the same code.
+    """
+    msg = str(exc).lower()
+    return (
+        "42210000" in msg
+        and "pending" in msg
+        and "cancel" in msg
+    )
