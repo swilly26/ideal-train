@@ -27,46 +27,66 @@
 #
 # SAFETY PROPERTIES
 # -----------------
-#   * Idempotent — no-op whenever watchdog.sh is already running (pgrep
-#     guard) even if traders are missing (watchdog restarts them itself).
-#   * Locked — flock on /tmp/supervise_traders.lock serialises concurrent
-#     invocations, so multiple supervisors can NEVER spawn a second
-#     watchdog (cron fires every minute; a slow start just waits).
+#   * Idempotent — no-op whenever THIS engine's watchdog.sh is already
+#     running (pgrep guard scoped to $ENGINE_DIR, so a supervisor for one
+#     deployment can never see another deployment's watchdog as "ours") even
+#     if traders are missing (the watchdog restarts them itself).
+#   * Locked — flock on $LOCKFILE serialises concurrent invocations, so
+#     multiple supervisors can NEVER spawn a second watchdog (cron fires
+#     every minute; a slow start just waits).  The lock is held ONLY for the
+#     brief lifetime of each supervisor run: the launched child closes fd 9
+#     (`exec 9>&-` inside the launch subshell) BEFORE setsid forks, so no
+#     descendant of the watchdog can ever pin the lock after a kill — the
+#     next cron tick after a teardown finds the lock free and relaunches.
 #   * Gated — the stack is only started during regular trading hours
-#     (DST-aware, pure-stdlib check via `python -m src.watchdog.market_status`),
-#     so a pre-open boot can never trigger the post-startup cleanup
-#     liquidation that has historically realised losses on leftover
-#     positions.  SUPERVISE_FORCE=1 overrides the gate for drills/emergency.
+#     (DST-aware, pure-stdlib check via `python -c 'from
+#     src.watchdog.market_status ...'`, run from $ENGINE_DIR so the import
+#     resolves regardless of cron's cwd — the gate MUST NOT depend on the
+#     caller's working directory, because cron starts jobs in the crontab
+#     owner's $HOME, not in the repo).  SUPERVISE_FORCE=1 overrides the gate
+#     for drills/emergency.
 #   * Detached — `setsid nohup ... < /dev/null` puts the watchdog in a new
 #     session with no controlling terminal; the traders it spawns detach the
 #     same way via start_trader.sh / start_turbo.sh.
+#
+# TEST HOOKS (env overrides, all default to production values)
+# -----------------------------------------------------------
+#   SUPERVISE_ENGINE_DIR  — engine root (default /home/team/shared/engine)
+#   SUPERVISE_LOG_DIR     — log directory (default $ENGINE_DIR/logs)
+#   SUPERVISE_LOG         — supervisor log file (default $LOG_DIR/supervise.log)
+#   SUPERVISE_LOCKFILE    — flock file (default /tmp/supervise_traders.lock)
+#   SUPERVISE_DRYRUN=1    — log the gate result and exit WITHOUT launching
+#                           (used by tests; also skips the pgrep guard so the
+#                           gate path is exercised deterministically)
 set -u
-
-ENGINE_DIR="/home/team/shared/engine"
-LOG_DIR="$ENGINE_DIR/logs"
-SUPERVISE_LOG="$LOG_DIR/supervise.log"
-LOCKFILE="/tmp/supervise_traders.lock"
+ENGINE_DIR="${SUPERVISE_ENGINE_DIR:-/home/team/shared/engine}"
+LOG_DIR="${SUPERVISE_LOG_DIR:-$ENGINE_DIR/logs}"
+SUPERVISE_LOG="${SUPERVISE_LOG:-$LOG_DIR/supervise.log}"
+LOCKFILE="${SUPERVISE_LOCKFILE:-/tmp/supervise_traders.lock}"
 PYTHON_BIN="$ENGINE_DIR/.venv/bin/python"
-
 mkdir -p "$LOG_DIR"
 log() {
     printf '%s [supervise] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$SUPERVISE_LOG"
 }
-
+# ── Work from the engine dir for the whole run ────────────────────
+# cron starts this job in the crontab owner's $HOME, so EVERY python -c
+# import below would fail with "No module named 'src'" unless we cd first
+# (this exact bug kept the supervisor deferring during the 2026-09-10 kill
+# drill and left the stack down ~7 min until manual restore).
+cd "$ENGINE_DIR"
 # ── Serialise concurrent invocations ───────────────────────────────
 exec 9>"$LOCKFILE"
 flock -n 9 || { log "another supervisor run holds the lock — exiting"; exit 0; }
-
-# ── Already supervised? no-op ──────────────────────────────────────
-if pgrep -f '[w]atchdog\.sh' >/dev/null; then
+# ── Already supervised? no-op (scoped to THIS engine's watchdog) ──
+WATCHDOG_RE="bash ${ENGINE_DIR}/watchdog[.]sh"
+if [[ "${SUPERVISE_DRYRUN:-0}" != "1" ]] && pgrep -f "$WATCHDOG_RE" >/dev/null; then
     exit 0
 fi
-
 # ── Market-hours gate (DST-aware, pure stdlib, no network) ─────────
 # Uses `python -c` (NOT `-m`) so the gate works on ANY checked-out tree
 # state — the supervisor must keep functioning even before this branch is
 # merged, and must never depend on a file that a later checkout could
-# remove.
+# remove.  Runs from $ENGINE_DIR (cd'd above), so it is cwd-independent.
 if [[ "${SUPERVISE_FORCE:-0}" != "1" ]]; then
     status="$("$PYTHON_BIN" -c 'from src.watchdog.market_status import in_rth_schedule; print("OPEN" if in_rth_schedule() else "CLOSED")' 2>/dev/null)"
     if [[ "$status" != "OPEN" ]]; then
@@ -74,11 +94,22 @@ if [[ "${SUPERVISE_FORCE:-0}" != "1" ]]; then
         exit 0
     fi
 fi
-
+# ── Test hook: dry-run reports the gate verdict without launching ──
+if [[ "${SUPERVISE_DRYRUN:-0}" == "1" ]]; then
+    log "dry-run: gate passed, would start stack detached (setsid)"
+    exit 0
+fi
 # ── Start the stack fully detached ─────────────────────────────────
+# The subshell closes fd 9 (the supervisor's flock fd) BEFORE setsid forks,
+# so neither the watchdog nor any of its descendants can hold the lock after
+# this run exits.  Without this, a teardown that kills the stack can leave
+# trailing children pinning the lock for up to ~60 s, delaying the next
+# cron-tick relaunch (observed in the 2026-09-10 drill).
 log "watchdog not running — starting stack detached (setsid)"
-cd "$ENGINE_DIR"
-setsid nohup bash "$ENGINE_DIR/watchdog.sh" < /dev/null >> "$LOG_DIR/watchdog_supervisor.log" 2>&1 &
-log "launched watchdog (pid $!) — traders will be (re)started by watchdog as needed"
-
+(
+    exec 9>&-
+    setsid nohup bash "$ENGINE_DIR/watchdog.sh" < /dev/null >> "$LOG_DIR/watchdog_supervisor.log" 2>&1 &
+    echo $! > "$LOG_DIR/.supervise_last_pid"
+)
+log "launched watchdog (pid $(cat "$LOG_DIR/.supervise_last_pid" 2>/dev/null)) — traders will be (re)started by watchdog as needed"
 exit 0
