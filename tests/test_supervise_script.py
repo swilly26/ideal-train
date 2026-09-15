@@ -238,11 +238,16 @@ def test_noop_guard_holds_while_watchdog_alive(tmp_path):
     must be a no-op (scoped pgrep guard), even with the real production
     watchdog running elsewhere on the same host.
 
-    The second run is verified by "no NEW log lines" (``log2 == log1``),
-    NOT by ``log2.strip() == ""``: the log file legitimately retains run
-    1's launch lines, so a whole-file-empty assertion can never pass even
-    when the second run is a perfect no-op (this exact broken assertion
-    made the suite red: 2026-09-13)."""
+    Since 2026-09-15 the no-op branch also carries the hourly liveness tick
+    (PR #35): the first no-op after a launch finds no heartbeat file, so it
+    emits exactly ONE "healthy tick" line and writes the heartbeat file; every
+    later no-op within the hour is perfectly silent.  The idempotence checks
+    are therefore:
+    - run 2 adds NO new launch lines (watchdog count stays 1, no
+      "launched watchdog");
+    - run 2 adds at MOST the one healthy-tick line (heartbeat warmup);
+    - run 3 (heartbeat file now present) is FULLY silent (``log3 == log2``)
+      — steady-state no-op silence, the original invariant, restated."""
     engine_dir, marker = _make_fake_engine(tmp_path, gate_output="OPEN")
     env = {**_env_base(tmp_path),
            "_ENGINE_DIR": engine_dir}
@@ -259,12 +264,26 @@ def test_noop_guard_holds_while_watchdog_alive(tmp_path):
         # cadence artifact).  Give the process table a moment to settle.
         time.sleep(0.5)
         log2 = _run(env, cwd="/", timeout=30)
-        assert log2 == log1, \
-            "second run must be a silent no-op (no new log lines) — " \
-            "if it launched a watchdog, the no-op guard failed"
+        new_lines = [l for l in log2.splitlines() if l not in log1.splitlines()]
+        assert all("launched watchdog" not in l for l in new_lines), \
+            "second run must not launch another watchdog — the no-op guard " \
+            f"failed: {new_lines!r}"
+        assert len(new_lines) <= 1, \
+            "second run added more than the one permitted healthy-tick line: " \
+            f"{new_lines!r}"
+        assert all("healthy tick" in l for l in new_lines), \
+            "the only permitted new line is the hourly healthy tick"
         assert _watchdog_count(engine_dir) == 1, \
             "supervisor spawned a second watchdog"
         assert log1.count("launched watchdog") == 1
+        # Steady state: the heartbeat file exists now, so a third run within
+        # the hour must be PERFECTLY silent (the original no-new-lines
+        # invariant, now that the one-time tick has been emitted).
+        log3 = _run(env, cwd="/", timeout=30)
+        assert log3 == log2, \
+            "third run must be a silent no-op (no new log lines) — " \
+            f"new lines: {[l for l in log3.splitlines() if l not in log2.splitlines()]!r}"
+        assert _watchdog_count(engine_dir) == 1
     finally:
         _cleanup_fake_watchdog(engine_dir, marker)
 

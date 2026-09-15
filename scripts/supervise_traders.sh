@@ -93,6 +93,19 @@ if [[ "${SUPERVISE_DRYRUN:-0}" != "1" ]] && {
     pgrep -f "$WATCHDOG_RE" >/dev/null \
     || { [[ -n "$last_pid" ]] && kill -0 "$last_pid" 2>/dev/null; }
 }; then
+    # Hourly healthy tick: while the stack is healthy this script is a
+    # silent no-op every minute, so an empty supervise.log is ambiguous —
+    # it cannot distinguish "supervisor not running" from "everything
+    # fine" (2026-09-14: supervise.log had zero lines Monday because cron
+    # was dead, and nobody could tell).  One line per hour proves this
+    # supervisor is alive — silence is never ambiguous.
+    HEARTBEAT_FILE="$LOG_DIR/.supervise_last_healthy"
+    last_h="$(cat "$HEARTBEAT_FILE" 2>/dev/null || true)"
+    now_h="$(date +%s)"
+    if [[ -z "$last_h" ]] || (( now_h - last_h >= 3600 )); then
+        log "healthy tick: watchdog alive — stack under watchdog control"
+        echo "$now_h" > "$HEARTBEAT_FILE"
+    fi
     exit 0
 fi
 # ── Market-hours gate (DST-aware, pure stdlib, no network) ─────────
