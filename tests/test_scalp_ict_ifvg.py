@@ -84,8 +84,13 @@ def _make15m(include_tap: bool = True) -> pd.DataFrame:
         else:
             base = 130.6 + 0.08 * (i - 24)
             o.append(base); h.append(base + 0.1); l.append(base - 0.08); c.append(base + 0.04)
-    if not include_tap:  # bar 24 becomes a normal continuation bar (no gap span)
-        o[24], h[24], l[24], c[24] = 130.9, 131.0, 130.7, 130.95
+    if not include_tap:
+        # late segment rallies HIGH above the gap (130.5..130.6): no 15m bar
+        # ever spans/tags it -> tap check must fail
+        base = 131.05
+        for j in range(20, 27):
+            o[j], h[j], l[j], c[j] = base, base + 0.15, base - 0.1, base + 0.05
+            base += 0.05
     return pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": [1000.0] * 27}, index=ts)
 
 
