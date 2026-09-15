@@ -34,6 +34,24 @@ from src.strategies.indicators import sma
 # ── Configuration ──────────────────────────────────────────────────
 SYMBOLS = ["NVDA", "META", "QQQ", "TSLA", "COIN", "AVGO"]
 CHECK_INTERVAL = 60  # seconds between polls
+# ── Market-gate hardening (2026-09-15, PR #35) ────────────────────
+# The gate must never wait silently for hours (observed 2026-09-14: a
+# whole-container freeze hid the traders' stall for 9h because a
+# confirmed-closed clock answer is the ONLY valid reason to defer —
+# anything else must retry loudly and FAIL OPEN once local ET passes
+# 09:30 + buffer).  Every knob below is env-overridable for drills/tests.
+MARKET_GATE_RETRY_SECONDS = float(          # unknown/error backoff    (15-30s)
+    os.environ.get("MARKET_GATE_RETRY_SECONDS", "20"))
+MARKET_GATE_HEARTBEAT_SECONDS = float(      # confirmed-closed heartbeat
+    os.environ.get("MARKET_GATE_HEARTBEAT_SECONDS", "240"))
+MARKET_GATE_FAIL_OPEN_BUFFER_SECONDS = float(  # local-ET fail-open buffer
+    os.environ.get("MARKET_GATE_FAIL_OPEN_BUFFER_SECONDS", "600"))
+MARKET_GATE_OVERDUE_LOG_SECONDS = float(    # loud overdue-open cadence
+    os.environ.get("MARKET_GATE_OVERDUE_LOG_SECONDS", "60"))
+MARKET_LOOP_UNKNOWN_RETRY_SECONDS = float(  # intraday unknown-clock retry
+    os.environ.get("MARKET_LOOP_UNKNOWN_RETRY_SECONDS", "20"))
+MARKET_TICK_HEARTBEAT_SECONDS = float(      # intraday tick-loop liveness
+    os.environ.get("MARKET_TICK_HEARTBEAT_SECONDS", "240"))
 # NOTE: Analysis shows low-confidence trades (0.4-0.6 bucket) average +$33.46 —
 # actually MORE profitable than high-confidence trades. More signals = more opportunities.
 CONFIDENCE_THRESHOLD = 0.3
@@ -212,21 +230,64 @@ class LiveTrader:
         logger.info("   Starting equity: ${:,.2f}".format(self.start_equity))
         return True
 
+    def _market_gate_status_name(self, market_open: bool | None) -> str:
+        """Human-readable status for gate logs: OPEN / CONFIRMED-CLOSED /
+        UNKNOWN.  ``None`` is UNKNOWN — an indeterminate clock that must
+        NEVER be treated as a confirmed close."""
+        if market_open is True:
+            return "OPEN"
+        if market_open is False:
+            return "CONFIRMED-CLOSED"
+        return "UNKNOWN"
+
+    async def _market_clock(self, context: str) -> tuple[bool | None, int]:
+        """One broker clock check with per-attempt logging.
+
+        ``context`` names the call site (``pre-open`` / ``intraday``) so
+        attempt counters and last errors are kept separately.  Returns
+        ``(status, attempt_number)``; status ``None`` means indeterminate
+        (timeout/exception) and is logged loudly with the last error —
+        never a silent retry.
+        """
+        if not hasattr(self, "_clock_attempts"):
+            self._clock_attempts: dict[str, int] = {}
+            self._clock_last_error: dict[str, str | None] = {}
+        self._clock_attempts[context] = self._clock_attempts.get(context, 0) + 1
+        attempt = self._clock_attempts[context]
+        try:
+            status = await self.broker.is_market_open()
+        except Exception as exc:  # network errors, SDK failures — indeterminate
+            self._clock_last_error[context] = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "Market clock check FAILED (%s — attempt %d): %s — treating as UNKNOWN, will retry",
+                context, attempt, self._clock_last_error[context],
+            )
+            return None, attempt
+        self._clock_last_error[context] = None
+        return status, attempt
+
     async def wait_for_market_open(self):
         """Wait for 9:30 ET using local DST-aware time as the primary gate.
-        Alpaca's clock is only a confirmation: a timeout (``None``) cannot
-        strand the trader after the session has opened (with a five-minute
-        grace period) and can never be mistaken for a confirmed close.
+
+        Hardened 2026-09-15 (PR #35): ONLY a CONFIRMED-CLOSED Alpaca clock
+        defers.  ``None``/exception is indeterminate and is retried on a
+        SHORT backoff with one log line per attempt (attempt N, last
+        error) — a silent multi-hour wait is impossible.  Once local ET is
+        >= 09:30 + buffer and the last status was NOT confirmed-closed,
+        the gate FAILS OPEN on local time.  While RTH per the local DST-
+        aware schedule is open but we are still waiting, a loud overdue
+        log fires every 60s so a stuck gate is glaring.
         """
         from zoneinfo import ZoneInfo
+        from src.watchdog.market_status import in_rth_schedule
         logger.info("Waiting for market to open (9:30 AM ET)...")
         last_heartbeat = time.monotonic()
-        # ~4 min cadence keeps quiet waits below the watchdog's staleness
-        # threshold (WATCHDOG_STALE_SECONDS, default 300s) so the log
-        # freshness signal is truthful even without the closed-market
-        # exemption (watchdog.sh / src/watchdog/policy.py).
-        heartbeat_interval = 240.0
-        check_interval = 30.0
+        last_overdue = time.monotonic()
+        retry_seconds = MARKET_GATE_RETRY_SECONDS
+        heartbeat_interval = MARKET_GATE_HEARTBEAT_SECONDS
+        fail_open_buffer = timedelta(seconds=MARKET_GATE_FAIL_OPEN_BUFFER_SECONDS)
+        overdue_cadence = MARKET_GATE_OVERDUE_LOG_SECONDS
+        last_status: bool | None = None  # None = unknown (NOT confirmed-closed)
         while True:
             seconds_until = self._seconds_until_open()
             now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -247,29 +308,63 @@ class LiveTrader:
                     )
                     last_heartbeat = time.monotonic()
                 continue
-            # We are at/past the calculated open. Confirm with Alpaca, but do
-            # not wait indefinitely when its clock endpoint is unavailable.
-            try:
-                market_open = await self.broker.is_market_open()
-            except Exception as e:
-                logger.warning("Market check failed: %s", e)
-                market_open = None
-            if market_open is True:
+            # ── At/past the calculated open: ask the Alpaca clock. ──
+            status, attempt = await self._market_clock("pre-open")
+            if status is None:
+                # Indeterminate clock — loud per-attempt retry, never silent.
+                logger.warning(
+                    "Market clock UNKNOWN (attempt %d, last error: %s) — "
+                    "retrying in %.0fs — NOT a confirmed close",
+                    attempt, self._clock_last_error.get("pre-open"), retry_seconds,
+                )
+            last_status = status
+            status_name = self._market_gate_status_name(status)
+            # ── Loud overdue log while RTH says open but we still wait. ──
+            # This is the missing observability that let the 2026-09-14
+            # stall rot for 9 hours: a stuck gate is now impossible to
+            # miss.  Fires for ANY status (closed/unknown) — every 60s.
+            if in_rth_schedule(now_et):
+                mins_past = max(
+                    (now_et.hour * 60 + now_et.minute) - (9 * 60 + 30), 0
+                )
+                if time.monotonic() - last_overdue >= overdue_cadence:
+                    open_instant = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                    fail_in = max(
+                        int((open_instant + fail_open_buffer - now_et).total_seconds()), 0
+                    )
+                    logger.warning(
+                        "⚠️ STILL WAITING FOR OPEN %d MINUTES PAST 09:30 ET "
+                        "(market_open=%s, attempt=%d) — FAIL-OPEN in %ds",
+                        mins_past, status_name, attempt, fail_in,
+                    )
+                    last_overdue = time.monotonic()
+            # ── Confirmed open → begin session. ──
+            if status is True:
                 if await self._begin_session(assumed=False):
                     return
-            elif market_open is None:
-                # Clock unavailable — indeterminate, NOT a confirmed close.
-                if now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 35):
-                    logger.warning("Market clock unavailable after grace period — proceeding on local time")
+            # ── FAIL-OPEN: past 09:30+buffer and last status was NOT
+            #    confirmed-closed → proceed on local time. ──
+            elif status is not False:
+                open_instant = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                if now_et >= open_instant + fail_open_buffer:
+                    logger.warning(
+                        "⚠️ FAIL-OPEN at %s ET: local time past 09:30+%ds buffer and "
+                        "last clock status was %s (NOT confirmed-closed, attempt %d) "
+                        "— proceeding on local time",
+                        now_et.strftime("%H:%M:%S"),
+                        int(MARKET_GATE_FAIL_OPEN_BUFFER_SECONDS),
+                        status_name, attempt,
+                    )
                     if await self._begin_session(assumed=True):
                         return
-                else:
-                    logger.warning("Market clock unavailable during grace period — retrying")
-            # market_open is False → confirmed closed → keep waiting.
+            # status False → confirmed closed → keep waiting (heartbeat).
             if time.monotonic() - last_heartbeat >= heartbeat_interval:
-                logger.info("Still waiting for market open, next check in %.0fs (clock confirmation)", check_interval)
+                logger.info(
+                    "Still waiting for market open, next check in %.0fs (clock confirmation)",
+                    retry_seconds,
+                )
                 last_heartbeat = time.monotonic()
-            await asyncio.sleep(check_interval)
+            await asyncio.sleep(retry_seconds)
     @staticmethod
     def _seconds_until_open() -> float:
         """Seconds until next 9:30 AM ET market open (DST-aware).
@@ -366,13 +461,12 @@ class LiveTrader:
         # resets local state before waiting for the following trading day.
         while True:
             await self.wait_for_market_open()
-
             logger.info("STEP 2/3: Entering main tick loop…")
             tick = 0
+            self._tick_loop_last_heartbeat = time.monotonic()
             try:
                 while True:
                     tick += 1
-
                     # ── EOD mandatory liquidation check ──────────────────
                     try:
                         if self._is_near_close():
@@ -382,25 +476,41 @@ class LiveTrader:
                             break
                     except Exception:
                         logger.exception("EOD check/liquidate failed — continuing")
-
+                    # ── Intraday market check (same hardening as the gate) ──
+                    # None/exception = indeterminate clock: NEVER treated as
+                    # a confirmed close.  Retry loudly with per-attempt
+                    # logging on a short backoff — a transient API outage
+                    # cannot trigger a false mid-session liquidation, and a
+                    # stuck clock cannot be silent.
                     try:
-                        market_open = await self.broker.is_market_open()
+                        market_open, attempt = await self._market_clock("intraday")
                     except Exception:
                         logger.exception("Market-open check failed — treating as unknown, will retry")
-                        market_open = None
+                        market_open, attempt = None, self._clock_attempts.get("intraday", 0)
                     if market_open is None:
-                        # Indeterminate clock (timeout/outage) — never treat as
-                        # a confirmed close.  Retry instead of shutting down,
-                        # so a transient API outage cannot trigger a false
-                        # mid-session liquidation.
-                        logger.warning("Market clock UNKNOWN — retrying instead of shutting down")
-                        await asyncio.sleep(CHECK_INTERVAL)
+                        logger.warning(
+                            "Market clock UNKNOWN intraday (attempt %d, last error: %s) "
+                            "— retrying in %.0fs — never treating unknown as closed",
+                            attempt, self._clock_last_error.get("intraday"),
+                            MARKET_LOOP_UNKNOWN_RETRY_SECONDS,
+                        )
+                        await asyncio.sleep(MARKET_LOOP_UNKNOWN_RETRY_SECONDS)
                         continue
                     if not market_open:
                         logger.info("⏹️  Market closed — completing session and waiting for next open")
                         break
-
                     await self._safe_tick(tick)
+                    # Intraday liveness heartbeat: a healthy session can be
+                    # INFO-silent for hours (no signals → no order logs),
+                    # which made watchdog staleness useless intraday
+                    # (2026-09-14: a 9h freeze produced zero lines during
+                    # RTH).  One line per cadence proves the loop is alive.
+                    if time.monotonic() - self._tick_loop_last_heartbeat >= MARKET_TICK_HEARTBEAT_SECONDS:
+                        logger.info(
+                            "❤️ Tick loop alive — tick %d, market OPEN (clock confirmed)",
+                            tick,
+                        )
+                        self._tick_loop_last_heartbeat = time.monotonic()
                     logger.debug("Tick %d: complete — sleeping %ds", tick, CHECK_INTERVAL)
                     await asyncio.sleep(CHECK_INTERVAL)
             except KeyboardInterrupt:
@@ -654,8 +764,24 @@ class LiveTrader:
         at the broker, liquidate them immediately so nothing hangs overnight.
         """
         try:
-            if await self.broker.is_market_open():
-                return  # Market is open — normal trading, no cleanup needed
+            try:
+                market_open = await self.broker.is_market_open()
+            except Exception as exc:
+                # Indeterminate clock (timeout/error) — do NOT liquidate on
+                # an unknown clock.  Only a CONFIRMED close may trigger
+                # cleanup, or we could sell into a live tape.
+                logger.warning(
+                    "🧹 Post-close cleanup skipped: market clock UNKNOWN (%s) — "
+                    "only a confirmed close may liquidate", exc,
+                )
+                return
+            if market_open is not False:
+                if market_open is None:
+                    logger.info(
+                        "🧹 Post-close cleanup skipped: market clock UNKNOWN — "
+                        "only a confirmed close may liquidate",
+                    )
+                return  # Market is open (True) or unknown (None) — no cleanup
 
             positions = await self.broker.get_positions()
             if not positions:

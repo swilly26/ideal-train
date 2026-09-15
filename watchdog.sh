@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Keep the AlgoFlow traders alive and recover them from stalled data/network calls.
 set -u
-
 ENGINE_DIR="/home/team/shared/engine"
 LOG_DIR="$ENGINE_DIR/logs"
 WATCHDOG_LOG="$LOG_DIR/watchdog.log"
-
 # Configurable via environment variables with safe defaults, so existing
 # deployments keep their current behaviour unless they opt in/out.
 #   WATCHDOG_STALE_SECONDS           how old a log must be before it is
@@ -20,20 +18,16 @@ WATCHDOG_LOG="$LOG_DIR/watchdog.log"
 export WATCHDOG_STALE_SECONDS WATCHDOG_SKIP_STALE_WHEN_CLOSED
 STALE_SECONDS="$WATCHDOG_STALE_SECONDS"
 CHECK_INTERVAL="${WATCHDOG_CHECK_INTERVAL:-60}"
-
 # The restart decision lives in a testable Python policy module.
 # watchdog.sh passes the per-trader facts and lets it decide; the policy
 # applies the market-hours exemption (see src/watchdog/policy.py).
 PYTHON_BIN="$ENGINE_DIR/.venv/bin/python"
 WATCHDOG_POLICY_CMD=( "$PYTHON_BIN" -m src.watchdog.policy )
-
 mkdir -p "$LOG_DIR"
 cd "$ENGINE_DIR" || exit 1
-
 log_action() {
     printf '%s [watchdog] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$WATCHDOG_LOG"
 }
-
 # Return the newest output/trade log for a trader. Launchers create a new
 # timestamped runner log on each start, while the trader also writes a daily
 # trade log, so consider both names.
@@ -45,44 +39,62 @@ latest_log() {
         ls -1t "$LOG_DIR"/turbo_runner_*.out "$LOG_DIR"/turbo_*.log 2>/dev/null | head -n 1
     fi
 }
-
 restart_trader() {
-    local kind="$1" pid
+    local kind="$1" reason="$2" pid state_file prev_pid out new_pid
+    if [[ "$kind" == "live" ]]; then
+        state_file="$LOG_DIR/.watchdog_last_pid_live"
+    else
+        state_file="$LOG_DIR/.watchdog_last_pid_turbo"
+    fi
+    prev_pid="$(cat "$state_file" 2>/dev/null || true)"
+    # Durable restart attribution: every restart records WHY it happened and
+    # the previous pid (or FIRST-BOOT) so future incidents are attributable
+    # from the log alone (2026-09-14: two unattributed restarts).
+    if [[ -n "$prev_pid" ]]; then
+        log_action "restart decision: $kind trader (reason=$reason, previous_pid=$prev_pid)"
+    else
+        log_action "restart decision: $kind trader (reason=$reason, previous_pid=FIRST-BOOT)"
+    fi
     if [[ "$kind" == "live" ]]; then
         pgrep -f '[l]ive_trader.py' | while read -r pid; do
             kill "$pid" 2>/dev/null || true
             log_action "killed stalled live trader pid=$pid"
         done
         log_action "starting live trader"
-        bash "$ENGINE_DIR/start_trader.sh" >> "$WATCHDOG_LOG" 2>&1
+        out="$(bash "$ENGINE_DIR/start_trader.sh" 2>&1)"
+        printf '%s\n' "$out" >> "$WATCHDOG_LOG"
+        new_pid="$(printf '%s\n' "$out" | sed -n 's/.*Started! PID: \([0-9][0-9]*\).*/\1/p' | head -n 1)"
     else
         pgrep -f '[t]urbo_trader.py' | while read -r pid; do
             kill "$pid" 2>/dev/null || true
             log_action "killed stalled turbo trader pid=$pid"
         done
         log_action "starting turbo trader"
-        bash "$ENGINE_DIR/start_turbo.sh" >> "$WATCHDOG_LOG" 2>&1
+        out="$(bash "$ENGINE_DIR/start_turbo.sh" 2>&1)"
+        printf '%s\n' "$out" >> "$WATCHDOG_LOG"
+        new_pid="$(printf '%s\n' "$out" | sed -n 's/.*Started! PID: \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    fi
+    if [[ -n "$new_pid" ]]; then
+        printf '%s\n' "$new_pid" > "$state_file"
     fi
 }
-
 check_trader() {
     local kind="$1" log_file age
     if [[ "$kind" == "live" ]]; then
         if ! pgrep -f '[l]ive_trader.py' >/dev/null; then
             log_action "live trader is not running"
-            restart_trader live
+            restart_trader live "process-not-running"
             return
         fi
     elif ! pgrep -f '[t]urbo_trader.py' >/dev/null; then
         log_action "turbo trader is not running"
-        restart_trader turbo
+        restart_trader turbo "process-not-running"
         return
     fi
-
     log_file="$(latest_log "$kind")"
     if [[ -z "$log_file" ]]; then
         log_action "$kind trader has no log file; restarting"
-        restart_trader "$kind"
+        restart_trader "$kind" "no-log-file"
         return
     fi
     age=$(( $(date +%s) - $(stat -c %Y "$log_file") ))
@@ -98,23 +110,34 @@ check_trader() {
         if [[ -z "$output" ]]; then
             # Policy helper failed — fall back to the legacy stale-kill.
             log_action "watchdog policy helper failed for $kind; restoring legacy stale-kill"
-            restart_trader "$kind"
+            restart_trader "$kind" "policy-helper-failed"
             return
         fi
         action="${output%%|*}"
         reason="${output#*|}"
         if [[ "$action" == "RESTART" ]]; then
             log_action "$kind trader log is stale (${age}s): $log_file; restarting ($reason)"
-            restart_trader "$kind"
+            restart_trader "$kind" "log-stale"
         else
             log_action "$kind trader log is stale (${age}s) but exempted: $reason"
         fi
     fi
 }
-
 log_action "watchdog started (interval=${CHECK_INTERVAL}s, stale=${STALE_SECONDS}s, skip-stale-when-closed=${WATCHDOG_SKIP_STALE_WHEN_CLOSED})"
+# Hourly healthy tick: the watchdog logs nothing while everything is fine,
+# so an hour-long silence is indistinguishable from a dead watchdog
+# (2026-09-14).  One line per hour proves liveness — silence is never
+# ambiguous while the process is up.
+LAST_HEALTHY_LOG="$(date +%s)"
 while true; do
     check_trader live
     check_trader turbo
+    now_ts="$(date +%s)"
+    if (( now_ts - LAST_HEALTHY_LOG >= 3600 )); then
+        live_state="yes"; pgrep -f '[l]ive_trader.py' >/dev/null || live_state="no"
+        turbo_state="yes"; pgrep -f '[t]urbo_trader.py' >/dev/null || turbo_state="no"
+        log_action "watchdog healthy tick (live=${live_state}, turbo=${turbo_state})"
+        LAST_HEALTHY_LOG="$now_ts"
+    fi
     sleep "$CHECK_INTERVAL"
 done
