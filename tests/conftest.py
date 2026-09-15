@@ -133,3 +133,29 @@ def breakout_ohlcv():
         {"open": opens, "high": highs, "low": lows, "close": closes, "volume": [1000] * periods},
         index=idx,
     )
+
+
+@pytest.fixture
+def make_frame():
+    """Build a CandleFrame from plain lists (hand-made mock candles).
+
+    ``ts_list`` is a list of "YYYY-MM-DD HH:MM" local (exchange-naive) times.
+    """
+    import numpy as np
+    import pandas as pd
+    from src.strategies.scalp.types import CandleFrame
+
+    def _make(symbol, timeframe, ts_list, o, h, l, c, v):
+        ts = np.asarray(pd.DatetimeIndex(ts_list).to_numpy(), dtype="datetime64[ns]")
+        return CandleFrame(
+            symbol=symbol,
+            timeframe=timeframe,
+            ts=ts,
+            open=np.asarray(o, dtype=float),
+            high=np.asarray(h, dtype=float),
+            low=np.asarray(l, dtype=float),
+            close=np.asarray(c, dtype=float),
+            volume=np.asarray(v, dtype=float),
+        )
+
+    return _make
