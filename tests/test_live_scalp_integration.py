@@ -357,7 +357,10 @@ class TestTickScalpBoxShort:
         monkeypatch.setattr(live_trader, "SCALP_MODULE_VOLFIB", False)
         monkeypatch.setattr(live_trader, "SCALP_MODULE_BOX", True)
         monkeypatch.setattr(live_trader, "SYMBOLS", ["QQQ"])
-        broker = FakeBroker(shortable=True)
+        # fill_price matches the 1m close (109.0): MARKET entries anchor their
+        # SL/TP to the broker-reported fill, so the stub fill must be the price
+        # the position is really opened at.
+        broker = FakeBroker(shortable=True, fill_price=109.0)
         provider = FakeProvider(_box_frames())
         trader = _make_scalp_trader(broker, provider)
         await trader._tick_scalp(1)
