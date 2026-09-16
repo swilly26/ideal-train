@@ -18,6 +18,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -133,6 +134,31 @@ SCALP_ARBITRATION = os.environ.get("SCALP_ARBITRATION", "best_rr").strip().lower
 # Per-symbol cooldown after a position closes (measured in 1-minute bars /
 # ticks): no NEW entry for the symbol until the window elapses.
 SCALP_COOLDOWN_BARS = int(os.environ.get("SCALP_COOLDOWN_BARS", "5"))
+# ── Fill anchoring + churn cap (post-go-live fix, 2026-09-16) ────────
+# MARKET fills land far from the signal-time reference on fast tape.  Live
+# COIN case (2026-09-16): signal "LONG entry=167.96 SL=167.01", filled at
+# 162.58 — so the strategy SL sat ABOVE the fill.  Alpaca rejected every
+# GTC stop with 42210000 "stop price must be less than current price", the
+# retry loop burned 4 attempts, and the in-process SL then treated the
+# stale level as breached and closed the trade (then the next signal
+# repeated the whole loop).  Strategy SL/TP are now re-anchored to the
+# CONFIRMED FILL before the broker stop is submitted — see
+# ``anchor_scalp_levels`` for the exact rule.
+SCALP_ANCHOR_LEVELS = os.environ.get("SCALP_ANCHOR_LEVELS", "true").lower() != "false"
+# Minimum distance the anchored SL/TP must keep from the fill: a fraction
+# of the fill, floored at an absolute amount.  Without it a level could sit
+# on top of the market price (instantly-triggered / rejected).
+SCALP_STOP_MIN_DISTANCE_PCT = float(
+    os.environ.get("SCALP_STOP_MIN_DISTANCE_PCT", "0.0005"))   # 0.05% of fill
+SCALP_STOP_MIN_DISTANCE_ABS = float(
+    os.environ.get("SCALP_STOP_MIN_DISTANCE_ABS", "0.01"))     # or 1 cent
+# Cadence (seconds) of the loud "position has NO broker stop" warning.
+SCALP_NO_STOP_WARN_SECONDS = float(os.environ.get("SCALP_NO_STOP_WARN_SECONDS", "60"))
+# Re-entry churn cap: max ScalpSet ENTRY ORDERS submitted per symbol per
+# trading day (<= 0 disables).  Prevents the COIN-style loop where a setup
+# re-emits every cooldown and re-enters after every stop-out.
+SCALP_MAX_ENTRIES_PER_SYMBOL_PER_SESSION = int(
+    os.environ.get("SCALP_MAX_ENTRIES_PER_SYMBOL_PER_SESSION", "3"))
 # SMT divergence pair for the IFVG module (best-effort on US equities).
 SCALP_PAIR_SYMBOL = os.environ.get("SCALP_PAIR_SYMBOL", "QQQ").upper()
 # Frame-cache TTLs (seconds) — higher timeframes are lazy-fetched so we
@@ -275,6 +301,189 @@ def _main_order_client_id(symbol: str, side: str, kind: str) -> str:
     cancellation and the per-symbol order book are self-describing.
     """
     return f"algoflow_MAIN_{symbol.upper()}_{kind}_{side}_{time.monotonic_ns()}"
+
+
+def _normalize_order_price(price: float) -> float:
+    """Round *price* to an Alpaca-legal equity increment.
+
+    Alpaca rejects sub-penny increments for prices >= $1.00 with 42210000
+    ("sub-penny increment does not fulfill minimum pricing criteria"), which
+    was observed live on 2026-09-16: strategy levels such as 211.160004 were
+    rejected outright, leaving positions with no take-profit order at all.
+    Sub-dollar prices keep 4 decimals (Alpaca permits sub-penny ticks there).
+    """
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return price
+    if not math.isfinite(p):
+        return p
+    return round(p, 2 if abs(p) >= 1.0 else 4)
+
+
+def _is_invalid_stop_level_error(exc: object) -> bool:
+    """True for an Alpaca 42210000 "stop price must be less|greater than
+    current price" rejection.
+
+    Those are PERMANENT for the submitted level: the stop sits on the wrong
+    side of the live market price, so re-submitting the same price just
+    hammers the broker (the live COIN 2026-09-16 loop).  Every other
+    rejection class (e.g. wash-trade 40310000) stays retryable.
+    """
+    msg = str(exc).lower()
+    if "42210000" not in msg:
+        return False
+    return ("stop price must be less than current price" in msg
+            or "stop price must be greater than current price" in msg)
+
+
+@dataclass(frozen=True)
+class AnchoredLevels:
+    """SL/TP levels re-anchored to the actual fill (see ``anchor_scalp_levels``).
+
+    ``sl_source`` / ``tp_source`` describe how each level was derived:
+
+    * ``strategy``            — the signal's own level was still valid vs fill
+    * ``fill_risk``           — re-priced from the fill using the signal risk
+    * ``fill_risk_clamped``   — as above, widened to the min-distance floor
+    * ``fill_reward`` / ``fill_reward_clamped`` — same for the TP (reward leg)
+    * ``no_strategy_sl``      — signal had no SL -> -6% backstop
+    * ``backstop``            — strategy SL invalid vs fill AND re-pricing
+                                degenerated -> -6% backstop (logged loudly)
+    * ``none``                — no TP order (rely on BE/trail + stops)
+    * ``unanchored``          — no valid fill price; strategy levels kept
+    * ``unusable``            — no derivable level at all (caller logs loudly)
+    """
+
+    sl: float | None
+    tp: float | None
+    sl_source: str
+    tp_source: str
+    min_distance: float = 0.0
+
+    @property
+    def sl_reanchored(self) -> bool:
+        return self.sl_source in ("fill_risk", "fill_risk_clamped")
+
+    @property
+    def tp_reanchored(self) -> bool:
+        return self.tp_source in ("fill_reward", "fill_reward_clamped")
+
+    @property
+    def sl_is_backstop(self) -> bool:
+        return self.sl_source == "backstop"
+
+
+def anchor_scalp_levels(
+    *,
+    is_short: bool,
+    fill: float,
+    entry_ref: float | None = None,
+    sl_ref: float | None = None,
+    tp_ref: float | None = None,
+    min_distance_pct: float | None = None,
+    min_distance_abs: float | None = None,
+    backstop_pct: float | None = None,
+) -> AnchoredLevels:
+    """Anchor a ScalpSet signal's SL/TP to the ACTUAL fill price.
+
+    The broker only validates levels against the live market price, so the
+    signal-time reference (the bar close the module used) is NOT a safe base
+    for a MARKET entry: the fill can be points away from it (live COIN
+    2026-09-16: signal ref 167.96, fill 162.58, strategy SL 167.01 -> every
+    stop submission rejected with 42210000).
+
+    Rule (deterministic, documented):
+
+    * ``min_dist = max(fill * min_distance_pct, min_distance_abs)``.
+    * SL is kept verbatim when it is still on the correct side of the fill
+      AND at least ``min_dist`` away (long: ``sl <= fill - min_dist``;
+      short: ``sl >= fill + min_dist``).
+    * Otherwise the stop is re-priced from the fill using the signal's own
+      risk amount ``|entry_ref - sl_ref|`` shifted to the fill
+      (long: ``fill - risk``, short: ``fill + risk``), then widened to
+      ``min_dist`` when the risk is smaller than the floor.
+    * If that re-priced level is degenerate (<= 0, or still on the wrong
+      side of the fill), the existing -6% backstop is used instead — the
+      caller logs loudly ("strategy SL invalid vs fill — using backstop").
+    * The TP follows the same rule with the signal's reward amount
+      (long: ``fill + reward``); when nothing valid can be derived the TP
+      is dropped (``None``) and BE/trail plus the stops take over.
+    * Levels are rounded to the exchange tick via ``_normalize_order_price``.
+
+    A missing fill (``None``/``<= 0``/NaN) cannot be anchored against, so the
+    raw strategy levels are returned unchanged (``unanchored``).
+    """
+    pct = SCALP_STOP_MIN_DISTANCE_PCT if min_distance_pct is None else min_distance_pct
+    abs_min = SCALP_STOP_MIN_DISTANCE_ABS if min_distance_abs is None else min_distance_abs
+    back_pct = PROTECTIVE_STOP_PCT if backstop_pct is None else backstop_pct
+
+    def _num(value) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+
+    fill_f = _num(fill)
+    if fill_f is None or fill_f <= 0:
+        return AnchoredLevels(sl=_num(sl_ref), tp=_num(tp_ref),
+                              sl_source="unanchored", tp_source="unanchored")
+    min_dist = max(fill_f * abs(pct), abs_min)
+    sign = 1.0 if is_short else -1.0
+    entry_ref_f = _num(entry_ref)
+    sl_ref_f = _num(sl_ref)
+    tp_ref_f = _num(tp_ref)
+
+    # ── Stop-loss ────────────────────────────────────────────────────
+    sl: float | None
+    sl_source: str
+    if sl_ref_f is not None and (
+        sl_ref_f >= fill_f + min_dist if is_short else sl_ref_f <= fill_f - min_dist
+    ):
+        sl, sl_source = _normalize_order_price(sl_ref_f), "strategy"
+    else:
+        risk = abs(entry_ref_f - sl_ref_f) if (entry_ref_f is not None and sl_ref_f is not None) else None
+        if risk is not None and risk > 0:
+            raw = fill_f + sign * risk
+            clamped = max(raw, fill_f + min_dist) if is_short else min(raw, fill_f - min_dist)
+            level = _normalize_order_price(clamped)
+            if level > 0 and ((level > fill_f) if is_short else (level < fill_f)):
+                sl = level
+                sl_source = "fill_risk" if abs(clamped - raw) <= 1e-9 else "fill_risk_clamped"
+            else:
+                sl, sl_source = None, "backstop"
+        else:
+            sl, sl_source = None, ("backstop" if sl_ref_f is not None else "no_strategy_sl")
+    if sl is None and sl_source != "unusable":
+        level = _normalize_order_price(
+            fill_f * (1 + back_pct) if is_short else fill_f * (1 - back_pct))
+        if level > 0 and ((level > fill_f) if is_short else (level < fill_f)):
+            sl, sl_source = level, ("backstop" if sl_ref_f is not None else "no_strategy_sl")
+        else:
+            sl, sl_source = None, "unusable"
+
+    # ── Take-profit ──────────────────────────────────────────────────
+    tp: float | None
+    tp_source: str
+    if tp_ref_f is not None and (
+        tp_ref_f <= fill_f - min_dist if is_short else tp_ref_f >= fill_f + min_dist
+    ):
+        tp, tp_source = _normalize_order_price(tp_ref_f), "strategy"
+    else:
+        reward = abs(tp_ref_f - entry_ref_f) if (tp_ref_f is not None and entry_ref_f is not None) else None
+        tp, tp_source = None, "none"
+        if reward is not None and reward > 0:
+            raw = fill_f - sign * reward
+            clamped = min(raw, fill_f - min_dist) if is_short else max(raw, fill_f + min_dist)
+            level = _normalize_order_price(clamped)
+            if level > 0 and ((level < fill_f) if is_short else (level > fill_f)):
+                tp = level
+                tp_source = "fill_reward" if abs(clamped - raw) <= 1e-9 else "fill_reward_clamped"
+    return AnchoredLevels(sl=sl, tp=tp, sl_source=sl_source, tp_source=tp_source,
+                          min_distance=min_dist)
 
 
 # ── Order-classification helpers (used by stop placement / replacement) ──
@@ -1171,6 +1380,13 @@ class LiveTrader:
         the -6% backstop is used only when it is ``None``.  Passed through
         for every scalp entry so teardown stops reconcile with strategy risk.
 
+        ScalpSet callers pass the level ALREADY ANCHORED TO THE FILL
+        (``_finalize_open_bundle`` → ``anchor_scalp_levels``), including the
+        backstop price itself when the strategy SL was invalid vs the fill.
+        An INVALID-LEVEL rejection is not retried (see
+        ``_is_invalid_stop_level_error``): the level is permanently wrong for
+        the current market, so the loop fast-fails and logs once.
+
         Duplicate detection is TYPE-AWARE: an existing same-side STOP order
         means the stop is already there (skip), while a same-side LIMIT (the
         scalp take-profit day-limit order) or a market order never counts as
@@ -1255,6 +1471,20 @@ class LiveTrader:
                 )
                 return True
             except Exception as exc:
+                if _is_invalid_stop_level_error(exc):
+                    # PERMANENT for this price: the stop sits on the wrong
+                    # side of the live market price (stale signal reference —
+                    # the live COIN 2026-09-16 defect).  Retrying the same
+                    # level only hammers the broker, so log ONCE and stop;
+                    # the in-process SL (anchored to the fill) stays active.
+                    logger.error(
+                        "🛡️  STOP %s: INVALID-LEVEL rejection (attempt %d/%d) — %s. "
+                        "Stop $%.2f is on the wrong side of the market; NOT retrying "
+                        "(permanent, non-retryable). Position has NO broker-level "
+                        "stop; in-process risk checks stay active.",
+                        sym, attempt, max_attempts, exc, stop_price,
+                    )
+                    return False
                 if attempt < max_attempts:
                     delay = initial_delay * attempt
                     logger.warning(
@@ -1406,6 +1636,122 @@ class LiveTrader:
             self._scalp_data_day: str = ""
         if not hasattr(self, "_scalp_ready_logged"):
             self._scalp_ready_logged: set[str] = set()
+        if not hasattr(self, "_scalp_entries"):
+            # sym -> ScalpSet entry orders submitted today (churn cap)
+            self._scalp_entries: dict[str, int] = {}
+        if not hasattr(self, "_scalp_entries_day"):
+            self._scalp_entries_day: str = ""
+        if not hasattr(self, "_scalp_cap_warned"):
+            self._scalp_cap_warned: set[str] = set()
+
+    # ── Entry accounting / fill resolution (2026-09-16 fix) ──────────
+    def _scalp_entries_today(self, sym: str) -> int:
+        """Number of ScalpSet entries submitted for *sym* today.
+
+        The counter is keyed to the UTC trading day (the session runs
+        13:30-20:00 UTC, so a UTC date rollover never lands mid-session) and
+        is cleared lazily on the first call of a new day.
+        """
+        self._scalp_init_state()
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._scalp_entries_day != day:
+            self._scalp_entries_day = day
+            self._scalp_entries.clear()
+            self._scalp_cap_warned.clear()
+        return int(self._scalp_entries.get(sym.upper(), 0))
+
+    def _scalp_entry_cap_reached(self, sym: str) -> bool:
+        """True when *sym* has used its per-session ScalpSet entry budget."""
+        cap = SCALP_MAX_ENTRIES_PER_SYMBOL_PER_SESSION
+        if cap is None or cap <= 0:
+            return False   # cap disabled
+        return self._scalp_entries_today(sym) >= cap
+
+    def _log_entry_cap_reached(self, sym: str) -> None:
+        """Log the churn-cap skip once per symbol/day (debug afterwards)."""
+        self._scalp_init_state()
+        sym = sym.upper()
+        if sym in self._scalp_cap_warned:
+            logger.debug("🚧 SCALP %s: entry cap reached — signal skipped", sym)
+            return
+        self._scalp_cap_warned.add(sym)
+        logger.info(
+            "🚧 SCALP %s: session entry cap reached (%d/%d entries today) — "
+            "skipping further signals for this symbol until the next session",
+            sym, self._scalp_entries_today(sym),
+            SCALP_MAX_ENTRIES_PER_SYMBOL_PER_SESSION,
+        )
+
+    def _record_scalp_entry(self, sym: str) -> None:
+        """Count a submitted entry against the per-session churn cap."""
+        self._scalp_init_state()
+        sym = sym.upper()
+        self._scalp_entries[sym] = self._scalp_entries_today(sym) + 1
+        logger.info(
+            "🧮 SCALP %s: entry %d/%d this session%s",
+            sym, self._scalp_entries[sym], SCALP_MAX_ENTRIES_PER_SYMBOL_PER_SESSION,
+            " (cap reached — no further entries today)"
+            if self._scalp_entry_cap_reached(sym) else "",
+        )
+
+    async def _resolve_fill_price(self, sym: str, result, fallback: float) -> float:
+        """Return the price the entry ACTUALLY filled at (2026-09-16 fix).
+
+        Anchoring SL/TP to a signal-time reference is what produced stops on
+        the wrong side of the market, so the entry's fill is resolved from
+        the broker, in order of truth:
+
+        1. ``OrderResult.filled_avg_price`` — the broker's own fill report;
+        2. the open position's ``avg_entry_price`` for the symbol;
+        3. *fallback* (the signal-time price) as a last resort, logged loudly
+           because it is exactly the stale reference this fix guards against.
+        """
+        sym = sym.upper()
+        filled = getattr(result, "filled_avg_price", None)
+        if not isinstance(filled, bool) and isinstance(filled, (int, float)) and filled > 0:
+            return float(filled)
+        try:
+            positions = await self.broker.get_positions()
+        except Exception as exc:
+            logger.warning("Fill resolution %s: position fetch failed (%s)", sym, exc)
+            positions = []
+        for p in positions or []:
+            try:
+                if str(p.get("symbol", "")).upper() != sym:
+                    continue
+                avg = p.get("avg_entry_price")
+            except Exception:
+                continue
+            if not isinstance(avg, bool) and isinstance(avg, (int, float)) and float(avg) > 0:
+                return float(avg)
+        logger.warning(
+            "⚠️  SCALP %s: broker fill price unknown — anchoring SL/TP to the "
+            "signal-time price %.2f (last resort)", sym, float(fallback),
+        )
+        return float(fallback)
+
+    def _warn_no_broker_stop(self, sym: str, state: dict, entry: float) -> None:
+        """Loud, rate-limited (default: per-minute) "no broker stop" warning.
+
+        A position without a broker-level stop is protected only by the
+        in-process SL, which exists only while THIS process lives — it must
+        never pass silently.  The level reported here is the same one the
+        broker stop would have used: anchored to the FILL, never the stale
+        signal reference.
+        """
+        now = time.monotonic()
+        last = float(state.get("no_stop_warn_ts") or 0.0)
+        if now - last < SCALP_NO_STOP_WARN_SECONDS:
+            return
+        state["no_stop_warn_ts"] = now
+        self._scalp_positions[sym] = state
+        sl = state.get("sl")
+        logger.warning(
+            "🚨 SCALP %s: NO BROKER STOP — position entered at %.2f is protected "
+            "ONLY by the in-process SL %s (process-local). Anchored level in use; "
+            "see the stop-placement log lines above.",
+            sym, float(entry), f"${float(sl):.2f}" if sl is not None else "NONE",
+        )
 
     # ── Data assembly ────────────────────────────────────────────────
 
@@ -1747,6 +2093,11 @@ class LiveTrader:
         if time.monotonic() < self._cooldown_until.get(sym, 0.0):
             logger.debug("🕐 SCALP %s: cooldown active — skipping new entry", sym)
             return False
+        # Re-entry churn cap: a setup that keeps re-emitting after every
+        # stop-out must not loop all session (the live COIN 2026-09-16 case).
+        if self._scalp_entry_cap_reached(sym):
+            self._log_entry_cap_reached(sym)
+            return False
         account = await self.broker.get_account()
         equity = account_equity(account)
         if equity is None or equity <= 0:
@@ -1785,7 +2136,8 @@ class LiveTrader:
         side = OrderSide.SELL if is_short else OrderSide.BUY
         client_id = _main_order_client_id(sym, side.value, "ENTRY")
         order_type = OrderType.MARKET if signal.entry_type == EntryType.MARKET else OrderType.LIMIT
-        limit_price = None if order_type == OrderType.MARKET else round(signal.entry_price, 6)
+        limit_price = (None if order_type == OrderType.MARKET
+                       else _normalize_order_price(signal.entry_price))
         order = Order(
             symbol=sym, side=side, quantity=qty, order_type=order_type,
             limit_price=limit_price, client_id=client_id,
@@ -1805,8 +2157,16 @@ class LiveTrader:
                 self._record_short_rejection(sym, str(err))
             return False
         self._last_signal_key[sym] = self._signal_key(signal)
+        self._record_scalp_entry(sym)
         if order_type == OrderType.MARKET:
-            fill_price = current_price if current_price > 0 else signal.entry_price
+            # Anchor every SL/TP level to the ACTUAL fill, never the
+            # signal-time reference — MARKET fills land points away from the
+            # signal price on fast tape, which is how the stop ended up on
+            # the wrong side of the market (live COIN 2026-09-16).
+            fill_price = await self._resolve_fill_price(
+                sym, result,
+                current_price if current_price > 0 else signal.entry_price,
+            )
             self.pm.open_position(
                 sym, -qty if is_short else qty, fill_price,
                 stop_loss_price=signal.stop_loss,
@@ -1838,24 +2198,83 @@ class LiveTrader:
     async def _finalize_open_bundle(
         self, sym: str, qty: float, fill_price: float, sig: ScalpSignal,
     ) -> None:
-        """Attach strategy-SL GTC stop + day-limit TP to a live position.
+        """Attach the ANCHORED-SL GTC stop + day-limit TP to a live position.
 
         Caller has already recorded the position in the PositionManager with
-        NEGATIVE qty for shorts.  Stop level: ``sig.stop_loss``; the -6%
-        backstop is the fallback only when the signal has no SL.
+        NEGATIVE qty for shorts.
+
+        SL/TP ANCHORING (post-go-live fix, 2026-09-16): the broker validates a
+        stop against the LIVE market price, so the signal-time levels are
+        re-anchored to the CONFIRMED fill (``pos.entry_price``) here.  A
+        strategy level that is still valid relative to the fill is kept
+        verbatim; otherwise it is re-priced from the fill using the signal's
+        risk/reward distance, clamped to a minimum distance, and — when even
+        that is degenerate — replaced by the -6% backstop with a loud log
+        ("strategy SL invalid vs fill — using backstop").  The SAME levels are
+        stored in the position state, so the in-process SL evaluates the
+        strategy stop relative to the FILL, not the stale reference.
         """
         sym = sym.upper()
         pos = self.pm.get_positions().get(sym)
         if pos is None:
             return
         is_short = sig.direction == Direction.SHORT
+        fill = float(pos.entry_price) or float(fill_price or 0.0)
+        if SCALP_ANCHOR_LEVELS:
+            levels = anchor_scalp_levels(
+                is_short=is_short, fill=fill, entry_ref=sig.entry_price,
+                sl_ref=sig.stop_loss, tp_ref=sig.take_profit,
+            )
+        else:  # env kill-switch: pre-fix behaviour (raw signal levels)
+            levels = AnchoredLevels(
+                sl=sig.stop_loss, tp=sig.take_profit,
+                sl_source="strategy", tp_source="strategy",
+            )
+        if levels.sl_reanchored or levels.tp_reanchored:
+            logger.warning(
+                "⚓ SCALP %s: signal levels stale vs fill %.2f "
+                "(entry_ref=%.2f SL_ref=%.2f TP_ref=%.2f) — re-anchored to "
+                "SL=%s TP=%s (min distance %.4f)",
+                sym, fill, float(sig.entry_price), float(sig.stop_loss),
+                float(sig.take_profit),
+                f"{levels.sl:.2f}" if levels.sl is not None else "BACKSTOP",
+                f"{levels.tp:.2f}" if levels.tp is not None else "none",
+                levels.min_distance,
+            )
+        if levels.sl_is_backstop:
+            logger.error(
+                "🚨 SCALP %s: strategy SL invalid vs fill — using backstop "
+                "(fill=%.2f SL_ref=%.2f TP_ref=%.2f entry_ref=%.2f, backstop "
+                "%.0f%% -> $%s). Strategy risk NOT honoured on this position.",
+                sym, fill, float(sig.stop_loss), float(sig.take_profit),
+                float(sig.entry_price), PROTECTIVE_STOP_PCT * 100,
+                f"{levels.sl:.2f}" if levels.sl is not None else "NONE",
+            )
+        elif levels.sl_source == "no_strategy_sl":
+            logger.warning(
+                "🛡️  SCALP %s: signal carries no SL — using the %.0f%% backstop "
+                "from the fill (%.2f -> %s)",
+                sym, PROTECTIVE_STOP_PCT * 100, fill,
+                f"${levels.sl:.2f}" if levels.sl is not None else "NONE",
+            )
+        if levels.sl is None:
+            logger.error(
+                "🚨 SCALP %s: no valid stop level derivable from fill %.2f — "
+                "position runs on the in-process risk pass only", sym, fill,
+            )
+        # Keep the PositionManager record in step with the broker levels: the
+        # in-process risk pass reads the scalp state, while this record feeds
+        # reports/teardown, and both must reflect the anchored geometry.
+        pos.stop_loss_price = levels.sl
+        pos.take_profit_price = levels.tp
         stop_ok = await self._place_protective_stop(
             sym, abs(pos.quantity), pos.entry_price,
-            is_short=is_short, stop_price=sig.stop_loss,
+            is_short=is_short, stop_price=levels.sl,
         )
         state = self._scalp_positions.get(sym, {})
         state.update({
-            "entry": pos.entry_price, "sl": sig.stop_loss, "tp": sig.take_profit,
+            "entry": pos.entry_price, "sl": levels.sl, "tp": levels.tp,
+            "sl_source": levels.sl_source, "tp_source": levels.tp_source,
             "direction": "SHORT" if is_short else "LONG",
             "be_done": False,
             "be_trigger_r": sig.breakeven_trigger_r,
@@ -1866,11 +2285,12 @@ class LiveTrader:
             "stop_order_id": None,
             "stop_placed": stop_ok,
             "tp_placed": False,
+            "no_stop_warn_ts": None,
         })
         self._scalp_positions[sym] = state
-        if stop_ok and SCALP_TP_DAY_LIMIT:
+        if stop_ok and SCALP_TP_DAY_LIMIT and levels.tp is not None:
             tp_ok = await self._place_tp_limit(
-                sym, abs(pos.quantity), sig.take_profit, is_short=is_short,
+                sym, abs(pos.quantity), levels.tp, is_short=is_short,
             )
             state["tp_placed"] = tp_ok
             if not tp_ok:
@@ -1893,7 +2313,10 @@ class LiveTrader:
         side = OrderSide.BUY if is_short else OrderSide.SELL
         order = Order(
             symbol=sym, side=side, quantity=qty, order_type=OrderType.LIMIT,
-            limit_price=round(float(tp_price), 6),
+            # Tick-normalised: a raw 211.160004 is rejected outright by
+            # Alpaca ("sub-penny increment", 42210000) and the position then
+            # runs with no take-profit order at all (live 2026-09-16).
+            limit_price=_normalize_order_price(tp_price),
             client_id=_main_order_client_id(sym, side.value, "TP"),
         )
         try:
@@ -2006,6 +2429,11 @@ class LiveTrader:
                 continue
             is_short = pos.quantity < 0
             entry = pos.entry_price
+            # A position without a broker-level stop must never pass
+            # silently: the in-process SL is the only protection left and it
+            # lives only as long as this process.
+            if not state.get("stop_placed", False):
+                self._warn_no_broker_stop(sym, state, entry)
             cur_sl = state.get("sl")
             if cur_sl is None:
                 continue
@@ -2220,6 +2648,9 @@ class LiveTrader:
                 continue
             if time.monotonic() < self._cooldown_until.get(sym, 0.0):
                 continue
+            if self._scalp_entry_cap_reached(sym):
+                self._log_entry_cap_reached(sym)
+                continue
             if self.pm.get_open_count() >= MAX_POSITIONS:
                 continue
             try:
@@ -2261,6 +2692,9 @@ class LiveTrader:
         self._shortable_cache.clear()
         self._scalp_data_warned.clear()
         self._scalp_ready_logged.clear()
+        self._scalp_entries.clear()
+        self._scalp_entries_day = ""
+        self._scalp_cap_warned.clear()
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
         for symbol in list(self.pm.get_open_symbols()):
