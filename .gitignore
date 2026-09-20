@@ -10,6 +10,9 @@ dist/
 logs/
 *.log
 
+# cached market data (re-fetchable via scripts/fetch_scalpset_history.py)
+data/
+
 # scratch / demo files
 demo.py
 full_demo.py
