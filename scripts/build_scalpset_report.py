@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,15 @@ VARIANTS = [
 ]
 SHORT = {"baseline": "baseline", "pessimistic": "pessimistic",
          "overnight": "overnight", "zero_cost": "zero-cost"}
+
+#: Why a variant may be absent, and what to do about it (shown verbatim in the report).
+MISSING_NOTE = (
+    "No artifact for this variant was present when the report was built. Each variant is a full "
+    "12-month portfolio replay run on the shared 2-core machine that also runs the live traders, "
+    "so a host suspension, a killed chain or a budget cut-off leaves it unrun — the raw logs are "
+    "`logs/bt_<variant>.log` and the run can be repeated on its own with the reproduce command in "
+    "§5. Nothing in this report estimates, interpolates or stands in for a missing variant."
+)
 
 
 def load(inp: Path, tag: str) -> dict | None:
@@ -122,6 +132,39 @@ def main() -> int:
              "out-of-sample by construction.")
     L.append("")
 
+    # ── run status: which variants this report actually contains ──────
+    present_tags = [t for t, _, _ in VARIANTS if runs.get(t)]
+    missing_tags = [t for t, _, _ in VARIANTS if not runs.get(t)]
+    L.append("### Run status — which variants are in this report")
+    L.append("")
+    L.append(f"Built {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} from "
+             f"`{inp}`. **{len(present_tags)} of {len(VARIANTS)} planned variants are present: "
+             f"{', '.join(present_tags)}.**")
+    if missing_tags:
+        L.append("")
+        L.append(f"**MISSING: {', '.join(missing_tags)}.** This report is not a four-variant "
+                 f"report, and every table below is explicitly limited to the variants that "
+                 f"ran.")
+    L.append("")
+    rows = []
+    for tag, label, desc in VARIANTS:
+        r = runs.get(tag)
+        if r:
+            m = r["portfolio_metrics"]
+            rows.append([f"**{label}**", "present", f"{m['trades']}", money(m["pnl_net"]),
+                         pct(m["win_rate"]), desc])
+        else:
+            rows.append([f"**{label}**", "**NOT INCLUDED**", "—", "—", "—", desc])
+    L.append(md_table(["Variant", "Status", "Trades", "Net P&L", "Win rate", "What it tests"],
+                      rows))
+    L.append("")
+    for tag in missing_tags:
+        label = next(lb for t, lb, _ in VARIANTS if t == tag)
+        L.append(f"- **{label}** — {MISSING_NOTE}")
+    if missing_tags:
+        L.append("")
+    L.append("")
+
     # ── TL;DR ─────────────────────────────────────────────────────────
     L.append("## 1. TL;DR — does the current running config have an edge?")
     L.append("")
@@ -147,7 +190,7 @@ def main() -> int:
               money(pm(t)["pnl_net"]), pct(pm(t)["total_return"], 2),
               num(pm(t)["profit_factor"]), pct(pm(t)["max_drawdown"], 2),
               money(pm(t)["pnl_per_trade"])]
-             for t in ("baseline", "pessimistic", "overnight", "zero_cost") if t in runs]))
+             for t in ("baseline", "pessimistic", "overnight", "zero_cost") if runs.get(t)]))
         L.append("")
         L.append(f"- Start equity {money(b['initial_equity'])} per run, whole-share 15% position "
                  f"sizing, max 6 concurrent positions, EOD flat (except the overnight run).")
@@ -260,8 +303,9 @@ def main() -> int:
             ["Gross P&L before costs", money(m["pnl_gross"])],
             ["Cost drag", money(m["cost_drag"])],
             ["Profit factor", num(m["profit_factor"])],
-            ["Expectancy (avg net per trade)", f"{money(m['pnl_per_trade'])} on avg "
-                                               f"{money(m['notional_traded'] / max(m['trades'], 1))} notional"],
+            ["Expectancy (avg net per trade)", f"{money(m['pnl_per_trade'])}" +
+                (f" on avg {money(m['notional_traded'] / max(m['trades'], 1))} notional"
+                 if m.get("notional_traded") else "")],
             ["Avg win / avg loss", f"{money(m['avg_win'])} / {money(m['avg_loss'])}"],
             ["Best / worst trade", f"{money(m['best'])} / {money(m['worst'])}"],
             ["Max drawdown (equity curve)", pct(m["max_drawdown"], 2)],
@@ -375,7 +419,13 @@ def main() -> int:
         ["Fills inside a 1-minute bar are optimistic",
          "When a bar's range touches both the stop and the target, the engine resolves by the conservative intra-bar rule but cannot see the true tick path. Sub-minute sequencing (stop-first vs target-first) is therefore a modelling choice, not ground truth."],
         ["EOD flat vs the overnight variant",
-         "The live stack has not always been flat into the close; the overnight run shows what holding through the close would have cost with the same entries."],
+         ("The live stack has not always been flat into the close; the overnight run shows what "
+          "holding through the close would have done. It is **not the same trade set** as the "
+          "other variants — a position held overnight keeps its symbol (and the per-symbol entry "
+          "cap) occupied, so these runs take " +
+          (f"{pm('baseline')['trades']:,} versus {pm('overnight')['trades']:,} trades"
+           if over else "a very different number of trades") +
+          ". Compare the two policies' outcomes, not their per-trade statistics.")],
         ["Costs are not the same as the engine default",
          "Even the 'baseline' run charges 2 bps / 1¢ adverse slippage per fill — it is not a frictionless run. The `zero_cost` diagnostic isolates the raw signal edge."],
         ["Window warmup",
