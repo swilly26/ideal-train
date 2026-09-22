@@ -32,6 +32,11 @@ from src.execution.alpaca_broker import AlpacaBroker, account_equity, is_order_a
 from src.execution.broker import Order, OrderSide, OrderType
 from src.execution.position_manager import PositionManager
 from src.execution.session_state import load_start_equity, save_start_equity
+from src.execution.exit_structure import (
+    ExitPlan,
+    format_exit_plan,
+    plan_exit_structure,
+)
 from src.execution.verified_close import close_position_verified
 from src.strategies.base import SignalType, StrategyConfig
 from src.strategies.mean_reversion import MeanReversionStrategy
@@ -2288,15 +2293,45 @@ class LiveTrader:
             "no_stop_warn_ts": None,
         })
         self._scalp_positions[sym] = state
-        if stop_ok and SCALP_TP_DAY_LIMIT and levels.tp is not None:
+        # ── Exit structure (2026-09-22) ──────────────────────────────
+        # A ground-up fix for the live defect where NO upside exit existed:
+        # the GTC stop reserves the position's whole shares, Alpaca rejects
+        # any second order for the same shares (40310000), and the rejection
+        # path used to NULL the TP level out of the state — leaving the
+        # position with a stop and nothing else.  The level is now ALWAYS
+        # kept: the plan below decides whether the upside exit rests at the
+        # broker or is owned by the trader-side monitor.
+        plan = plan_exit_structure(
+            abs(pos.quantity), stop_placed=stop_ok, tp=levels.tp,
+        )
+        state["stop_qty"] = plan.stop_qty
+        state["tp_monitored"] = plan.monitored_tp
+        state["tp_plan_reason"] = plan.reason
+        self._scalp_positions[sym] = state
+        logger.info("🧩 SCALP %s: exit structure — %s", sym, format_exit_plan(plan))
+        if (SCALP_TP_DAY_LIMIT and levels.tp is not None
+                and plan.broker_tp_qty > 0):
             tp_ok = await self._place_tp_limit(
-                sym, abs(pos.quantity), levels.tp, is_short=is_short,
+                sym, plan.broker_tp_qty, levels.tp, is_short=is_short,
             )
             state["tp_placed"] = tp_ok
-            if not tp_ok:
-                state["tp"] = None  # absent TP → rely on BE/trail + stops
-        elif stop_ok:
-            state["tp"] = None
+            if tp_ok:
+                state["tp_monitored"] = False
+            else:
+                logger.warning(
+                    "🎯 SCALP %s: broker TP order REJECTED — the upside exit "
+                    "at $%.2f is now TRADER-SIDE MONITORED for the full %.6f "
+                    "shares (the GTC stop stays at the broker)",
+                    sym, float(levels.tp), abs(pos.quantity),
+                )
+        elif levels.tp is not None:
+            logger.warning(
+                "🎯 SCALP %s: upside exit at $%.2f is TRADER-SIDE MONITORED "
+                "for the full %.6f shares — %s (the GTC stop stays at the "
+                "broker; monitor cancels it, closes, and re-protects on "
+                "failure)",
+                sym, float(levels.tp), abs(pos.quantity), plan.reason,
+            )
         self._scalp_positions[sym] = state
 
     async def _place_tp_limit(
@@ -2455,7 +2490,12 @@ class LiveTrader:
             if tp is not None and not state.get("tp_placed", False):
                 hit = (price >= tp) if not is_short else (price <= tp)
                 if hit:
-                    logger.info("🎯 SCALP %s: in-process TP $%.2f hit (no TP order) — closing", sym, tp)
+                    logger.info(
+                        "🎯 SCALP %s: MONITORED TP $%.2f hit (price %.2f, no "
+                        "resting TP order — the GTC stop reserves the shares) "
+                        "— cancelling the stop and closing the full position",
+                        sym, tp, price,
+                    )
                     await self._scalp_close_position(sym, price, "scalp_tp_inproc")
                     continue
             # ── BE / trail ──
@@ -2516,6 +2556,10 @@ class LiveTrader:
             return True
         if outcome.status == "pending":
             logger.info("⏳ EXIT %s (%s): close pending — P&L deferred to position sync", sym, reason)
+            # The stop was cancelled to free the shares for this close.  If
+            # the close only PARTIALLY filled, what is still held is naked —
+            # re-protect the residual before returning (idempotent).
+            await self._reprotect_residual(sym, f"{reason} close pending")
             return True
         logger.warning("EXIT %s (%s) rejected (%s) — restoring protective stop", sym, reason, outcome.message)
         pos = self.pm.get_positions().get(sym)
@@ -2526,6 +2570,47 @@ class LiveTrader:
                 is_short=pos.quantity < 0, stop_price=state.get("sl"),
             )
         return False
+
+    async def _reprotect_residual(self, sym: str, reason: str) -> bool:
+        """Re-place the protective stop for a PARTIAL-exit residual.
+
+        Every exit path cancels the resting stop before closing (the broker
+        will not let a close order co-exist with a stop on the same shares).
+        If the close then only fills part of the position, the shares left
+        behind are unprotected — this restores protection for whatever the
+        broker still holds, at the same anchored level.
+
+        Idempotent: ``_place_protective_stop`` returns early when a same-side
+        stop already rests, so calling this after any exit attempt is safe
+        (never two stops, never a naked residual).
+
+        Returns True when the broker holds nothing (nothing to protect) or a
+        stop is in place.
+        """
+        sym = sym.upper()
+        try:
+            positions = await self.broker.get_positions()
+        except Exception as exc:
+            logger.warning("Cannot verify residual protection for %s: %s", sym, exc)
+            return False
+        row = next(
+            (p for p in positions if str(p.get("symbol", "")).upper() == sym), None,
+        )
+        if row is None:
+            return True
+        qty = float(row.get("qty", 0) or 0)
+        if qty == 0:
+            return True
+        state = self._scalp_positions.get(sym, {})
+        entry = float(row.get("avg_entry_price", 0) or 0) or float(state.get("entry") or 0)
+        logger.warning(
+            "🛡️  SCALP %s: residual %.6f shares still held after %s — the stop "
+            "was cancelled for that exit, re-placing it now",
+            sym, qty, reason,
+        )
+        return await self._place_protective_stop(
+            sym, abs(qty), entry, is_short=qty < 0, stop_price=state.get("sl"),
+        )
 
     def _scalp_cleanup_state(self, sym: str) -> None:
         self._scalp_init_state()
@@ -2630,6 +2715,27 @@ class LiveTrader:
                     sym, sym, qty, price,
                 )
                 await self._place_protective_stop(sym, int(qty), price, is_short=False)
+
+        # ── Shrunk: a partial exit left a residual ────────────────────
+        # A tracked position that lost shares on the broker (a partial fill
+        # of a close order, or an external reduction) must not sit naked.  No
+        # P&L is booked here — the exit accounting stays with the verified
+        # close / vanish path — but protection is restored immediately, and
+        # loudly, because a residual with no stop is exactly the failure this
+        # trader must never allow.
+        for sym in sorted(pm_syms & set(by_sym)):
+            if sym not in main_set:
+                continue
+            tracked = float(self.pm.get_positions()[sym].quantity)
+            broker_qty = float(by_sym[sym].get("qty", 0) or 0)
+            if abs(broker_qty) >= abs(tracked) - 1e-9:
+                continue
+            logger.warning(
+                "🚨 SCALP %s: broker holds %.6f but %.6f is tracked — a PARTIAL "
+                "exit left a residual; re-protecting it before the next tick",
+                sym, broker_qty, tracked,
+            )
+            await self._reprotect_residual(sym, "partial exit (position sync)")
 
     # ── Scalp tick loop ──────────────────────────────────────────────
 

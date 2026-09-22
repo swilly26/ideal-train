@@ -365,9 +365,15 @@ class TestTickScalpBoxShort:
         trader = _make_scalp_trader(broker, provider)
         await trader._tick_scalp(1)
 
-        # SELL market order was placed with WHOLE shares (floor of 275.22 = 275);
-        # the only other order is the day-limit TP.
-        assert len(broker.orders) == 2
+        # SELL market order was placed with WHOLE shares (floor of 275.22 = 275).
+        # There is NO second broker order: the whole-share GTC stop reserves all
+        # 275 shares, so a full-quantity day-limit TP on the same shares is
+        # rejected by Alpaca (40310000, live 2026-09-21).  The upside exit is the
+        # trader-side monitored TP: the level lives in the position state.
+        assert len(broker.orders) == 1
+        state = trader._scalp_positions["QQQ"]
+        assert state["tp"] == 88.0
+        assert state["tp_monitored"] is True and state["tp_placed"] is False
         entry = broker.orders[0]
         assert entry.symbol == "QQQ"
         assert entry.side == OrderSide.SELL
@@ -388,9 +394,11 @@ class TestTickScalpBoxShort:
         assert stop_price > 109.0
         assert round(stop_price, 2) != round(109.0 * 1.06, 2)
 
-        # day-limit TP at the structural target
+        # the structural TP target (88.0, asserted above from the state) is
+        # the MONITORED exit level: no day-limit TP order can rest next to the
+        # whole-share GTC stop (40310000)
         tps = [o for o in broker.orders if o is not None and o.order_type == OrderType.LIMIT]
-        assert len(tps) == 1 and round(float(tps[0].limit_price), 2) == 88.0
+        assert tps == []
 
         # per-signal log present with geometry
         assert trader._last_signal_key.get("QQQ") is not None
@@ -456,12 +464,18 @@ class TestLimitPath:
         pos = trader.pm.get_positions().get("NVDA")
         assert pos is not None and pos.quantity == 30.0 and pos.entry_price == 100.0
         assert trader._scalp_bundles == {}
-        # strategy SL stop + day-limit TP attached at the actual fill qty
+        # strategy SL stop attached at the actual fill qty
         sym, qty, stop_price, _cid, side = trader.broker.stop_requests[0]
         assert (sym, qty, side) == ("NVDA", 30, "SELL")
         assert stop_price == 98.0
-        tps = [o for o in trader.broker.orders if o.order_type == OrderType.LIMIT]
-        assert any(round(float(o.limit_price), 2) == 106.0 for o in tps)
+        # the TP target is kept as the MONITORED exit level, not a resting
+        # order: the 30-share GTC stop reserves every share (40310000)
+        tps = [o for o in trader.broker.orders
+               if o.order_type == OrderType.LIMIT
+               and "ENTRY" not in (o.client_id or "")]
+        assert tps == []          # no resting TP next to the GTC stop
+        state = trader._scalp_positions["NVDA"]
+        assert state["tp"] == 106.0 and state["tp_monitored"] is True
 
     @pytest.mark.asyncio
     async def test_tp_fill_sync_books_pnl_and_starts_cooldown(self):
@@ -502,7 +516,9 @@ class TestShortRejectionBackoff:
         trader = _make_scalp_trader(broker)
         sig = _sig("NVDA", Direction.SHORT, 100.0, 101.5, 97.0, "box_theory", rr=3.0)
         await trader._scalp_enter(sig, 100.0)
-        assert len(broker.orders) == 2  # SELL entry + BUY day-limit TP
+        # SELL entry only: the BUY day-limit TP cannot rest next to the
+        # whole-share BUY GTC stop (both would need the same 15 shares)
+        assert len(broker.orders) == 1
         o = broker.orders[0]
         assert o.side == OrderSide.SELL
         assert int(o.quantity) == o.quantity == 15  # 10k*15% / 100 = 15 whole

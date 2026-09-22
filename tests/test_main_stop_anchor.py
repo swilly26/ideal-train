@@ -218,9 +218,12 @@ class TestAnchoredStopReachesBroker:
         state = trader._scalp_positions["COIN"]
         assert state["sl"] == 161.63 and state["stop_placed"] is True
         assert state["sl_source"] == "fill_risk"
-        # the keep-leg TP survives (valid vs the fill) and is tick-normalised
-        tps = [o for o in broker.orders if o.order_type == OrderType.LIMIT]
-        assert len(tps) == 1 and float(tps[0].limit_price) == 184.14
+        # the keep-leg TP target survives (valid vs the fill) and is
+        # tick-normalised.  It is not a resting broker order — the whole-share
+        # GTC stop reserves the position (40310000) — it is the monitored exit
+        # level, so it must live in the position state.
+        assert state["tp"] == 184.14
+        assert state["tp_monitored"] is True and state["tp_placed"] is False
         text = "\n".join(r.getMessage() for r in caplog.records)
         assert "stale vs fill" in text and "re-anchored" in text
 
@@ -230,10 +233,12 @@ class TestAnchoredStopReachesBroker:
         trader = _make_scalp_trader(broker)
         sig = _sig("NVDA", Direction.LONG, 100.0, 98.0, 106.160004, "box_theory")
         assert await trader._scalp_enter(sig, 100.0) is True
-        tps = [o for o in broker.orders if o.order_type == OrderType.LIMIT]
-        assert len(tps) == 1
-        assert float(tps[0].limit_price) == 106.16   # not 106.160004
-        assert trader._scalp_positions["NVDA"]["tp"] == 106.16
+        # tick-normalised into the MONITORED exit level (no resting TP order
+        # sits next to the whole-share GTC stop)
+        assert not [o for o in broker.orders if o.order_type == OrderType.LIMIT]
+        state = trader._scalp_positions["NVDA"]
+        assert state["tp"] == 106.16                 # not 106.160004
+        assert state["tp_monitored"] is True
 
     @pytest.mark.asyncio
     async def test_fill_from_order_result_wins_over_position_avg(self):
@@ -414,7 +419,8 @@ class TestEntryChurnCap:
         # three entry orders reached the broker, the 4th never did
         entries = [o for o in broker.orders if o.order_type == OrderType.MARKET]
         assert len(entries) == 3
-        assert len(broker.orders) == 6      # 3 entries + 3 day-limit TPs
+        # 3 entries only — each position's TP is the monitored exit level
+        assert len(broker.orders) == 3
         assert trader._scalp_entries["NVDA"] == 3
         text = "\n".join(r.getMessage() for r in caplog.records)
         assert "session entry cap reached" in text
