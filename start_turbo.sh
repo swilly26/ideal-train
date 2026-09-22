@@ -21,7 +21,9 @@ echo ""
 # setsid: trader runs in its OWN session so an external teardown of the
 # invoking session (interactive terminal or watchdog.sh) cannot take it down.
 # nohup: SIGHUP immune.  stdin from /dev/null: no terminal dependency.
-setsid nohup python3 turbo_trader.py < /dev/null > logs/turbo_runner_$(date +%Y%m%d_%H%M%S).out 2>&1 &
+export PYTHONUNBUFFERED=1
+# same block-buffering fix as start_trader.sh (see the comment there)
+setsid nohup python3 -u turbo_trader.py < /dev/null > logs/turbo_runner_$(date +%Y%m%d_%H%M%S).out 2>&1 &
 PID=$!
 echo "Started! PID: $PID"
 echo "Monitor: tail -f /home/team/shared/engine/logs/turbo_$(date +%Y%m%d).log"
