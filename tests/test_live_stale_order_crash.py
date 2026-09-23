@@ -31,21 +31,32 @@ class StuckOpenOrder:
 
 
 class StuckCancelBroker:
-    """Broker whose stale MAIN order can never be cancelled (42210000)."""
+    """Broker whose stale MAIN order can never be cancelled (42210000).
+
+    The boot sweep (``_cancel_stale_orders``) now walks our own open orders
+    and cancels them one by one, keeping any protective stop that belongs to a
+    position the broker still holds; this fake models a cancel that is never
+    confirmed (the order stays in the open-order book).
+    """
 
     def __init__(self):
         self.cancel_calls = 0
-        self.last_prefix = None
+        self.last_cancel_id = None
+        self.open_orders_calls = 0
 
     async def startup_health_check(self):
         return None
 
-    async def cancel_orders_by_client_id_prefix(self, prefix):
+    async def get_positions(self):
+        return []          # nothing held -> nothing to protect
+
+    async def cancel_order_and_wait(self, order_id, timeout=10.0, poll_interval=0.25):
         self.cancel_calls += 1
-        self.last_prefix = prefix
-        return 0  # every cancel attempt fails -> nothing confirmed cancelled
+        self.last_cancel_id = order_id
+        return False       # cancellation is never confirmed
 
     async def get_open_orders(self):
+        self.open_orders_calls += 1
         # The stuck order remains visible in the open-order book forever.
         return [StuckOpenOrder()]
 
@@ -89,8 +100,9 @@ async def test_run_continues_when_stale_cancel_unconfirmed():
     with pytest.raises(_ReachedMarketWait):
         await trader.run()
 
-    assert trader.broker.cancel_calls == 1
-    assert trader.broker.last_prefix == "algoflow_MAIN_"
+    assert trader.broker.cancel_calls == 1, "the stuck order must be attempted"
+    assert trader.broker.last_cancel_id == StuckOpenOrder.id
+    assert trader.broker.open_orders_calls >= 1
     assert seen.get("sync") is True, \
         "position sync must still run when stale cancellation is unconfirmed"
     assert seen.get("stops") is True, \

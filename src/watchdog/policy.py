@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Mapping, Optional, Tuple
 
 from src.watchdog.market_status import NY_TZ, market_closed_by_schedule
@@ -34,6 +34,60 @@ from src.watchdog.market_status import NY_TZ, market_closed_by_schedule
 # Verdict tokens printed by the CLI (parsed by watchdog.sh).
 RESTART_TOKEN = "RESTART"
 OK_TOKEN = "OK"
+
+# ── Missed-session gap detection (2026-09-23) ─────────────────────────────
+# 2026-09-22: the MAIN trader produced no line for 33.4h — an entire US
+# session was missed — and the watchdog reported it as a quiet
+# "log stale (...) but exempted: market closed" line.  A gap long enough to
+# have swallowed a whole regular session AND actually overlapping one is not
+# an exemption, it is an INCIDENT: it must be impossible to read the log and
+# miss it.
+RTH_SECONDS = 6.5 * 3600          # one regular session, 09:30-16:00 ET
+MISSED_SESSION_TOKEN = "MISSED_SESSION"
+
+
+def gap_covers_a_session(
+    log_age_seconds: float, *, now: Optional[datetime] = None,
+    step_minutes: int = 15,
+) -> bool:
+    """True when a log gap of *log_age_seconds* ending at *now* covered RTH.
+
+    Requires BOTH a gap at least as long as a full session and an actual
+    overlap with the regular-hours schedule: a trader held quiet over a
+    weekend or a holiday is not a missed session.  The schedule is sampled
+    every ``step_minutes`` (cheap and precise enough for an incident signal).
+    """
+    try:
+        age = float(log_age_seconds)
+    except (TypeError, ValueError):
+        return False
+    if age < RTH_SECONDS:
+        return False
+    end = now if now is not None else datetime.now(NY_TZ)
+    start = end - timedelta(seconds=age)
+    step = timedelta(minutes=max(1, int(step_minutes)))
+    moment = start
+    while moment <= end:
+        if not market_closed_by_schedule(moment):
+            return True
+        moment += step
+    return False
+
+
+def missed_session_verdict(
+    *, log_age: float, now: Optional[datetime] = None,
+) -> Tuple[bool, str]:
+    """``(is_missed_session, human-readable detail)`` for one trader gap."""
+    if gap_covers_a_session(log_age, now=now):
+        try:
+            hours = float(log_age) / 3600.0
+        except (TypeError, ValueError):
+            hours = 0.0
+        return True, (
+            f"no output for {hours:.1f}h (>= {RTH_SECONDS / 3600:.1f}h) spanning "
+            f"regular trading hours — a session was missed"
+        )
+    return False, "gap does not span a regular session"
 
 
 def read_config(
@@ -152,6 +206,16 @@ def main(argv: Optional[list] = None) -> int:
         log_age = 0.0
 
     now = _parse_now(args["now"]) if args.get("now") else None
+    if args.get("gap-age") is not None:
+        # Gap-scan mode: is this stale-log gap a MISSED SESSION?  (The stale
+        # exemption answers a different question and must never mask this.)
+        try:
+            gap_age = float(args["gap-age"])
+        except ValueError:
+            gap_age = 0.0
+        missed, detail = missed_session_verdict(log_age=gap_age, now=now)
+        print(f"{MISSED_SESSION_TOKEN if missed else OK_TOKEN}|{detail}")
+        return 0
     restart, reason = check(
         process_running=flag("process-running", "yes"),
         has_log=flag("has-log", "yes"),
