@@ -656,6 +656,54 @@ def _stop_on_wrong_side(stop_price, is_short: bool, market_price) -> bool:
     return float(stop_price) >= float(market_price)
 
 
+# The protection audit (see _audit_position_protection) protects a position
+# FROM NOW: it is the last line of defence for a position the broker still
+# holds, so it always anchors the stop on the LIVE MARKET.  An entry-anchored
+# level is the wrong anchor once a position has drifted (2026-09-23: a naked
+# QQQ short at market 745.74 with entry 706.06 was about to be "protected" by
+# the entry-anchored 748.42 — a fraction of a percent away, i.e. an immediate
+# exit dressed up as a safety net).  A drifted position is additionally
+# reported loudly, because closing it is a HUMAN decision, not the audit's.
+AUDIT_ENTRY_ANCHOR_DEADZONE_PCT = 0.01   # <1% from market = an immediate exit
+
+
+def _entry_anchored_stop(entry_price, is_short: bool, pct: float | None = None):
+    """The entry-anchored backstop level (None when it cannot be derived).
+
+    Kept only as a fallback for the audit when the live market price cannot be
+    read; new placements that must protect a position *now* use
+    ``_market_anchored_stop`` instead.
+    """
+    if pct is None:
+        pct = PROTECTIVE_STOP_PCT
+    if isinstance(entry_price, bool) or not isinstance(entry_price, (int, float)):
+        return None
+    if float(entry_price) <= 0:
+        return None
+    price = (float(entry_price) * (1 + pct) if is_short
+             else float(entry_price) * (1 - pct))
+    return round(price, 2)
+
+
+def _entry_anchor_is_spent(entry_stop, is_short: bool, market_price) -> bool:
+    """True when the entry-anchored backstop is no longer a safety net.
+
+    Either it sits on the wrong side of the live market, or it sits so close to
+    it that it would fill on the next tick.  Without a usable market price the
+    answer is False (never call a position spent on a guess).
+    """
+    if _stop_on_wrong_side(entry_stop, is_short, market_price):
+        return True
+    if isinstance(market_price, bool) or not isinstance(market_price, (int, float)):
+        return False
+    if isinstance(entry_stop, bool) or not isinstance(entry_stop, (int, float)):
+        return False
+    market = float(market_price)
+    if market <= 0:
+        return False
+    return abs(market - float(entry_stop)) / market < AUDIT_ENTRY_ANCHOR_DEADZONE_PCT
+
+
 # ── Short-rejection classification + BP-capped sizing (turbo #29 lessons) ──
 
 def _rejection_kind(error_message: str | None) -> str:
@@ -989,16 +1037,15 @@ class LiveTrader:
         logger.info("Cancelling any stale orders from prior sessions…")
         cancelled = await self._cancel_stale_orders()
         logger.info(f"Cancelled {cancelled} stale order(s)")
-        remaining = await self.broker.get_open_orders()
-        # Only a non-stop order we still own counts as an UNCONFIRMED cancel:
-        # the protective stops the sweep deliberately keeps must not be
-        # mistaken for a stuck cancel (they would defer the position cleanup
-        # on every single boot of a protected account).
-        stale_cancel_unconfirmed = any(
-            str(getattr(o, "client_order_id", "")).startswith("algoflow_MAIN_")
-            and not _order_is_stop_like(o)
-            for o in remaining
-        )
+        # The sweep tells us which of OUR orders it could not confirm as
+        # cancelled.  Deriving this from the open-order book instead (as this
+        # code used to) is unsafe: an order whose type metadata cannot be read
+        # counts as "stop-like", so an unconfirmed cancel looked like a kept
+        # protective stop and the deferral never fired (2026-09-23).  A
+        # protective stop the sweep deliberately KEEPS is not an unconfirmed
+        # cancel and must not defer the cleanup on every boot.
+        unconfirmed = list(getattr(self, "_stale_cancel_unconfirmed", []) or [])
+        stale_cancel_unconfirmed = bool(unconfirmed)
         if stale_cancel_unconfirmed:
             # A leftover order the broker pins as "pending cancel" (e.g. a
             # cancel was in flight when a previous host died) answers every
@@ -1006,13 +1053,15 @@ class LiveTrader:
             # That must NOT kill the boot: the order is already being
             # cancelled at the broker, so we skip only the post-startup
             # position-cleanup step (its intent was to liquidate leftovers
-            # whose orders we expected to be gone) and continue the normal
-            # boot — sync positions, re-place protective stops, wait for
-            # market. Mirror of the turbo trader's tolerant handling.
+            # whose orders we expected to be gone, and a still-live order can
+            # collide with the liquidation) and continue the normal boot —
+            # sync positions, re-place protective stops, wait for market.
+            # Mirror of the turbo trader's tolerant handling.
             logger.warning(
-                "Stale order cancellation was not confirmed — deferring post-startup "
-                "position cleanup; continuing boot (positions will be synced and "
-                "protective stops re-placed)"
+                "Stale order cancellation was not confirmed for %d order(s) (%s) — "
+                "deferring post-startup position cleanup; continuing boot (positions "
+                "will be synced and protective stops re-placed)",
+                len(unconfirmed), ", ".join(u[:8] for u in unconfirmed),
             )
 
         # ── Layer 2: Sync positions from Alpaca at startup ───────────
@@ -1374,8 +1423,19 @@ class LiveTrader:
         cannot be read, NO order that looks like a protective stop is
         cancelled (fail safe: leaving a stale stop is recoverable, leaving a
         position naked is not).
+
+        Side effect (2026-09-23): every order whose cancellation was NOT
+        confirmed is recorded in ``self._stale_cancel_unconfirmed``.  That is
+        the signal ``run()`` uses to defer the post-startup position cleanup:
+        an order still live at the broker may collide with (or wash-trade) a
+        liquidating order for the same symbol, and it may be a protective stop
+        the broker has not finished cancelling.  The signal must come from the
+        sweep itself — re-deriving it from the open-order book mis-read any
+        order whose type metadata cannot be parsed as "stop-like" and so let an
+        unconfirmed cancel slip through (2026-09-23 regression).
         """
         prefix = "algoflow_MAIN_"
+        self._stale_cancel_unconfirmed: list[str] = []
         try:
             open_orders = await self.broker.get_open_orders()
         except Exception as exc:
@@ -1414,12 +1474,21 @@ class LiveTrader:
                 )
                 continue
             try:
-                if await self.broker.cancel_order_and_wait(str(o.id)):
-                    cancelled += 1
+                confirmed = await self.broker.cancel_order_and_wait(str(o.id))
             except Exception as exc:
+                confirmed = False
                 logger.warning(
                     "stale-order sweep: cancel of order %s failed: %s",
                     str(getattr(o, "id", ""))[:8], exc,
+                )
+            if confirmed:
+                cancelled += 1
+            else:
+                self._stale_cancel_unconfirmed.append(str(getattr(o, "id", "") or "?"))
+                logger.warning(
+                    "stale-order sweep: cancellation of order %s (%s) was NOT "
+                    "confirmed — it may still be live at the broker",
+                    str(getattr(o, "id", ""))[:8], cid or "no client id",
                 )
         if kept:
             logger.info(
@@ -1625,6 +1694,7 @@ class LiveTrader:
         is_short: bool = False,
         stop_price: float | None = None,
         market_price: float | None = None,
+        anchor: str = "entry",
     ) -> bool:
         """Place a GTC protective stop-loss order at the broker.
 
@@ -1638,6 +1708,17 @@ class LiveTrader:
         placed EXACTLY at that level — the strategy's risk-defined SL — and
         the -6% backstop is used only when it is ``None``.  Passed through
         for every scalp entry so teardown stops reconcile with strategy risk.
+
+        ``anchor`` (2026-09-23) selects the anchor for a backstop
+        (``stop_price is None``):
+          ``"entry"``  — entry * (1 ± 6%), the position's own risk level; the
+                         level is re-anchored to the market only when it lands
+                         on the wrong side of it.  This is the entry path.
+          ``"market"`` — market * (1 ± 6%), i.e. protection measured from the
+                         live price.  Used by the protection audit, which
+                         guards a position that already drifted from its entry
+                         (an entry anchor there is a fraction of a percent from
+                         the market = an immediate exit, not a safety net).
 
         ScalpSet callers pass the level ALREADY ANCHORED TO THE FILL
         (``_finalize_open_bundle`` → ``anchor_scalp_levels``), including the
@@ -1668,6 +1749,36 @@ class LiveTrader:
         entry_anchored = stop_price is None
         if stop_price is not None:
             origin = "strategy SL"
+        elif anchor == "market":
+            # Market-anchored backstop: the level must protect the position
+            # from NOW, not reproduce its entry risk.
+            if market_price is None:
+                market_price = await self._market_reference_price(sym)
+            anchored = _market_anchored_stop(market_price, is_short)
+            if anchored is None:
+                logger.warning(
+                    "🛡️  STOP %s: no live market reference — falling back to the "
+                    "entry-anchored backstop", sym,
+                )
+                stop_price = _entry_anchored_stop(entry_price, is_short)
+                if stop_price is None:
+                    logger.error(
+                        "🛡️  STOP %s: cannot derive any protective level "
+                        "(entry=%s, market UNKNOWN) — position stays unprotected",
+                        sym, entry_price,
+                    )
+                    self._mark_unprotected(
+                        sym,
+                        "neither the live market nor the entry price yielded a "
+                        "usable protective level",
+                    )
+                    return False
+                origin = (f"backstop entry {('+' if is_short else '-')}"
+                          f"{PROTECTIVE_STOP_PCT * 100:.0f}% (no market reference)")
+            else:
+                stop_price = anchored
+                origin = ("market-anchored backstop "
+                          f"{('+' if is_short else '-')}{PROTECTIVE_STOP_PCT * 100:.0f}%")
         else:
             stop_price = round(
                 entry_price * (1 + PROTECTIVE_STOP_PCT) if is_short
@@ -1973,6 +2084,15 @@ class LiveTrader:
         ``heal`` re-places a missing stop (throttled per symbol) unless
         another non-stop working order for that symbol is in flight, where a
         new stop would only bounce off the broker's wash-trade filter.
+
+        The level placed here is ALWAYS market-anchored (short: market * 1.06,
+        long: market * 0.94): the audit protects the position from now, and for
+        a position that has drifted away from its entry an entry-anchored level
+        either lands on the wrong side of the market or sits a fraction of a
+        percent from it, turning the safety net into an immediate exit.
+        A position whose entry band is spent is reported loudly — a human
+        decides whether it should be closed — while the market-anchored stop
+        does the protecting.
         """
         self._scalp_init_state()
         main_set = {s.upper() for s in SYMBOLS}
@@ -2020,6 +2140,23 @@ class LiveTrader:
                 "another order is in flight — re-placing on the next pass"
                 if busy else ("attempting placement now" if heal else "no re-placement attempted"),
             )
+            market = await self._market_reference_price(sym)
+            entry_stop = _entry_anchored_stop(pos.entry_price, is_short)
+            if market is not None and _entry_anchor_is_spent(entry_stop, is_short, market):
+                logger.error(
+                    "🚨 PROTECTION GAP (%s): %s has moved BEYOND its entry-anchored "
+                    "%s%.0f%% band (entry $%.2f, entry band %s, live market $%.2f) — an "
+                    "entry-anchored stop there would be an immediate exit rather than a "
+                    "safety net; the stop placed now is MARKET-anchored %s%.0f%% "
+                    "($%.2f) and a HUMAN should decide whether this position is worth "
+                    "holding at all",
+                    context, sym, "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100,
+                    pos.entry_price,
+                    f"${entry_stop:.2f}" if entry_stop is not None else "n/a",
+                    market, "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100,
+                    round(market * (1 + PROTECTIVE_STOP_PCT) if is_short
+                          else market * (1 - PROTECTIVE_STOP_PCT), 2),
+                )
             if busy or not heal:
                 unprotected.append(sym)
                 continue
@@ -2030,6 +2167,7 @@ class LiveTrader:
             throttles[sym] = now
             ok = await self._place_protective_stop(
                 sym, int(abs(pos.quantity)), pos.entry_price, is_short=is_short,
+                market_price=market, anchor="market",
             )
             if not ok:
                 unprotected.append(sym)

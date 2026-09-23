@@ -15,6 +15,12 @@ WATCHDOG_LOG="$LOG_DIR/watchdog.log"
 #                                     weekends) — default 1 (on). Safe: a
 #                                     trader that is NOT running is still
 #                                     restarted regardless of market hours.
+#   DEPLOY SAFETY (do not lower without checking this): a healthy trader emits
+#   an intraday liveness heartbeat every MARKET_TICK_HEARTBEAT_SECONDS (240s
+#   default) during regular hours, so its newest log line is never older than
+#   ~240s while the market is open.  WATCHDOG_STALE_SECONDS must stay ABOVE
+#   that heartbeat — the 300s default leaves 60s of slack — otherwise this
+#   watchdog would kill and restart a perfectly healthy trader mid-session.
 : "${WATCHDOG_STALE_SECONDS:=300}"
 : "${WATCHDOG_SKIP_STALE_WHEN_CLOSED:=1}"
 export WATCHDOG_STALE_SECONDS WATCHDOG_SKIP_STALE_WHEN_CLOSED
@@ -78,11 +84,14 @@ trader_process_running() {
 # An unmistakable incident line: "MISSED SESSION" in the watchdog log AND a
 # one-line note in the repo, so a whole missed session can never again be
 # filed as a routine exemption.
+write_incident() {
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" >> "$INCIDENT_LOG"
+}
 report_missed_session() {
     local kind="$1" age="$2" log_file="$3" detail="$4" line
     line="MISSED SESSION: $kind trader produced no log line for ${age}s (~$(( age / 3600 ))h) spanning a regular session ($detail); newest log $log_file"
     log_action "$line"
-    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$line" >> "$INCIDENT_LOG"
+    write_incident "$line"
 }
 restart_trader() {
     local kind="$1" reason="$2" pid state_file prev_pid out new_pid
@@ -157,6 +166,13 @@ check_trader() {
         gap="$( "${WATCHDOG_POLICY_CMD[@]}" --gap-age="$age" "${NOW_ARG[@]}" 2>/dev/null )"
         if [[ "$gap" == "$MISSED_SESSION_TOKEN"* ]]; then
             report_missed_session "$kind" "$age" "$log_file" "${gap#*|}"
+        elif [[ -z "$gap" ]]; then
+            # The gap scan is the ONLY thing that turns a swallowed session into
+            # an incident.  If it cannot run, silence must NOT read as "no
+            # missed session" — that is exactly how 33.4h of missing output was
+            # filed as a routine exemption on 2026-09-22.
+            log_action "WARNING: the gap scan for $kind produced no verdict (the policy helper failed to run) — for the ${age}s gap ending now a missed session CANNOT be ruled out"
+            write_incident "GAP SCAN UNAVAILABLE: the watchdog could not evaluate the ${age}s log gap of the $kind trader (policy helper failed) — a missed session cannot be ruled out, check logs/runner_*.out by hand"
         fi
         # 3. Ask the Python policy for the stale-log verdict. It applies the
         #    market-hours exemption: a stale log is NOT a reason to restart
@@ -167,8 +183,14 @@ check_trader() {
                 --process-running=yes --has-log=yes --age="$age" "${NOW_ARG[@]}"
         )"
         if [[ -z "$output" ]]; then
-            # Policy helper failed — fall back to the legacy stale-kill.
-            log_action "watchdog policy helper failed for $kind; restoring legacy stale-kill"
+            # The helper owns the market-hours knowledge, so without its verdict
+            # we cannot tell a trader that is legitimately sleeping (market
+            # closed) from one that is frozen.  Keep the legacy fail-safe
+            # (restart), but never silently: this path CAN restart a healthy
+            # trader while the market is closed, so it is logged as a WARNING
+            # and written to the incident file.
+            log_action "WARNING: the watchdog policy helper failed for $kind — no stale-log verdict could be computed (market hours therefore UNKNOWN); falling back to the legacy stale-kill for this check (this may restart a healthy trader)"
+            write_incident "POLICY HELPER FAILED: the ${age}s log staleness of the $kind trader could not be judged (market hours unknown) — the watchdog fell back to the legacy stale-kill and may have restarted a healthy trader; investigate the watchdog's policy helper now"
             restart_trader "$kind" "policy-helper-failed"
             return
         fi
