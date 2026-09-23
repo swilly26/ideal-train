@@ -290,9 +290,13 @@ class TestCancellingOrderIsNotCoverage:
         assert broker.rejections and "40310000" in broker.rejections[0]
         stops = broker.live_stops("META", is_short=True)
         assert len(stops) == 1
-        # market 736.50 < entry 750.06, so the entry anchor (750.06 * 1.06) is
-        # already on the protective side for this short — kept, not re-anchored
-        assert stops[0].stop_price == pytest.approx(round(750.06 * 1.06, 2))
+        # ONE RULE (2026-09-23 review): the startup path anchors on the LIVE
+        # MARKET, exactly like _audit_position_protection — market 736.50 *
+        # 1.06 = 780.69, NOT the entry anchor (750.06 * 1.06 = 795.06).
+        # (This expectation was changed deliberately: the startup path used to
+        # keep the entry anchor whenever it happened to be on the protective
+        # side of the market, which is a different rule from the audit's.)
+        assert stops[0].stop_price == pytest.approx(round(736.50 * 1.06, 2))
         assert live_trader._order_is_live_working(stops[0]) is True
 
     @pytest.mark.asyncio
@@ -345,7 +349,14 @@ class TestMarketAnchoredBackstop:
         assert stops[0].stop_price == pytest.approx(382.77)
         assert broker.stop_requests[0][3].startswith("algoflow_MAIN_AVGO_STOP_")
         text = "\n".join(_messages(caplog))
-        assert "WRONG side of the live market" in text
+        # The startup path now anchors on the market UP FRONT (one rule with
+        # _audit_position_protection), so the wrong-side entry level is never
+        # even submitted — and the spent entry band is reported with the same
+        # loud ERROR the audit emits (closing the position is a HUMAN call).
+        assert "WRONG side of the live market" not in text
+        assert "PROTECTION GAP (startup)" in text
+        assert "BEYOND its entry-anchored +6% band" in text
+        assert "a HUMAN should decide whether this position is worth holding" in text
 
     @pytest.mark.asyncio
     async def test_long_backstop_uses_the_market_not_the_entry(self):
@@ -485,12 +496,13 @@ class TestStartupSweepKeepsProtection:
             assert len(live) == 1, f"{sym} has {len(live)} live stops"
             assert live[0].stop_price > market, "stop must sit above a short's market"
         qqq = broker.live_stops("QQQ", is_short=True)[0]
-        # QQQ's entry anchor (706.06 * 1.06 = 748.42) is still on the
-        # protective side of its market (745.74), so it is kept as-is: the 6%
-        # entry stop is what fires here, because this position is already past
-        # it.  A market anchor is used only when the entry anchor would land
-        # on the WRONG side of the market (the AVGO case above).
-        assert qqq.stop_price == pytest.approx(round(706.06 * 1.06, 2))
+        # DELIBERATE EXPECTATION CHANGE (2026-09-23 review): the startup path
+        # now uses ONE rule with _audit_position_protection and anchors the
+        # backstop on the LIVE MARKET (745.74 * 1.06 = 790.48, which is exactly
+        # the stop a human hand-placed on this position at the broker), not the
+        # entry anchor 706.06 * 1.06 = 748.42 (0.36% from the market = an
+        # immediate exit dressed up as a safety net).
+        assert qqq.stop_price == pytest.approx(round(745.74 * 1.06, 2))
         assert qqq.stop_price > 745.74
         # no cancelling/duplicate leftovers anywhere
         assert not [

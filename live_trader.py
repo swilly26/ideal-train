@@ -159,6 +159,24 @@ SCALP_STOP_MIN_DISTANCE_ABS = float(
     os.environ.get("SCALP_STOP_MIN_DISTANCE_ABS", "0.01"))     # or 1 cent
 # Cadence (seconds) of the loud "position has NO broker stop" warning.
 SCALP_NO_STOP_WARN_SECONDS = float(os.environ.get("SCALP_NO_STOP_WARN_SECONDS", "60"))
+# ── Verified-fill entry gate (2026-09-23) ─────────────────────────────
+# Live defect at the 13:30Z open: the trader recorded NVDA/TSLA/COIN as
+# positions, tried to protect them and BOOKED P&L for them, although the
+# broker never filled a single entry order.  The orders were still working
+# (six to ten seconds of broker-side created_at -> submitted_at lag at the
+# open, then no match at all), our own "position vanished" cleanup CANCELED
+# them, and the phantom P&L was priced from the PREVIOUS session's fills
+# (NVDA 227.36, TSLA 376.96, COIN 200.11 -- every one of them a 2026-09-22
+# execution).  A position therefore exists only after a VERIFIED fill,
+# whatever the submission response claimed:
+#   * the broker reports filled / partially_filled, AND
+#   * it carries a real filled_qty AND a real filled_avg_price.
+# An entry still working after this window is abandoned (cancelled) and is
+# never recorded as a position.
+SCALP_ENTRY_FILL_TIMEOUT_SECONDS = float(
+    os.environ.get("SCALP_ENTRY_FILL_TIMEOUT_SECONDS", "12"))
+SCALP_ENTRY_FILL_POLL_SECONDS = float(
+    os.environ.get("SCALP_ENTRY_FILL_POLL_SECONDS", "0.5"))
 # Re-entry churn cap: max ScalpSet ENTRY ORDERS submitted per symbol per
 # trading day (<= 0 disables).  Prevents the COIN-style loop where a setup
 # re-emits every cooldown and re-enters after every stop-out.
@@ -616,6 +634,67 @@ def _order_is_protective_for(o, is_short: bool) -> bool:
     if not _order_matches_side(o, want):
         return False
     return _order_is_stop_like(o)
+
+
+# Order statuses that mean "the broker confirms an EXECUTION".
+_FILLED_ORDER_STATUSES = frozenset({"FILLED", "PARTIALLY_FILLED"})
+
+
+def _verified_fill_qty_price(order_like) -> tuple[float, float] | None:
+    """``(filled_qty, avg_fill_price)`` for a BROKER-CONFIRMED execution.
+
+    ``None`` for everything else.  A submission that is merely accepted, new,
+    pending, rejected, canceled or expired is NOT a fill, however alive the
+    order looks — 2026-09-23: the open booked three positions whose entry
+    orders had ``filled_qty == 0`` and had never touched the account.
+    """
+    if order_like is None:
+        return None
+    if _order_status_token(order_like) not in _FILLED_ORDER_STATUSES:
+        return None
+    qty = getattr(order_like, "filled_quantity", None)
+    if qty is None:
+        qty = getattr(order_like, "filled_qty", None)
+    price = getattr(order_like, "filled_avg_price", None)
+    if price is None:
+        price = getattr(order_like, "avg_fill_price", None)
+    try:
+        qty_f = float(qty)
+        price_f = float(price)
+    except (TypeError, ValueError):
+        return None
+    if qty_f <= 0 or price_f <= 0:
+        return None
+    return qty_f, price_f
+
+
+def _order_fill_timestamp(order_like):
+    """Best-effort fill timestamp of a confirmed execution (None when absent)."""
+    for attr in ("filled_at", "updated_at", "created_at"):
+        value = getattr(order_like, attr, None)
+        if value is None:
+            continue
+        try:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+        except AttributeError:
+            continue
+        return value
+    return None
+
+
+def _order_side_token(order_like) -> str:
+    """Normalised side token ("BUY"/"SELL"/"") of an order-like object."""
+    raw = getattr(order_like, "side", None)
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        token = raw
+    else:
+        token = getattr(raw, "value", None) or str(raw)
+    if not isinstance(token, str):
+        return ""
+    return token.upper().rsplit(".", 1)[-1].strip()
 
 
 def _market_anchored_stop(
@@ -1741,7 +1820,16 @@ class LiveTrader:
         sym = symbol.upper()
         qty = int(qty)
         if qty <= 0:
-            logger.warning("🛡️  STOP %s: position too small for protective stop (qty < 1 share)", sym)
+            # Never a silent no-op: a "stop for 0 shares" protects nothing, it
+            # is how a phantom position hides, and it makes Alpaca reject the
+            # follow-on take-profit with the misleading 40310000 "potential
+            # wash trade detected" (2026-09-23 open: "SL=broker GTC stop x0").
+            logger.error(
+                "🚨 INCIDENT STOP %s: refusing to submit a protective stop for "
+                "qty=%s — zero shares protect nothing. A protective order may only "
+                "be placed for a broker-verified filled quantity.",
+                sym, qty,
+            )
             return False
 
         stop_side = "BUY" if is_short else "SELL"
@@ -1937,13 +2025,22 @@ class LiveTrader:
         )
         return False
 
-    async def _cancel_protective_stops(self, symbol: str) -> bool:
-        """Cancel all open orders for *symbol* (protective stops).
+    async def _cancel_protective_stops(
+        self, symbol: str, *, protective_only: bool = False, is_short: bool = False,
+    ) -> bool:
+        """Cancel open orders for *symbol* (protective stops).
 
         Called before closing a position so the GTC stop doesn't remain
         open after the position is gone (an orphaned SELL stop could later
-        trigger as an accidental short).  Returns True only when every
-        previously-open order for the symbol is confirmed gone.
+        trigger as an accidental short).  Returns True only when every order
+        this call tried to cancel is confirmed gone.
+
+        ``protective_only`` (used by the position-vanish path, 2026-09-23)
+        cancels ONLY orders that are protective for a position of side
+        ``is_short``: the sweep used to cancel EVERY open order for the
+        symbol, which killed a still-WORKING ENTRY order and reported it as
+        "Cancelled 1 protective order(s)".  Anything that is not a protective
+        stop is left alone and named in the log.
         """
         sym = symbol.upper()
         try:
@@ -1952,8 +2049,20 @@ class LiveTrader:
             logger.warning("Failed to fetch open orders for %s: %s", sym, exc)
             return False
 
-        cancelled = 0
+        to_cancel = []
         for o in open_orders:
+            if protective_only and not _order_is_protective_for(o, is_short):
+                logger.warning(
+                    "🛡️  KEEPING order %s for %s — not a protective %s stop; the "
+                    "vanish cleanup must never cancel a working entry order",
+                    str(getattr(o, "id", ""))[:8], sym,
+                    "BUY" if is_short else "SELL",
+                )
+                continue
+            to_cancel.append(o)
+
+        cancelled = 0
+        for o in to_cancel:
             try:
                 if await self.broker.cancel_order_and_wait(str(o.id)):
                     cancelled += 1
@@ -1967,7 +2076,7 @@ class LiveTrader:
             logger.info("🗑️  Cancelled %d protective order(s) for %s", cancelled, sym)
         remaining = await self.broker.get_open_orders()
         remaining_ids = {str(getattr(order, "id", "")) for order in remaining}
-        return not any(str(o.id) in remaining_ids for o in open_orders)
+        return not any(str(o.id) in remaining_ids for o in to_cancel)
 
     async def _ensure_protective_stops(self):
         """Ensure every inherited main position has a LIVE protective stop.
@@ -2052,8 +2161,35 @@ class LiveTrader:
                 sym, abs(pos.quantity), pos.entry_price,
                 " [short]" if is_short else "",
             )
+            # ONE RULE with _audit_position_protection (2026-09-23 review):
+            # the startup path anchors the backstop on the LIVE MARKET too —
+            # market * 1.06 (short) / * 0.94 (long).  An inherited position has
+            # usually drifted from its entry, where an entry-anchored level is
+            # either on the wrong side of the market (broker refuses it, the
+            # fast-fail path returns and the position is left bare) or a
+            # fraction of a percent from it (an immediate exit dressed up as a
+            # safety net).  A position whose entry band is spent gets the same
+            # loud ERROR the audit emits: closing it is a HUMAN decision.
+            market = await self._market_reference_price(sym)
+            entry_stop = _entry_anchored_stop(pos.entry_price, is_short)
+            if market is not None and _entry_anchor_is_spent(entry_stop, is_short, market):
+                logger.error(
+                    "🚨 PROTECTION GAP (startup): %s has moved BEYOND its "
+                    "entry-anchored %s%.0f%% band (entry $%.2f, entry band %s, live "
+                    "market $%.2f) — an entry-anchored stop there would be an "
+                    "immediate exit rather than a safety net; the stop placed now is "
+                    "MARKET-anchored %s%.0f%% ($%.2f) and a HUMAN should decide "
+                    "whether this position is worth holding at all",
+                    sym, "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100,
+                    pos.entry_price,
+                    f"${entry_stop:.2f}" if entry_stop is not None else "n/a",
+                    market, "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100,
+                    round(market * (1 + PROTECTIVE_STOP_PCT) if is_short
+                          else market * (1 - PROTECTIVE_STOP_PCT), 2),
+                )
             placed = await self._place_protective_stop(
                 sym, int(abs(pos.quantity)), pos.entry_price, is_short=is_short,
+                market_price=market, anchor="market",
             )
             if placed:
                 logger.info(
@@ -2234,6 +2370,11 @@ class LiveTrader:
             self._scalp_entries_day: str = ""
         if not hasattr(self, "_scalp_cap_warned"):
             self._scalp_cap_warned: set[str] = set()
+        if not hasattr(self, "_entry_order_ids"):
+            # sym -> the ENTRY order the recorded position came from.  Kept so
+            # a "position vanished" pass can tell "the entry never filled"
+            # (phantom position) apart from "the broker closed it" (2026-09-23).
+            self._entry_order_ids: dict[str, str] = {}
 
     # ── Entry accounting / fill resolution (2026-09-16 fix) ──────────
     def _scalp_entries_today(self, sym: str) -> int:
@@ -2320,6 +2461,185 @@ class LiveTrader:
             "signal-time price %.2f (last resort)", sym, float(fallback),
         )
         return float(fallback)
+
+    async def _broker_order_state(self, order_id: str):
+        """Re-read ONE order from the broker (``None`` when unreadable/absent).
+
+        The submission response is a snapshot taken before the broker had a
+        chance to match anything; every "did this actually execute?" decision
+        re-reads the order instead of trusting that snapshot.
+        """
+        if not order_id:
+            return None
+        getter = getattr(self.broker, "get_order", None)
+        if getter is None:
+            return None
+        try:
+            return await getter(order_id)
+        except Exception as exc:
+            logger.warning("Could not re-read order %s: %s", order_id, exc)
+            return None
+
+    async def _await_verified_entry_fill(
+        self, sym: str, result, requested_qty: float,
+    ) -> tuple[float, float] | None:
+        """Wait for the broker to CONFIRM the entry execution.
+
+        Returns ``(filled_qty, filled_avg_price)`` ONLY for a real fill, and
+        ``None`` when the order was rejected / canceled / expired, when the
+        broker cannot be polled, or when it was still working after
+        ``SCALP_ENTRY_FILL_TIMEOUT_SECONDS``.
+
+        This is the settlement barrier the stop placement always needed: at
+        the 2026-09-23 open Alpaca answered the submission with an "accepted"
+        order at 13:30:01.844 that it did not even submit until 13:30:08.104
+        and never filled, and the trader had already booked the position.
+        """
+        verified = _verified_fill_qty_price(result)
+        if verified is not None:
+            return verified
+        status = _order_status_token(result)
+        order_id = str(getattr(result, "order_id", "") or "")
+        if not is_order_alive(status) or not order_id:
+            return None
+        waiter = getattr(self.broker, "wait_for_order_fill", None)
+        if waiter is None:
+            logger.error(
+                "🚨 SCALP %s: entry order %s is NOT filled (status=%s) and the "
+                "broker cannot poll it — NO position recorded; if it does fill, "
+                "the next position sync adopts and protects it",
+                sym, order_id, status or "unknown",
+            )
+            return None
+        logger.info(
+            "⏳ SCALP %s: entry order %s is still WORKING (status=%s, filled_qty=0) "
+            "— waiting up to %.0fs for the broker to confirm the execution before "
+            "this becomes a position",
+            sym, order_id, status or "unknown", SCALP_ENTRY_FILL_TIMEOUT_SECONDS,
+        )
+        try:
+            filled = await waiter(
+                order_id,
+                timeout=SCALP_ENTRY_FILL_TIMEOUT_SECONDS,
+                poll_interval=SCALP_ENTRY_FILL_POLL_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("SCALP %s: fill poll for entry %s failed: %s", sym, order_id, exc)
+            return None
+        if filled is None or isinstance(filled, bool):
+            return None
+        verified = _verified_fill_qty_price(filled)
+        if verified is None:
+            logger.error(
+                "🚨 SCALP %s: the broker's poll of entry order %s returned "
+                "status=%s filled_qty=%s — not a verifiable execution; refusing to "
+                "record a position, place a stop or book P&L for it",
+                sym, order_id, _order_status_token(filled) or "unknown",
+                getattr(filled, "filled_quantity", None),
+            )
+            return None
+        logger.info(
+            "✅ SCALP %s: broker CONFIRMED the entry fill — %.6f shares @ $%.2f "
+            "(order %s, requested %.6f)",
+            sym, verified[0], verified[1], order_id, requested_qty,
+        )
+        return verified
+
+    async def _abandon_unfilled_entry(
+        self, sym: str, result, requested_qty: float, *, is_short: bool,
+    ) -> tuple[float, float] | None:
+        """Give up on an entry that never filled — record NOTHING for it.
+
+        The working order is cancelled (an unmanaged entry order can fill
+        later into a position no one protects) and the final state is
+        re-read.  If that read confirms a fill the cancel raced, the position
+        DOES exist at the broker and is returned to the caller to be adopted
+        and protected on the spot; otherwise this is a phantom entry and a
+        loud INCIDENT is logged — no position, no stop, no P&L.
+        """
+        status = _order_status_token(result)
+        order_id = str(getattr(result, "order_id", "") or "")
+        final = None
+        try:
+            if order_id and is_order_alive(status):
+                await self.broker.cancel_order_and_wait(order_id, timeout=5.0)
+            final = await self._broker_order_state(order_id)
+        except Exception as exc:
+            logger.warning(
+                "SCALP %s: could not cancel/verify the unfilled entry %s: %s",
+                sym, order_id or "?", exc,
+            )
+        verified = _verified_fill_qty_price(final)
+        if verified is not None:
+            logger.warning(
+                "⚠️  SCALP %s: entry %s FILLED (%s x %.2f) while it was being "
+                "abandoned — the broker DOES hold this position; adopting it and "
+                "placing its protective stop now",
+                sym, order_id or "?", verified[0], verified[1],
+            )
+            return verified
+        logger.error(
+            "🚨 INCIDENT SCALP %s: entry order %s (%s %.6f) NEVER FILLED — broker "
+            "status=%s, filled_qty=%s. NO position was recorded, NO protective "
+            "order was placed and NO P&L will be booked: the account never held "
+            "this position. Nothing to unwind.",
+            sym, order_id or "?", "SELL" if is_short else "BUY", requested_qty,
+            _order_status_token(final) or status or "unknown",
+            getattr(final, "filled_quantity", None),
+        )
+        return None
+
+    async def _verified_exit_execution(self, sym: str, pos) -> tuple[float, str] | None:
+        """The broker's OWN fill that CLOSED *pos*: ``(price, order_id)``.
+
+        Never "the most recent fill for this symbol" — that is what priced the
+        2026-09-23 phantom positions at the PREVIOUS session's executions
+        (NVDA 227.36, TSLA 376.96, COIN 200.11, all filled 2026-09-22) and
+        booked +97.78 of realised P&L on three trades that never happened.
+        Only an execution on the CLOSING side (BUY covers a short, SELL closes
+        a long) at or after the position was opened counts.
+        """
+        is_short = float(getattr(pos, "quantity", 0.0)) < 0
+        want_side = "BUY" if is_short else "SELL"
+        getter = getattr(self.broker, "get_recent_fills", None)
+        if getter is None:
+            return None
+        try:
+            fills = await getter(sym, limit=20)
+        except Exception as exc:
+            logger.warning("Exit-fill lookup for %s failed: %s", sym, exc)
+            return None
+        since = self._entry_times.get(sym)
+        best = None
+        best_ts = None
+        for o in fills or []:
+            if _verified_fill_qty_price(o) is None:
+                continue
+            if _order_side_token(o) != want_side:
+                continue
+            ts = _order_fill_timestamp(o)
+            if since is not None and ts is not None and ts < since:
+                continue
+            if best is None or (ts is not None and (best_ts is None or ts >= best_ts)):
+                best, best_ts = o, ts
+        if best is None:
+            return None
+        return _verified_fill_qty_price(best)[1], str(getattr(best, "id", "") or "")
+
+    async def _entry_order_ever_filled(self, sym: str) -> bool | None:
+        """``True``/``False`` when the recorded ENTRY order's state is readable.
+
+        ``None`` = unknown (no order id on record, or the broker could not be
+        asked).  This is what separates "the tracker held a position the
+        broker never had" from "the position genuinely closed at the broker".
+        """
+        order_id = getattr(self, "_entry_order_ids", {}).get(sym)
+        if not order_id:
+            return None
+        state = await self._broker_order_state(order_id)
+        if state is None:
+            return None
+        return _verified_fill_qty_price(state) is not None
 
     def _warn_no_broker_stop(self, sym: str, state: dict, entry: float) -> None:
         """Loud, rate-limited (default: per-minute) "no broker stop" warning.
@@ -2747,32 +3067,52 @@ class LiveTrader:
             if is_short:
                 self._record_short_rejection(sym, str(err))
             return False
-        self._last_signal_key[sym] = self._signal_key(signal)
-        self._record_scalp_entry(sym)
         if order_type == OrderType.MARKET:
-            # Anchor every SL/TP level to the ACTUAL fill, never the
-            # signal-time reference — MARKET fills land points away from the
-            # signal price on fast tape, which is how the stop ended up on
-            # the wrong side of the market (live COIN 2026-09-16).
-            fill_price = await self._resolve_fill_price(
-                sym, result,
-                current_price if current_price > 0 else signal.entry_price,
-            )
+            # ── VERIFIED FILL, OR NO POSITION AT ALL (2026-09-23) ──────
+            # A submission response is NOT an execution.  The 13:30Z open
+            # booked three positions (NVDA/TSLA/COIN) whose entry orders were
+            # still working at the broker, then admitted +102.90/-80.34/+75.22
+            # of P&L on them — the account was never in those trades.
+            # Until the broker CONFIRMS a fill there is no position here: no
+            # slot in the position limit, no protective order, no P&L.  The
+            # level anchor is the confirmed FILL, never the signal-time
+            # reference (MARKET fills land points away on fast tape; live
+            # COIN 2026-09-16 put the strategy stop on the wrong side).
+            fill = await self._await_verified_entry_fill(sym, result, qty)
+            if fill is None:
+                fill = await self._abandon_unfilled_entry(
+                    sym, result, qty, is_short=is_short,
+                )
+            if fill is None:
+                return False
+            filled_qty, fill_price = fill
+            self._last_signal_key[sym] = self._signal_key(signal)
+            self._record_scalp_entry(sym)
+            if filled_qty + 1e-9 < qty:
+                logger.warning(
+                    "⚠️  SCALP %s: only %.6f of %.6f shares filled — tracking and "
+                    "protecting the VERIFIED quantity only",
+                    sym, filled_qty, qty,
+                )
             self.pm.open_position(
-                sym, -qty if is_short else qty, fill_price,
+                sym, -filled_qty if is_short else filled_qty, fill_price,
                 stop_loss_price=signal.stop_loss,
                 take_profit_price=signal.take_profit,
             )
             self._entry_times[sym] = datetime.now(timezone.utc)
+            self._entry_order_ids[sym] = str(getattr(result, "order_id", "") or "")
             logger.info(
-                "📈 %s %s: %s @ $%.2f | qty=%.2f (%s%d%% equity%s) | strategy=%s",
+                "📈 %s %s: %s @ $%.2f | qty=%.2f (%s%d%% equity%s) | strategy=%s "
+                "[broker-verified fill]",
                 "SHORT" if is_short else "BUY", sym,
                 "MARKET" if order_type == OrderType.MARKET else "LIMIT",
-                fill_price, qty, "-" if is_short else "", POSITION_SIZE_PCT * 100,
+                fill_price, filled_qty, "-" if is_short else "", POSITION_SIZE_PCT * 100,
                 " BP-capped" if bp_capped else "", signal.strategy,
             )
-            await self._finalize_open_bundle(sym, qty, fill_price, signal)
+            await self._finalize_open_bundle(sym, filled_qty, fill_price, signal)
         else:
+            self._last_signal_key[sym] = self._signal_key(signal)
+            self._record_scalp_entry(sym)
             self._scalp_bundles[sym] = {
                 "qty": qty, "direction": "SHORT" if is_short else "LONG",
                 "sl": signal.stop_loss, "tp": signal.take_profit,
@@ -3204,6 +3544,7 @@ class LiveTrader:
         self._scalp_positions.pop(sym, None)
         self._scalp_bundles.pop(sym, None)
         self._last_signal_key.pop(sym, None)
+        self._entry_order_ids.pop(sym, None)
 
     # ── Per-tick position sync (limit fills, TP fills, orphan cleanup) ─
 
@@ -3239,23 +3580,69 @@ class LiveTrader:
                 continue
             if sym in by_sym:
                 continue
-            fill_price = await self.broker.get_last_fill_price(sym)
-            if fill_price is not None:
-                self.pm.close_position(sym, exit_price=fill_price, exit_reason="scalp_sync_removed")
+            pos = self.pm.get_positions().get(sym)
+            if pos is None:
+                continue
+            # ── VERIFIED EXIT OR NOTHING (2026-09-23) ──────────────────
+            # P&L is booked ONLY against an execution the broker actually
+            # reports for THIS position (15-25s after the open the account was
+            # credited with +102.90/-80.34/+75.22 from three trades that never
+            # happened, priced at the previous session's fills).
+            exit_fill = await self._verified_exit_execution(sym, pos)
+            if exit_fill is not None:
+                exit_price, exit_order_id = exit_fill
+                self.pm.close_position(
+                    sym, exit_price=exit_price, exit_reason="scalp_sync_removed")
+                logger.info(
+                    "👻 SCALP %s: position closed at the broker — booked P&L at the "
+                    "broker's VERIFIED exit fill $%.2f (order %s)",
+                    sym, exit_price, (exit_order_id or "?")[:8],
+                )
             else:
-                self.pm.discard_position(sym, reason="scalp_sync_removed_no_fill")
-            # Never leave an orphaned GTC stop after the position is gone.
+                # No execution to price it with — and NEVER "the most recent
+                # fill for the symbol", which is the previous session's
+                # execution.  "Never filled" and "genuinely gone" are told
+                # apart by the recorded ENTRY order's own state.
+                entry_filled = await self._entry_order_ever_filled(sym)
+                entry_order_id = getattr(self, "_entry_order_ids", {}).get(sym, "?")
+                if entry_filled is False:
+                    logger.error(
+                        "🚨 INCIDENT SCALP %s: the tracker held %s x %.2f @ $%.2f — a "
+                        "position the broker NEVER HAD: entry order %s reports "
+                        "filled_qty=0, so this entry NEVER FILLED. NO P&L booked, "
+                        "nothing to unwind, the account was never in this trade.",
+                        sym, "SHORT" if float(pos.quantity) < 0 else "LONG",
+                        abs(float(pos.quantity)), pos.entry_price, entry_order_id,
+                    )
+                else:
+                    logger.error(
+                        "🚨 INCIDENT SCALP %s: tracked %s x %.2f @ $%.2f has "
+                        "DISAPPEARED from the broker with NO verified execution to "
+                        "price it (entry order %s, entry fill %s) — REALISED P&L NOT "
+                        "BOOKED: an unverifiable exit is not a $0.00 exit. Reconcile "
+                        "this trade by hand at the broker.",
+                        sym, "SHORT" if float(pos.quantity) < 0 else "LONG",
+                        abs(float(pos.quantity)), pos.entry_price, entry_order_id,
+                        "confirmed" if entry_filled else "UNKNOWN",
+                    )
+                self.pm.discard_position(sym, reason="scalp_sync_removed_no_execution")
+            # Never leave an orphaned GTC stop after the position is gone —
+            # and ONLY the stop.  This cleanup used to cancel EVERY open order
+            # for the symbol, which is how it killed a still-WORKING entry
+            # order at the 2026-09-23 open (NVDA entry f1cc2e8d: status
+            # canceled, filled_qty=0) and then reported it as "Cancelled 1
+            # protective order(s) for NVDA".
             try:
-                await self._cancel_protective_stops(sym)
+                await self._cancel_protective_stops(
+                    sym, protective_only=True, is_short=float(pos.quantity) < 0)
             except Exception as exc:
                 logger.warning("Could not cancel leftover orders for %s: %s", sym, exc)
             self._entry_times.pop(sym, None)
             self._cooldown_until[sym] = time.monotonic() + SCALP_COOLDOWN_BARS * 60.0
             self._scalp_cleanup_state(sym)
             logger.info(
-                "👻 SCALP %s: position vanished from broker (fill=%s) — booked/cleaned, cooldown %dmin",
-                sym, f"{fill_price:.2f}" if fill_price is not None else "UNKNOWN",
-                SCALP_COOLDOWN_BARS,
+                "👻 SCALP %s: position gone from the broker — state cleaned, cooldown %dmin",
+                sym, SCALP_COOLDOWN_BARS,
             )
         # ── Added: limit-entry filled or inherited ──
         for sym, p in by_sym.items():
@@ -3300,7 +3687,13 @@ class LiveTrader:
                     "🛡️  SCALP %s: inherited position %s x %.2f @ $%.2f — placing default protective stop",
                     sym, sym, qty, price,
                 )
-                await self._place_protective_stop(sym, int(qty), price, is_short=False)
+                # The SIDE comes from the broker's SIGNED quantity, and the
+                # quantity is passed as a magnitude: `int(qty)` on a short is
+                # negative, which the placement refuses as "qty <= 0" and the
+                # position ends up with no stop at all.
+                await self._place_protective_stop(
+                    sym, int(abs(qty)), price, is_short=qty < 0, anchor="market",
+                )
 
         # ── Shrunk: a partial exit left a residual ────────────────────
         # A tracked position that lost shares on the broker (a partial fill
@@ -3391,6 +3784,7 @@ class LiveTrader:
         self._scalp_entries.clear()
         self._scalp_entries_day = ""
         self._scalp_cap_warned.clear()
+        self._entry_order_ids.clear()
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
         for symbol in list(self.pm.get_open_symbols()):

@@ -50,6 +50,11 @@ class OrderResult:
     status: str  # "filled", "partial", "rejected", ...
     created_at: datetime
     error_message: str | None = None
+    # When the broker says the order actually EXECUTED (None while it has not).
+    # Kept separate from created_at: an entry order can be created seconds
+    # before it is anything other than "accepted" (2026-09-23: created
+    # 13:30:01.844, submitted 13:30:08.104, never filled).
+    filled_at: datetime | None = None
 
 
 class Broker(ABC):
@@ -90,6 +95,26 @@ class Broker(ABC):
         broker implementations keep working without modification.
         """
         return None
+
+    async def get_order(self, order_id: str) -> "OrderResult | None":
+        """Return ONE order's CURRENT state, or ``None`` when unreadable.
+
+        Callers use this to ask the broker "did this order actually execute?"
+        instead of trusting the submission response.  The default returns
+        ``None`` (= "cannot tell"), which callers MUST treat as "no verified
+        execution" — never as a fill.
+        """
+        return None
+
+    async def get_recent_fills(self, symbol: str, limit: int = 20) -> list[OrderResult]:
+        """Return the most recent CLOSED orders for *symbol* (newest first).
+
+        Used to price a position that disappeared from the broker from the
+        execution that closed it — never from "the last fill for this symbol",
+        which can be the previous session's trade.  The default returns an
+        empty list, so callers book NO P&L rather than a fabricated one.
+        """
+        return []
 
     async def get_last_fill_price(self, symbol: str) -> float | None:
         """Return the average fill price of the most recent FILLED order

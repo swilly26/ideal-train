@@ -113,6 +113,14 @@ class FakeBroker:
     async def get_last_fill_price(self, symbol):
         return self.fill_price
 
+    async def get_recent_fills(self, symbol, limit=20):
+        """Broker fill history for *symbol* (empty unless a test sets it)."""
+        return [o for o in getattr(self, "recent_fills", [])
+                if str(getattr(o, "symbol", "")).upper() == symbol.upper()][:limit]
+
+    async def get_order(self, order_id):
+        return getattr(self, "order_states", {}).get(str(order_id))
+
     async def is_shortable(self, symbol):
         return self._shortable
 
@@ -478,14 +486,41 @@ class TestLimitPath:
         assert state["tp"] == 106.0 and state["tp_monitored"] is True
 
     @pytest.mark.asyncio
-    async def test_tp_fill_sync_books_pnl_and_starts_cooldown(self):
+    async def test_tp_fill_sync_books_pnl_at_the_verified_broker_fill(self):
+        """A vanished position is priced from its OWN execution (2026-09-23)."""
+        from src.execution.broker import OrderResult
         trader = _make_scalp_trader(FakeBroker())
         trader.pm.open_position("NVDA", 30.0, 100.0)
-        trader.broker.positions = {}  # position vanished → TP limit filled
+        trader._entry_times["NVDA"] = datetime.now(timezone.utc)
+        trader.broker.positions = {}  # position gone → its TP limit filled
+        trader.broker.recent_fills = [OrderResult(
+            order_id="tp-1", symbol="NVDA", side=OrderSide.SELL, quantity=30.0,
+            filled_quantity=30.0, filled_avg_price=106.0, status="filled",
+            created_at=datetime.now(timezone.utc),
+            filled_at=datetime.now(timezone.utc),
+        )]
         await trader._scalp_sync_positions()
         assert not trader.pm.has_position("NVDA")
+        assert trader.pm.get_realized_pnl() == pytest.approx(30.0 * (106.0 - 100.0))
         assert "NVDA" in trader._cooldown_until
         assert trader._scalp_positions.get("NVDA") is None  # state cleaned
+
+    @pytest.mark.asyncio
+    async def test_tp_fill_sync_books_nothing_without_a_verified_execution(
+        self, caplog,
+    ):
+        """No execution ⇒ no P&L (the stale `fill_price` is NOT the exit price)."""
+        trader = _make_scalp_trader(FakeBroker())
+        trader.pm.open_position("NVDA", 30.0, 100.0)
+        trader.broker.positions = {}   # gone, but the broker reports no fill
+
+        with caplog.at_level("ERROR", logger="live_trader"):
+            await trader._scalp_sync_positions()
+
+        assert not trader.pm.has_position("NVDA")
+        assert trader.pm.get_realized_pnl() == 0.0
+        assert "INCIDENT" in "\n".join(r.getMessage() for r in caplog.records)
+        assert "NVDA" in trader._cooldown_until
 
 
 # ---------------------------------------------------------------------------
