@@ -519,7 +519,11 @@ class TestProtectionAudit:
         assert "attempting placement now" in text
         stops = broker.live_stops("QQQ", is_short=True)
         assert len(stops) == 1
-        assert stops[0].stop_price == pytest.approx(round(745.74 * 1.06, 2))
+        # entry anchor 706.06 * 1.06 = 748.42 sits ABOVE the market (745.74),
+        # so it is the level used; a market anchor is only substituted when the
+        # entry anchor would land on the wrong side of the market.
+        assert stops[0].stop_price == pytest.approx(round(706.06 * 1.06, 2))
+        assert stops[0].stop_price > 745.74
 
     @pytest.mark.asyncio
     async def test_audit_reports_a_position_it_cannot_heal(self, caplog):
