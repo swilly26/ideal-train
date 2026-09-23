@@ -519,11 +519,43 @@ class TestProtectionAudit:
         assert "attempting placement now" in text
         stops = broker.live_stops("QQQ", is_short=True)
         assert len(stops) == 1
-        # entry anchor 706.06 * 1.06 = 748.42 sits ABOVE the market (745.74),
-        # so it is the level used; a market anchor is only substituted when the
-        # entry anchor would land on the wrong side of the market.
-        assert stops[0].stop_price == pytest.approx(round(706.06 * 1.06, 2))
+        # The audit protects the position FROM NOW, so its level is anchored on
+        # the LIVE MARKET: 745.74 * 1.06 = 790.48 (owner decision, 2026-09-23).
+        # The entry-anchored level (706.06 * 1.06 = 748.42) sits only 0.36%
+        # above the market — it would fill on the next tick, i.e. it is an
+        # immediate exit dressed up as a safety net, not protection.
+        assert stops[0].stop_price == pytest.approx(round(745.74 * 1.06, 2))
         assert stops[0].stop_price > 745.74
+        # ...and because this position has drifted out of its own risk band,
+        # the audit says so loudly: whether to close it is a HUMAN decision,
+        # while the market-anchored stop does the protecting.
+        assert "BEYOND its entry-anchored" in text
+        assert "a HUMAN should decide" in text
+
+    @pytest.mark.asyncio
+    async def test_audit_market_anchors_a_position_past_its_band(self, caplog):
+        """A short that has run past entry * 1.06 gets a market-anchored stop.
+
+        Its entry-anchored backstop (748.42) is BELOW the live market (800.00),
+        so the broker would refuse it (42210000) and the position would stay
+        naked.  The audit must anchor on the market and shout about the band.
+        """
+        broker = RestartBroker(positions=[{
+            "symbol": "QQQ", "qty": -23, "avg_entry_price": 706.06,
+            "current_price": 800.00,
+        }])
+        trader = _make_trader(broker)
+        trader.pm.open_position("QQQ", -23, 706.06)
+        with caplog.at_level("WARNING", logger="live_trader"):
+            unprotected = await trader._audit_position_protection(context="position sync")
+        assert unprotected == []
+        text = "\n".join(_messages(caplog))
+        assert "BEYOND its entry-anchored" in text
+        assert "a HUMAN should decide" in text
+        stops = broker.live_stops("QQQ", is_short=True)
+        assert len(stops) == 1
+        assert stops[0].stop_price == pytest.approx(round(800.00 * 1.06, 2))
+        assert stops[0].stop_price > 800.00
 
     @pytest.mark.asyncio
     async def test_audit_reports_a_position_it_cannot_heal(self, caplog):

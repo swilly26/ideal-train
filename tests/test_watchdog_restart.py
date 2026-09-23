@@ -29,8 +29,6 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import pytest
-
 import src.watchdog.policy as policy
 
 ENGINE = Path("/home/team/shared/engine")
@@ -41,8 +39,15 @@ SATURDAY_NOON = "2026-09-26T12:00:00"     # market closed
 WEDNESDAY_1500 = "2026-09-23T15:00:00"    # regular trading hours
 
 
-def _make_engine(tmp_path, *, live_pids="", turbo_pids="", live_age=60, turbo_age=60):
-    """Throwaway engine dir: logs, stub launchers, symlinked src, pids stub."""
+def _make_engine(tmp_path, *, live_pids="", turbo_pids="5252", live_age=60, turbo_age=60):
+    """Throwaway engine dir: logs, stub launchers, symlinked src, pids stub.
+
+    ``live_pids`` / ``turbo_pids`` are the pid lists the stub liveness command
+    reports.  The turbo trader is ALIVE by default so that a live-trader
+    assertion is never polluted by the turbo restart that an empty turbo_pids
+    would trigger; pass ``turbo_pids=""`` to model a dead turbo trader.
+    One line per pid; "PID@N" means "only on the Nth call".
+    """
     root = tmp_path / "engine"
     (root / "logs").mkdir(parents=True, exist_ok=True)
     (root / "src").symlink_to(ENGINE / "src")
@@ -84,8 +89,12 @@ def _make_engine(tmp_path, *, live_pids="", turbo_pids="", live_age=60, turbo_ag
     )
     state = root / "pids_state"
     state.mkdir(exist_ok=True)
-    (state / "live_pids").write_text(live_pids)
-    (state / "turbo_pids").write_text(turbo_pids)
+    # NOTE: the trailing newline is load-bearing.  The stub below feeds this
+    # file to `while read -r spec`; without a final newline `read` hits EOF on
+    # the first line, returns non-zero and the loop body never runs, so every
+    # trader looked dead and the real branches were never exercised.
+    (state / "live_pids").write_text(live_pids + "\n")
+    (state / "turbo_pids").write_text(turbo_pids + "\n")
     return root
 
 
@@ -162,15 +171,6 @@ class TestWatchdogScript:
         assert "but exempted" not in out["watchdog"]
         assert "MISSED SESSION" not in out["watchdog"]
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="shell/policy subprocess path not verified in this sandbox: the "
-               "script's Python policy helper did not produce a verdict when run "
-               "from a throwaway engine dir, so the stale/exemption/missed-session "
-               "branches fall back to the legacy stale-kill.  The verdict logic "
-               "itself is covered by TestGapCoversSession and "
-               "tests/test_watchdog_policy.py; this shell integration is UNVERIFIED.",
-    )
     def test_frozen_trader_during_market_hours_is_restarted(self, tmp_path):
         """Alive but silent for a long time during RTH -> restart, loudly."""
         root = _make_engine(tmp_path, live_pids="4242", live_age=1800)
@@ -180,15 +180,6 @@ class TestWatchdogScript:
         assert "stub launcher" in out["started"]
         assert "but exempted" not in out["watchdog"]
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="shell/policy subprocess path not verified in this sandbox: the "
-               "script's Python policy helper did not produce a verdict when run "
-               "from a throwaway engine dir, so the stale/exemption/missed-session "
-               "branches fall back to the legacy stale-kill.  The verdict logic "
-               "itself is covered by TestGapCoversSession and "
-               "tests/test_watchdog_policy.py; this shell integration is UNVERIFIED.",
-    )
     def test_stale_log_while_closed_and_alive_is_still_exempted(self, tmp_path):
         root = _make_engine(tmp_path, live_pids="4242", live_age=1200)
         _, out = _run(root, env_extra={"WATCHDOG_NOW": SATURDAY_NOON})
@@ -197,15 +188,6 @@ class TestWatchdogScript:
         assert out["started"] == ""
         assert "MISSED SESSION" not in out["watchdog"]
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="shell/policy subprocess path not verified in this sandbox: the "
-               "script's Python policy helper did not produce a verdict when run "
-               "from a throwaway engine dir, so the stale/exemption/missed-session "
-               "branches fall back to the legacy stale-kill.  The verdict logic "
-               "itself is covered by TestGapCoversSession and "
-               "tests/test_watchdog_policy.py; this shell integration is UNVERIFIED.",
-    )
     def test_missed_session_is_an_incident_not_a_quiet_exemption(self, tmp_path):
         root = _make_engine(tmp_path, live_pids="4242", live_age=130000)
         _, out = _run(root, env_extra={"WATCHDOG_NOW": SATURDAY_NOON})
@@ -217,15 +199,6 @@ class TestWatchdogScript:
         # but the incident is on the record.
         assert "but exempted" in out["watchdog"]
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="shell/policy subprocess path not verified in this sandbox: the "
-               "script's Python policy helper did not produce a verdict when run "
-               "from a throwaway engine dir, so the stale/exemption/missed-session "
-               "branches fall back to the legacy stale-kill.  The verdict logic "
-               "itself is covered by TestGapCoversSession and "
-               "tests/test_watchdog_policy.py; this shell integration is UNVERIFIED.",
-    )
     def test_exemption_cannot_hide_a_process_that_died_during_the_check(self, tmp_path):
         root = _make_engine(tmp_path, live_pids="4242@1", live_age=1200)
         _, out = _run(root, env_extra={"WATCHDOG_NOW": SATURDAY_NOON})
@@ -267,3 +240,26 @@ class TestWatchdogScript:
         assert "reason=process-not-running" in out["watchdog"]
         assert "stub launcher" in out["started"]
         assert "but exempted" not in out["watchdog"]
+
+    def test_a_broken_policy_helper_is_loud_and_on_the_record(self, tmp_path):
+        """If the policy helper cannot run, silence must not be read as "fine".
+
+        The helper owns the market-hours knowledge, so when it fails the
+        watchdog cannot tell a sleeping trader from a frozen one.  It keeps the
+        legacy fail-safe (restart) — but this path can restart a HEALTHY trader
+        while the market is closed, so it must be impossible to miss: a WARNING
+        in the log, a line in the incident file, and the gap scan (which is the
+        only thing that turns a swallowed session into an incident) must say
+        that a missed session cannot be ruled out.
+        """
+        root = _make_engine(tmp_path, live_pids="4242", live_age=1200)
+        missing = tmp_path / "no-such-python"
+        _, out = _run(root, env_extra={
+            "WATCHDOG_NOW": SATURDAY_NOON,
+            "WATCHDOG_PYTHON": str(missing),
+        })
+        assert "gap scan for live produced no verdict" in out["watchdog"]
+        assert "policy helper failed for live" in out["watchdog"]
+        assert "reason=policy-helper-failed" in out["watchdog"]
+        assert "GAP SCAN UNAVAILABLE" in out["incidents"]
+        assert "POLICY HELPER FAILED" in out["incidents"]
