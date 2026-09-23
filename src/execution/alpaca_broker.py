@@ -78,6 +78,22 @@ def account_equity(account: dict) -> float | None:
         return None
 
 
+def _as_datetime(value) -> datetime | None:
+    """Coerce an Alpaca timestamp (datetime or ISO string) to a datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            from dateutil.parser import parse as dt_parse
+
+            return dt_parse(value)
+        except Exception:
+            return None
+    return None
+
+
 class BrokerAuthenticationError(RuntimeError):
     """Raised when the broker cannot prove that its session is authenticated."""
 
@@ -594,6 +610,83 @@ class AlpacaBroker(Broker):
             return bool(asset.shortable)
         except (AttributeError, TypeError, ValueError):
             return None
+    async def get_order(self, order_id: str) -> OrderResult | None:
+        """Fetch ONE order's current state — ``None`` when it cannot be read.
+
+        Answers "did this order actually EXECUTE?" from the broker rather than
+        from the submission response, which is a snapshot taken before the
+        broker matched anything (2026-09-23: the trader booked three positions
+        whose entry orders had ``filled_qty == 0``).  Façade: the identifier may
+        be an order id OR one of our own client_order_id values (the
+        idempotency path stores the client id as the order id), so a failed id
+        lookup is retried as a client-id lookup.
+        """
+        if not order_id:
+            return None
+        try:
+            order = await self._run_with_timeout(
+                self._trading_client.get_order_by_id, order_id
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Order lookup for %s timed out after %.1fs", order_id, _API_TIMEOUT_SECONDS
+            )
+            return None
+        except Exception as exc:
+            logger.debug("Order id lookup for %s failed (%s) — trying client id", order_id, exc)
+            try:
+                order = await self._run_with_timeout(
+                    self._trading_client.get_order_by_client_id, order_id
+                )
+            except Exception as exc2:
+                logger.warning("Could not read order %s: %s", order_id, exc2)
+                return None
+        if order is None:
+            return None
+        try:
+            return self._map_order_result(order)
+        except Exception as exc:
+            logger.warning("Could not map order %s: %s", order_id, exc)
+            return None
+
+    async def get_recent_fills(self, symbol: str, limit: int = 20) -> list[OrderResult]:
+        """The most recent CLOSED orders for *symbol*, newest first.
+
+        The caller filters by status/side/time to find the execution that
+        closed a position.  Deliberately NOT ``get_last_fill_price``: "the last
+        fill for this symbol" is the previous session's trade when nothing has
+        filled today (2026-09-23 NVDA 227.36 / TSLA 376.96 / COIN 200.11 were
+        all 2026-09-22 executions used to price positions that never existed).
+        """
+        sym = symbol.upper()
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+
+            orders = await self._run_with_timeout(
+                self._trading_client.get_orders,
+                GetOrdersRequest(
+                    status=QueryOrderStatus.CLOSED,
+                    symbols=[sym],
+                    limit=max(1, int(limit)),
+                ),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Fill history fetch for %s timed out after %.1fs", sym, _API_TIMEOUT_SECONDS
+            )
+            return []
+        except Exception as exc:
+            logger.warning("Could not fetch fill history for %s: %s", sym, exc)
+            return []
+        out: list[OrderResult] = []
+        for order in orders or []:
+            try:
+                out.append(self._map_order_result(order))
+            except Exception as exc:
+                logger.warning("Could not map a fill-history order for %s: %s", sym, exc)
+        return out
+
     async def get_last_fill_price(self, symbol: str) -> float | None:
         """Return the average fill price of the most recent FILLED order
         for *symbol*, or ``None`` if none exists / the lookup failed.
@@ -702,6 +795,7 @@ class AlpacaBroker(Broker):
             ),
             status=str(alpaca_order.status).lower().removeprefix("orderstatus."),
             created_at=created,
+            filled_at=_as_datetime(getattr(alpaca_order, "filled_at", None)),
         )
 
     @staticmethod
