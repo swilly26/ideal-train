@@ -13,9 +13,10 @@ DEFECT 2 — a dead or silent trader goes unnoticed:
   the process check: a trader that is not running — dead, or a zombie the
   host never reaped — is restarted whatever the clock says.
 
-These tests run the REAL ``watchdog.sh`` against a throwaway engine dir
-(logs, stub launchers, a symlinked ``src``) and a stub process-liveness
-command, so nothing here can touch, kill or restart the live stack:
+These tests run the REAL ``watchdog.sh`` -- the copy in THIS tree, never
+the one at the live engine root -- against a throwaway engine dir (logs,
+stub launchers, a symlinked ``src``) and a stub process-liveness command,
+so nothing here can touch, kill or restart the live stack:
 
 * ``ALGOFLOW_ENGINE_DIR``     redirects every path the script writes to;
 * ``WATCHDOG_PIDS_CMD``       replaces the pgrep scan (and the kill list);
@@ -31,8 +32,14 @@ from zoneinfo import ZoneInfo
 
 import src.watchdog.policy as policy
 
+#: The LIVE engine root -- kept only so the docstring below stays honest.
 ENGINE = Path("/home/team/shared/engine")
-SCRIPT = os.environ.get("WATCHDOG_SCRIPT", f"{ENGINE}/watchdog.sh")
+#: The tree under test.  The script executed MUST come from here, never
+#: from the live root: on 2026-09-23 a suite run executed
+#: /home/team/shared/engine/watchdog.sh (the production copy, which
+#: ignores ALGOFLOW_ENGINE_DIR) and restarted the live traders 61 times.
+TREE = Path(__file__).resolve().parents[1]
+SCRIPT = os.environ.get("WATCHDOG_SCRIPT", f"{TREE}/watchdog.sh")
 NY = ZoneInfo("America/New_York")
 
 SATURDAY_NOON = "2026-09-26T12:00:00"     # market closed
