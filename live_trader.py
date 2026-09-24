@@ -159,6 +159,24 @@ SCALP_STOP_MIN_DISTANCE_ABS = float(
     os.environ.get("SCALP_STOP_MIN_DISTANCE_ABS", "0.01"))     # or 1 cent
 # Cadence (seconds) of the loud "position has NO broker stop" warning.
 SCALP_NO_STOP_WARN_SECONDS = float(os.environ.get("SCALP_NO_STOP_WARN_SECONDS", "60"))
+# ── Verified-fill entry gate (2026-09-23) ─────────────────────────────
+# Live defect at the 13:30Z open: the trader recorded NVDA/TSLA/COIN as
+# positions, tried to protect them and BOOKED P&L for them, although the
+# broker never filled a single entry order.  The orders were still working
+# (six to ten seconds of broker-side created_at -> submitted_at lag at the
+# open, then no match at all), our own "position vanished" cleanup CANCELED
+# them, and the phantom P&L was priced from the PREVIOUS session's fills
+# (NVDA 227.36, TSLA 376.96, COIN 200.11 -- every one of them a 2026-09-22
+# execution).  A position therefore exists only after a VERIFIED fill,
+# whatever the submission response claimed:
+#   * the broker reports filled / partially_filled, AND
+#   * it carries a real filled_qty AND a real filled_avg_price.
+# An entry still working after this window is abandoned (cancelled) and is
+# never recorded as a position.
+SCALP_ENTRY_FILL_TIMEOUT_SECONDS = float(
+    os.environ.get("SCALP_ENTRY_FILL_TIMEOUT_SECONDS", "12"))
+SCALP_ENTRY_FILL_POLL_SECONDS = float(
+    os.environ.get("SCALP_ENTRY_FILL_POLL_SECONDS", "0.5"))
 # Re-entry churn cap: max ScalpSet ENTRY ORDERS submitted per symbol per
 # trading day (<= 0 disables).  Prevents the COIN-style loop where a setup
 # re-emits every cooldown and re-enters after every stop-out.
@@ -527,6 +545,244 @@ def _order_matches_side(o, side: str) -> bool:
     return str(getattr(o, "side", "")).upper().endswith(str(side).upper())
 
 
+# ── Order liveness: a cancelling order is NOT protection ──────────────────
+# 2026-09-22 incident: the boot-time stale-order sweep cancelled the META and
+# QQQ protective stops; the broker pinned both PENDING_CANCEL (10s cancel
+# timeout each), the coverage check counted those *cancelling* orders as
+# protection ("existing BUY stop found; not submitting duplicate") and the two
+# shorts then sat with no protective order at the broker for 34 hours.
+_DEAD_ORDER_STATUSES = frozenset({
+    "CANCELED", "CANCELLED", "PENDING_CANCEL", "REJECTED", "EXPIRED",
+    "REPLACED", "DONE_FOR_DAY", "FILLED", "STOPPED", "SUSPENDED",
+})
+
+# How many times a stop may be re-anchored onto the live market within one
+# placement call before we give up loudly (never silently).
+_MAX_MARKET_REANCHORS = 2
+
+
+def _order_status_token(o) -> str:
+    """Normalised status token for an open-order object ("" when absent).
+
+    Accepts Alpaca's ``OrderStatus`` enum (``str()`` == ``OrderStatus.NEW``)
+    as well as plain strings.  Anything that is not a textual status (a test
+    double, a broker payload without one) yields "" = "unknown".
+    """
+    raw = getattr(o, "status", None)
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        token = raw
+    else:
+        value = getattr(raw, "value", None)
+        if isinstance(value, str):
+            token = value
+        else:
+            return ""
+    token = str(token).upper()
+    if "." in token:
+        token = token.rsplit(".", 1)[-1]
+    return token.strip()
+
+
+def _order_is_live_working(o) -> bool:
+    """True only when the broker says this order is STILL WORKING.
+
+    PENDING_CANCEL / CANCELED / REJECTED / EXPIRED (every terminal state) are
+    not protection: counting them as coverage is exactly how two short
+    positions were left naked for 34 hours (2026-09-22).  An order object that
+    carries no recognisable status at all is treated as live — the
+    conservative direction (never place a duplicate stop) and the only
+    behaviour possible for a broker payload that does not report status.
+    """
+    token = _order_status_token(o)
+    if not token:
+        return True
+    return token not in _DEAD_ORDER_STATUSES
+
+
+def _order_has_type_metadata(o) -> bool:
+    """True when the object states its order type (Alpaca always does)."""
+    otype = getattr(o, "type", None)
+    if isinstance(otype, str):
+        return True
+    return isinstance(getattr(otype, "value", None), str)
+
+
+def _order_is_stop_like(o) -> bool:
+    """True for a STOP-like order: recognised stop metadata, or an order whose
+    type this code cannot read at all (legacy/partial payloads).
+
+    A KNOWN non-stop type (a market/limit order) is never stop-like: a working
+    opposite-side *exit* order must not be mistaken for protection.
+    """
+    if _order_is_limit(o):
+        return False
+    return _order_is_stop(o) or not _order_has_type_metadata(o)
+
+
+def _order_is_protective_for(o, is_short: bool) -> bool:
+    """True when *o* is a LIVE, correctly-sided, working protective stop.
+
+    Direction-aware — a BUY stop protects a short, a SELL stop protects a long
+    — and stop-only: a resting limit (take-profit / entry) or a market order
+    is not protection.
+    """
+    if not _order_is_live_working(o):
+        return False
+    want = "BUY" if is_short else "SELL"
+    if not _order_matches_side(o, want):
+        return False
+    return _order_is_stop_like(o)
+
+
+# Order statuses that mean "the broker confirms an EXECUTION".
+_FILLED_ORDER_STATUSES = frozenset({"FILLED", "PARTIALLY_FILLED"})
+
+
+def _verified_fill_qty_price(order_like) -> tuple[float, float] | None:
+    """``(filled_qty, avg_fill_price)`` for a BROKER-CONFIRMED execution.
+
+    ``None`` for everything else.  A submission that is merely accepted, new,
+    pending, rejected, canceled or expired is NOT a fill, however alive the
+    order looks — 2026-09-23: the open booked three positions whose entry
+    orders had ``filled_qty == 0`` and had never touched the account.
+    """
+    if order_like is None:
+        return None
+    if _order_status_token(order_like) not in _FILLED_ORDER_STATUSES:
+        return None
+    qty = getattr(order_like, "filled_quantity", None)
+    if qty is None:
+        qty = getattr(order_like, "filled_qty", None)
+    price = getattr(order_like, "filled_avg_price", None)
+    if price is None:
+        price = getattr(order_like, "avg_fill_price", None)
+    try:
+        qty_f = float(qty)
+        price_f = float(price)
+    except (TypeError, ValueError):
+        return None
+    if qty_f <= 0 or price_f <= 0:
+        return None
+    return qty_f, price_f
+
+
+def _order_fill_timestamp(order_like):
+    """Best-effort fill timestamp of a confirmed execution (None when absent)."""
+    for attr in ("filled_at", "updated_at", "created_at"):
+        value = getattr(order_like, attr, None)
+        if value is None:
+            continue
+        try:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+        except AttributeError:
+            continue
+        return value
+    return None
+
+
+def _order_side_token(order_like) -> str:
+    """Normalised side token ("BUY"/"SELL"/"") of an order-like object."""
+    raw = getattr(order_like, "side", None)
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        token = raw
+    else:
+        token = getattr(raw, "value", None) or str(raw)
+    if not isinstance(token, str):
+        return ""
+    return token.upper().rsplit(".", 1)[-1].strip()
+
+
+def _market_anchored_stop(
+    market_price, is_short: bool, pct: float | None = None,
+) -> float | None:
+    """A backstop level anchored to the LIVE MARKET (None when unusable).
+
+    Short -> market * (1 + pct) (above the market), long -> market * (1 - pct)
+    (below it).  Never entry-anchored: on a position that has run against us
+    the entry anchor lands on the wrong side of the market, the broker rejects
+    it (42210000) and the position is left with no stop at all.
+    """
+    if pct is None:
+        pct = PROTECTIVE_STOP_PCT
+    if isinstance(market_price, bool) or not isinstance(market_price, (int, float)):
+        return None
+    if float(market_price) <= 0:
+        return None
+    level = float(market_price) * (1 + pct) if is_short else float(market_price) * (1 - pct)
+    return round(level, 2)
+
+
+def _stop_on_wrong_side(stop_price, is_short: bool, market_price) -> bool:
+    """True when *stop_price* is not on the protective side of the market.
+
+    A short's BUY stop must sit ABOVE the market; a long's SELL stop must sit
+    BELOW it.  Without a usable market price the answer is False (unknown, so
+    nothing is re-anchored on a guess).
+    """
+    if isinstance(market_price, bool) or not isinstance(market_price, (int, float)):
+        return False
+    if float(market_price) <= 0:
+        return False
+    if isinstance(stop_price, bool) or not isinstance(stop_price, (int, float)):
+        return False
+    if is_short:
+        return float(stop_price) <= float(market_price)
+    return float(stop_price) >= float(market_price)
+
+
+# The protection audit (see _audit_position_protection) protects a position
+# FROM NOW: it is the last line of defence for a position the broker still
+# holds, so it always anchors the stop on the LIVE MARKET.  An entry-anchored
+# level is the wrong anchor once a position has drifted (2026-09-23: a naked
+# QQQ short at market 745.74 with entry 706.06 was about to be "protected" by
+# the entry-anchored 748.42 — a fraction of a percent away, i.e. an immediate
+# exit dressed up as a safety net).  A drifted position is additionally
+# reported loudly, because closing it is a HUMAN decision, not the audit's.
+AUDIT_ENTRY_ANCHOR_DEADZONE_PCT = 0.01   # <1% from market = an immediate exit
+
+
+def _entry_anchored_stop(entry_price, is_short: bool, pct: float | None = None):
+    """The entry-anchored backstop level (None when it cannot be derived).
+
+    Kept only as a fallback for the audit when the live market price cannot be
+    read; new placements that must protect a position *now* use
+    ``_market_anchored_stop`` instead.
+    """
+    if pct is None:
+        pct = PROTECTIVE_STOP_PCT
+    if isinstance(entry_price, bool) or not isinstance(entry_price, (int, float)):
+        return None
+    if float(entry_price) <= 0:
+        return None
+    price = (float(entry_price) * (1 + pct) if is_short
+             else float(entry_price) * (1 - pct))
+    return round(price, 2)
+
+
+def _entry_anchor_is_spent(entry_stop, is_short: bool, market_price) -> bool:
+    """True when the entry-anchored backstop is no longer a safety net.
+
+    Either it sits on the wrong side of the live market, or it sits so close to
+    it that it would fill on the next tick.  Without a usable market price the
+    answer is False (never call a position spent on a guess).
+    """
+    if _stop_on_wrong_side(entry_stop, is_short, market_price):
+        return True
+    if isinstance(market_price, bool) or not isinstance(market_price, (int, float)):
+        return False
+    if isinstance(entry_stop, bool) or not isinstance(entry_stop, (int, float)):
+        return False
+    market = float(market_price)
+    if market <= 0:
+        return False
+    return abs(market - float(entry_stop)) / market < AUDIT_ENTRY_ANCHOR_DEADZONE_PCT
+
+
 # ── Short-rejection classification + BP-capped sizing (turbo #29 lessons) ──
 
 def _rejection_kind(error_message: str | None) -> str:
@@ -858,13 +1114,17 @@ class LiveTrader:
 
         # ── Layer 4: Cancel stale orders from prior sessions ─────────
         logger.info("Cancelling any stale orders from prior sessions…")
-        cancelled = await self.broker.cancel_orders_by_client_id_prefix("algoflow_MAIN_")
+        cancelled = await self._cancel_stale_orders()
         logger.info(f"Cancelled {cancelled} stale order(s)")
-        remaining = await self.broker.get_open_orders()
-        stale_cancel_unconfirmed = any(
-            str(getattr(o, "client_order_id", "")).startswith("algoflow_MAIN_")
-            for o in remaining
-        )
+        # The sweep tells us which of OUR orders it could not confirm as
+        # cancelled.  Deriving this from the open-order book instead (as this
+        # code used to) is unsafe: an order whose type metadata cannot be read
+        # counts as "stop-like", so an unconfirmed cancel looked like a kept
+        # protective stop and the deferral never fired (2026-09-23).  A
+        # protective stop the sweep deliberately KEEPS is not an unconfirmed
+        # cancel and must not defer the cleanup on every boot.
+        unconfirmed = list(getattr(self, "_stale_cancel_unconfirmed", []) or [])
+        stale_cancel_unconfirmed = bool(unconfirmed)
         if stale_cancel_unconfirmed:
             # A leftover order the broker pins as "pending cancel" (e.g. a
             # cancel was in flight when a previous host died) answers every
@@ -872,13 +1132,15 @@ class LiveTrader:
             # That must NOT kill the boot: the order is already being
             # cancelled at the broker, so we skip only the post-startup
             # position-cleanup step (its intent was to liquidate leftovers
-            # whose orders we expected to be gone) and continue the normal
-            # boot — sync positions, re-place protective stops, wait for
-            # market. Mirror of the turbo trader's tolerant handling.
+            # whose orders we expected to be gone, and a still-live order can
+            # collide with the liquidation) and continue the normal boot —
+            # sync positions, re-place protective stops, wait for market.
+            # Mirror of the turbo trader's tolerant handling.
             logger.warning(
-                "Stale order cancellation was not confirmed — deferring post-startup "
-                "position cleanup; continuing boot (positions will be synced and "
-                "protective stops re-placed)"
+                "Stale order cancellation was not confirmed for %d order(s) (%s) — "
+                "deferring post-startup position cleanup; continuing boot (positions "
+                "will be synced and protective stops re-placed)",
+                len(unconfirmed), ", ".join(u[:8] for u in unconfirmed),
             )
 
         # ── Layer 2: Sync positions from Alpaca at startup ───────────
@@ -1224,6 +1486,96 @@ class LiveTrader:
             len(broker_symbols), added, removed,
         )
 
+    async def _cancel_stale_orders(self) -> int:
+        """Boot sweep of OUR stale orders — never a live protective stop.
+
+        Structural fix for the 2026-09-22 incident: the sweep used to cancel
+        every ``algoflow_MAIN_`` order, which included the protective stops of
+        positions we had just inherited.  The two cancelled stops got pinned
+        PENDING_CANCEL, the protection check then counted those cancelling
+        orders as coverage, and the positions sat naked for 34 hours.  The
+        sweep and the protection check must never disagree about the same
+        order, so the sweep simply does not touch an order that is a
+        protective stop for a position the broker still holds.
+
+        Returns the number of orders cancelled.  When the held positions
+        cannot be read, NO order that looks like a protective stop is
+        cancelled (fail safe: leaving a stale stop is recoverable, leaving a
+        position naked is not).
+
+        Side effect (2026-09-23): every order whose cancellation was NOT
+        confirmed is recorded in ``self._stale_cancel_unconfirmed``.  That is
+        the signal ``run()`` uses to defer the post-startup position cleanup:
+        an order still live at the broker may collide with (or wash-trade) a
+        liquidating order for the same symbol, and it may be a protective stop
+        the broker has not finished cancelling.  The signal must come from the
+        sweep itself — re-deriving it from the open-order book mis-read any
+        order whose type metadata cannot be parsed as "stop-like" and so let an
+        unconfirmed cancel slip through (2026-09-23 regression).
+        """
+        prefix = "algoflow_MAIN_"
+        self._stale_cancel_unconfirmed: list[str] = []
+        try:
+            open_orders = await self.broker.get_open_orders()
+        except Exception as exc:
+            logger.warning(
+                "Stale-order sweep: cannot read open orders (%s) — nothing cancelled", exc,
+            )
+            return 0
+        held: set[str] = set()
+        positions_known = True
+        try:
+            held = {
+                str(p.get("symbol", "")).upper()
+                for p in await self.broker.get_positions()
+            }
+        except Exception as exc:
+            positions_known = False
+            logger.warning(
+                "Stale-order sweep: cannot read broker positions (%s) — no order that "
+                "looks like a protective stop will be cancelled on this boot", exc,
+            )
+        cancelled, kept = 0, []
+        for o in open_orders:
+            cid = str(getattr(o, "client_order_id", "") or "")
+            if not cid.startswith(prefix):
+                continue
+            sym = str(getattr(o, "symbol", "")).upper()
+            # Stop-like (see _order_is_stop_like): never cancel one while the
+            # position it protects is still held.
+            protective = _order_is_stop_like(o)
+            if protective and (not positions_known or sym in held):
+                kept.append(sym)
+                logger.info(
+                    "🛡️  stale-order sweep: KEEPING protective order %s for held position "
+                    "%s (a stop protecting a live position is never stale)",
+                    str(getattr(o, "id", ""))[:8], sym,
+                )
+                continue
+            try:
+                confirmed = await self.broker.cancel_order_and_wait(str(o.id))
+            except Exception as exc:
+                confirmed = False
+                logger.warning(
+                    "stale-order sweep: cancel of order %s failed: %s",
+                    str(getattr(o, "id", ""))[:8], exc,
+                )
+            if confirmed:
+                cancelled += 1
+            else:
+                self._stale_cancel_unconfirmed.append(str(getattr(o, "id", "") or "?"))
+                logger.warning(
+                    "stale-order sweep: cancellation of order %s (%s) was NOT "
+                    "confirmed — it may still be live at the broker",
+                    str(getattr(o, "id", ""))[:8], cid or "no client id",
+                )
+        if kept:
+            logger.info(
+                "🛡️  stale-order sweep kept %d protective stop(s) for held positions: %s",
+                len(kept), ", ".join(sorted(set(kept))),
+            )
+        return cancelled
+
     # ── Post-startup stale position cleanup ────────────────────────────
 
     async def _post_startup_cleanup(self):
@@ -1362,6 +1714,55 @@ class LiveTrader:
 
     # ── Broker-level protective stops ────────────────────────────────
 
+    async def _market_reference_price(self, symbol: str) -> float | None:
+        """Best-effort LIVE market price for *symbol* (None when unknown).
+
+        Source: the broker's own position mark (``current_price``), which is
+        refreshed on every call.  Deliberately NOT the entry price and NOT a
+        historical fill: an entry-anchored level is exactly what leaves a
+        losing inherited position unprotected (2026-09-22 AVGO).
+        """
+        sym = symbol.upper()
+        try:
+            positions = await self.broker.get_positions()
+        except Exception as exc:
+            logger.warning("Market reference for %s: position fetch failed (%s)", sym, exc)
+            return None
+        for p in positions or []:
+            try:
+                if str(p.get("symbol", "")).upper() != sym:
+                    continue
+                price = p.get("current_price")
+            except Exception:
+                continue
+            if isinstance(price, bool) or not isinstance(price, (int, float)):
+                continue
+            if float(price) > 0:
+                return float(price)
+        return None
+
+    def _unprotected_store(self) -> set:
+        store = getattr(self, "_unprotected_symbols", None)
+        if store is None:
+            store = set()
+            self._unprotected_symbols = store
+        return store
+
+    def _mark_unprotected(self, symbol: str, detail: str) -> None:
+        """Record + shout about a held position with NO live broker stop."""
+        sym = symbol.upper()
+        self._unprotected_store().add(sym)
+        logger.error(
+            "🚨 UNPROTECTED %s: no live protective stop at the broker — %s",
+            sym, detail,
+        )
+
+    def _mark_protected(self, symbol: str, stop_price: float | None = None) -> None:
+        """Clear the unprotected marker for a symbol whose stop is live."""
+        self._unprotected_store().discard(symbol.upper())
+        if stop_price is not None:
+            logger.debug("🛡️  %s: protection restored at $%.2f", symbol.upper(), stop_price)
+
     async def _place_protective_stop(
         self,
         symbol: str,
@@ -1371,6 +1772,8 @@ class LiveTrader:
         initial_delay: float = STOP_PLACEMENT_INITIAL_DELAY,
         is_short: bool = False,
         stop_price: float | None = None,
+        market_price: float | None = None,
+        anchor: str = "entry",
     ) -> bool:
         """Place a GTC protective stop-loss order at the broker.
 
@@ -1384,6 +1787,17 @@ class LiveTrader:
         placed EXACTLY at that level — the strategy's risk-defined SL — and
         the -6% backstop is used only when it is ``None``.  Passed through
         for every scalp entry so teardown stops reconcile with strategy risk.
+
+        ``anchor`` (2026-09-23) selects the anchor for a backstop
+        (``stop_price is None``):
+          ``"entry"``  — entry * (1 ± 6%), the position's own risk level; the
+                         level is re-anchored to the market only when it lands
+                         on the wrong side of it.  This is the entry path.
+          ``"market"`` — market * (1 ± 6%), i.e. protection measured from the
+                         live price.  Used by the protection audit, which
+                         guards a position that already drifted from its entry
+                         (an entry anchor there is a fraction of a percent from
+                         the market = an immediate exit, not a safety net).
 
         ScalpSet callers pass the level ALREADY ANCHORED TO THE FILL
         (``_finalize_open_bundle`` → ``anchor_scalp_levels``), including the
@@ -1406,13 +1820,53 @@ class LiveTrader:
         sym = symbol.upper()
         qty = int(qty)
         if qty <= 0:
-            logger.warning("🛡️  STOP %s: position too small for protective stop (qty < 1 share)", sym)
+            # Never a silent no-op: a "stop for 0 shares" protects nothing, it
+            # is how a phantom position hides, and it makes Alpaca reject the
+            # follow-on take-profit with the misleading 40310000 "potential
+            # wash trade detected" (2026-09-23 open: "SL=broker GTC stop x0").
+            logger.error(
+                "🚨 INCIDENT STOP %s: refusing to submit a protective stop for "
+                "qty=%s — zero shares protect nothing. A protective order may only "
+                "be placed for a broker-verified filled quantity.",
+                sym, qty,
+            )
             return False
 
         stop_side = "BUY" if is_short else "SELL"
         entry_side = "SELL" if is_short else "BUY"
+        entry_anchored = stop_price is None
         if stop_price is not None:
             origin = "strategy SL"
+        elif anchor == "market":
+            # Market-anchored backstop: the level must protect the position
+            # from NOW, not reproduce its entry risk.
+            if market_price is None:
+                market_price = await self._market_reference_price(sym)
+            anchored = _market_anchored_stop(market_price, is_short)
+            if anchored is None:
+                logger.warning(
+                    "🛡️  STOP %s: no live market reference — falling back to the "
+                    "entry-anchored backstop", sym,
+                )
+                stop_price = _entry_anchored_stop(entry_price, is_short)
+                if stop_price is None:
+                    logger.error(
+                        "🛡️  STOP %s: cannot derive any protective level "
+                        "(entry=%s, market UNKNOWN) — position stays unprotected",
+                        sym, entry_price,
+                    )
+                    self._mark_unprotected(
+                        sym,
+                        "neither the live market nor the entry price yielded a "
+                        "usable protective level",
+                    )
+                    return False
+                origin = (f"backstop entry {('+' if is_short else '-')}"
+                          f"{PROTECTIVE_STOP_PCT * 100:.0f}% (no market reference)")
+            else:
+                stop_price = anchored
+                origin = ("market-anchored backstop "
+                          f"{('+' if is_short else '-')}{PROTECTIVE_STOP_PCT * 100:.0f}%")
         else:
             stop_price = round(
                 entry_price * (1 + PROTECTIVE_STOP_PCT) if is_short
@@ -1421,6 +1875,34 @@ class LiveTrader:
             )
             origin = f"backstop entry {('+' if is_short else '-')}{PROTECTIVE_STOP_PCT * 100:.0f}%"
         stop_price = round(float(stop_price), 2)
+
+        # ── Side-aware, MARKET-anchored backstop (2026-09-22) ──────────
+        # A position re-synced after a restart can be far past its entry:
+        # the live AVGO short had entry 337.75 and market 361.10, so the
+        # entry-anchored backstop (337.75 * 1.06 = 358.02) sat BELOW the
+        # market, Alpaca answered 42210000, the fast-fail path returned and
+        # the short was left with no protective order at all.  Any
+        # entry-derived level that lands on the wrong side of the live market
+        # is re-anchored to the MARKET, never kept.  A strategy-provided SL is
+        # left alone here (its geometry is the strategy's business); it is
+        # re-anchored only if the broker actually rejects it as invalid.
+        if entry_anchored and market_price is None:
+            market_price = await self._market_reference_price(sym)
+        if _stop_on_wrong_side(stop_price, is_short, market_price):
+            anchored = _market_anchored_stop(market_price, is_short)
+            if anchored is not None:
+                logger.warning(
+                    "🛡️  STOP %s: level $%.2f (%s) is on the WRONG side of the live "
+                    "market $%.2f for a %s — re-anchoring to the market %s%.0f%% = "
+                    "$%.2f so the position is not left unprotected",
+                    sym, stop_price, origin, float(market_price),
+                    "SHORT" if is_short else "LONG",
+                    "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100, anchored,
+                )
+                stop_price = anchored
+                origin = ("market-anchored backstop "
+                          f"{('+' if is_short else '-')}{PROTECTIVE_STOP_PCT * 100:.0f}%")
+        reanchors_used = 0
 
         for attempt in range(1, max_attempts + 1):
             # ── Re-check the symbol's open orders before each attempt ──
@@ -1432,18 +1914,20 @@ class LiveTrader:
                 # A same-side STOP (or, for legacy order objects that don't
                 # expose stop metadata, a plain same-side order) means the
                 # stop is already there.  A same-side LIMIT (scalp TP day
-                # limit) never counts as a stop.
+                # limit) never counts as a stop, and neither does a
+                # cancelling/terminal order: a PENDING_CANCEL stop is NOT
+                # protection (2026-09-22 — two shorts naked for 34h).
                 stop_present = any(
-                    _order_matches_side(o, stop_side)
-                    and (_order_is_stop(o) or not _order_is_limit(o))
-                    for o in existing
+                    _order_is_protective_for(o, is_short) for o in existing
                 )
                 if stop_present:
                     logger.info("🛡️  STOP %s: existing %s stop found; not submitting duplicate",
                                 sym, stop_side)
                     return True
                 entry_open = any(
-                    _order_matches_side(o, entry_side) and not _order_is_stop(o)
+                    _order_is_live_working(o)
+                    and _order_matches_side(o, entry_side)
+                    and not _order_is_stop(o)
                     for o in existing
                 )
                 if entry_open:
@@ -1474,20 +1958,53 @@ class LiveTrader:
                     sym, stop_side, stop_price, origin, entry_price,
                     " [SHORT]" if is_short else "",
                 )
+                self._mark_protected(sym, stop_price)
                 return True
             except Exception as exc:
                 if _is_invalid_stop_level_error(exc):
-                    # PERMANENT for this price: the stop sits on the wrong
-                    # side of the live market price (stale signal reference —
-                    # the live COIN 2026-09-16 defect).  Retrying the same
-                    # level only hammers the broker, so log ONCE and stop;
-                    # the in-process SL (anchored to the fill) stays active.
+                    # The level sits on the wrong side of the live market
+                    # (the live COIN 2026-09-16 loop, and the AVGO short after
+                    # the 2026-09-22 restart).  Fast-failing here is what left
+                    # the position with NO broker stop, so: re-anchor onto the
+                    # market and try again; only give up — loudly, and with the
+                    # position explicitly marked unprotected — when even that
+                    # is impossible.
+                    fresh = await self._market_reference_price(sym)
+                    anchored = _market_anchored_stop(fresh, is_short)
+                    if (
+                        anchored is not None
+                        and anchored != stop_price
+                        and reanchors_used < _MAX_MARKET_REANCHORS
+                        and attempt < max_attempts
+                    ):
+                        reanchors_used += 1
+                        logger.error(
+                            "🛡️  STOP %s: INVALID-LEVEL rejection (attempt %d/%d) — %s. "
+                            "Level $%.2f is on the wrong side of the live market %s; "
+                            "re-anchoring to $%.2f and trying again — this position "
+                            "must not stay unprotected.",
+                            sym, attempt, max_attempts, exc, stop_price,
+                            f"${float(fresh):.2f}" if fresh is not None else "UNKNOWN",
+                            anchored,
+                        )
+                        stop_price = anchored
+                        origin = ("market-anchored backstop "
+                                  f"{('+' if is_short else '-')}{PROTECTIVE_STOP_PCT * 100:.0f}%")
+                        continue
                     logger.error(
                         "🛡️  STOP %s: INVALID-LEVEL rejection (attempt %d/%d) — %s. "
-                        "Stop $%.2f is on the wrong side of the market; NOT retrying "
-                        "(permanent, non-retryable). Position has NO broker-level "
-                        "stop; in-process risk checks stay active.",
+                        "Level $%.2f is on the wrong side of the market and no "
+                        "market-referenced level could be derived (market=%s). NOT "
+                        "retrying this level (permanent for this price). Position has "
+                        "NO broker-level stop; in-process risk checks stay active.",
                         sym, attempt, max_attempts, exc, stop_price,
+                        f"${float(fresh):.2f}" if fresh is not None else "UNKNOWN",
+                    )
+                    self._mark_unprotected(
+                        sym,
+                        "level $%.2f was rejected as invalid and no "
+                        "market-referenced level could be derived "
+                        "(market reference unavailable)" % stop_price,
                     )
                     return False
                 if attempt < max_attempts:
@@ -1503,15 +2020,27 @@ class LiveTrader:
                         "broker-level stop; in-process risk checks still active.",
                         sym, max_attempts, exc,
                     )
+        self._mark_unprotected(
+            sym, f"stop placement failed after {max_attempts} attempts",
+        )
         return False
 
-    async def _cancel_protective_stops(self, symbol: str) -> bool:
-        """Cancel all open orders for *symbol* (protective stops).
+    async def _cancel_protective_stops(
+        self, symbol: str, *, protective_only: bool = False, is_short: bool = False,
+    ) -> bool:
+        """Cancel open orders for *symbol* (protective stops).
 
         Called before closing a position so the GTC stop doesn't remain
         open after the position is gone (an orphaned SELL stop could later
-        trigger as an accidental short).  Returns True only when every
-        previously-open order for the symbol is confirmed gone.
+        trigger as an accidental short).  Returns True only when every order
+        this call tried to cancel is confirmed gone.
+
+        ``protective_only`` (used by the position-vanish path, 2026-09-23)
+        cancels ONLY orders that are protective for a position of side
+        ``is_short``: the sweep used to cancel EVERY open order for the
+        symbol, which killed a still-WORKING ENTRY order and reported it as
+        "Cancelled 1 protective order(s)".  Anything that is not a protective
+        stop is left alone and named in the log.
         """
         sym = symbol.upper()
         try:
@@ -1520,8 +2049,20 @@ class LiveTrader:
             logger.warning("Failed to fetch open orders for %s: %s", sym, exc)
             return False
 
-        cancelled = 0
+        to_cancel = []
         for o in open_orders:
+            if protective_only and not _order_is_protective_for(o, is_short):
+                logger.warning(
+                    "🛡️  KEEPING order %s for %s — not a protective %s stop; the "
+                    "vanish cleanup must never cancel a working entry order",
+                    str(getattr(o, "id", ""))[:8], sym,
+                    "BUY" if is_short else "SELL",
+                )
+                continue
+            to_cancel.append(o)
+
+        cancelled = 0
+        for o in to_cancel:
             try:
                 if await self.broker.cancel_order_and_wait(str(o.id)):
                     cancelled += 1
@@ -1535,61 +2076,242 @@ class LiveTrader:
             logger.info("🗑️  Cancelled %d protective order(s) for %s", cancelled, sym)
         remaining = await self.broker.get_open_orders()
         remaining_ids = {str(getattr(order, "id", "")) for order in remaining}
-        return not any(str(o.id) in remaining_ids for o in open_orders)
+        return not any(str(o.id) in remaining_ids for o in to_cancel)
 
     async def _ensure_protective_stops(self):
-        """Ensure every inherited main position has a GTC protective stop.
+        """Ensure every inherited main position has a LIVE protective stop.
 
         Called right after ``_sync_positions_from_broker()`` at startup, so
         positions that survived a process-group kill / sandbox cycle are
-        protected within seconds of boot.  For each tracked main symbol we
-        check whether a stop order already exists at Alpaca; if not, we
-        place a fresh one (entry − PROTECTIVE_STOP_PCT).  Only symbols in
-        the main trader's ``SYMBOLS`` set are touched: the account is shared
-        with the turbo trader, and we must never place our own stops on its
-        leveraged-ETF positions.
+        protected within seconds of boot.  Only symbols in the main trader's
+        ``SYMBOLS`` set are touched: the account is shared with the turbo
+        trader, and we must never place our own stops on its leveraged-ETF
+        positions.
+
+        Coverage is defined strictly: an order counts only when the broker
+        says it is still WORKING, it is a stop (not a resting limit) and it is
+        on the protective side for this position's direction.  A
+        PENDING_CANCEL / cancelled / rejected / expired order is NOT
+        protection — 2026-09-22: two shorts sat naked for 34 hours because a
+        cancelling order satisfied this check.  The "no stop found" warning is
+        emitted only when a placement is actually attempted, so a healthy sync
+        is never a false alarm.
         """
         main_set = {s.upper() for s in SYMBOLS}
         if not self.pm.get_open_symbols():
             logger.info("🛡️  No inherited positions — skipping protective stop check")
             return
 
-        # Fetch all open orders once so we can check stop coverage
+        # Fetch all open orders once so we can check live stop coverage
         try:
             open_orders = await self.broker.get_open_orders()
         except Exception as exc:
             logger.warning("Cannot verify protective stops — order fetch failed: %s", exc)
+            logger.error(
+                "🚨 PROTECTION UNVERIFIED (startup): %d inherited position(s) could not "
+                "be checked for a broker stop because the order fetch failed — verify "
+                "at the broker before trusting this session",
+                len(self.pm.get_open_symbols()),
+            )
             return
 
-        # Build a set of symbols that already have an open stop order
-        # (SELL stop for longs, BUY stop for shorts — either means covered).
-        covered_symbols: set[str] = set()
-        for o in open_orders:
-            o_sym = str(o.symbol).upper()
-            o_side = str(o.side).upper()
-            if o_sym in main_set and o_side in ("SELL", "BUY"):
-                covered_symbols.add(o_sym)
-
+        unprotected: list[str] = []
         for sym in list(self.pm.get_open_symbols()):
             if sym not in main_set:
                 continue
             pos = self.pm.get_positions().get(sym)
             if pos is None:
                 continue
+            is_short = pos.quantity < 0
+            stop_side = "BUY" if is_short else "SELL"
 
-            if sym in covered_symbols:
-                logger.info("🛡️  %s: existing stop order found — covered", sym)
+            live_stops = [
+                o for o in open_orders
+                if str(getattr(o, "symbol", "")).upper() == sym
+                and _order_is_protective_for(o, is_short)
+            ]
+            if live_stops:
+                logger.info(
+                    "🛡️  %s: already protected by live %s stop %s — no action",
+                    sym, stop_side,
+                    ", ".join(str(getattr(o, "id", ""))[:8] for o in live_stops),
+                )
+                self._mark_protected(sym)
                 continue
 
-            is_short = pos.quantity < 0
+            dead = [
+                o for o in open_orders
+                if str(getattr(o, "symbol", "")).upper() == sym
+                and not _order_is_live_working(o)
+            ]
+            if dead:
+                logger.warning(
+                    "🛡️  %s: %d order(s) for this symbol are NOT working "
+                    "(cancelling/terminal: %s) — they are not protection; "
+                    "placing a live stop now",
+                    sym, len(dead),
+                    ", ".join(
+                        f"{str(getattr(o, 'id', ''))[:8]}={_order_status_token(o) or 'unknown'}"
+                        for o in dead
+                    ),
+                )
             logger.warning(
-                "🛡️  %s: NO protective stop found for inherited position "
-                "(%s shares @ $%.2f%s) — placing one now",
-                sym, abs(pos.quantity), pos.entry_price, " [short]" if is_short else "",
+                "🛡️  %s: NO live protective stop for inherited position "
+                "(%s shares @ $%.2f%s) — attempting placement now",
+                sym, abs(pos.quantity), pos.entry_price,
+                " [short]" if is_short else "",
             )
-            await self._place_protective_stop(
+            # ONE RULE with _audit_position_protection (2026-09-23 review):
+            # the startup path anchors the backstop on the LIVE MARKET too —
+            # market * 1.06 (short) / * 0.94 (long).  An inherited position has
+            # usually drifted from its entry, where an entry-anchored level is
+            # either on the wrong side of the market (broker refuses it, the
+            # fast-fail path returns and the position is left bare) or a
+            # fraction of a percent from it (an immediate exit dressed up as a
+            # safety net).  A position whose entry band is spent gets the same
+            # loud ERROR the audit emits: closing it is a HUMAN decision.
+            market = await self._market_reference_price(sym)
+            entry_stop = _entry_anchored_stop(pos.entry_price, is_short)
+            if market is not None and _entry_anchor_is_spent(entry_stop, is_short, market):
+                logger.error(
+                    "🚨 PROTECTION GAP (startup): %s has moved BEYOND its "
+                    "entry-anchored %s%.0f%% band (entry $%.2f, entry band %s, live "
+                    "market $%.2f) — an entry-anchored stop there would be an "
+                    "immediate exit rather than a safety net; the stop placed now is "
+                    "MARKET-anchored %s%.0f%% ($%.2f) and a HUMAN should decide "
+                    "whether this position is worth holding at all",
+                    sym, "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100,
+                    pos.entry_price,
+                    f"${entry_stop:.2f}" if entry_stop is not None else "n/a",
+                    market, "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100,
+                    round(market * (1 + PROTECTIVE_STOP_PCT) if is_short
+                          else market * (1 - PROTECTIVE_STOP_PCT), 2),
+                )
+            placed = await self._place_protective_stop(
                 sym, int(abs(pos.quantity)), pos.entry_price, is_short=is_short,
+                market_price=market, anchor="market",
             )
+            if placed:
+                logger.info(
+                    "🛡️  %s: protective stop CONFIRMED live at the broker after placement",
+                    sym,
+                )
+            else:
+                unprotected.append(sym)
+
+        if unprotected:
+            logger.error(
+                "🚨 PROTECTION GAP after startup sync: %s still have NO live broker "
+                "stop despite placement attempts — these positions are exposed to a "
+                "gap move; verify at the broker NOW",
+                ", ".join(sorted(unprotected)),
+            )
+        else:
+            logger.info("🛡️  Protective stop check complete — every held position covered")
+
+    async def _audit_position_protection(self, *, context: str, heal: bool = True) -> list[str]:
+        """Verify — and by default restore — protection for every held position.
+
+        Runs at the end of every position-sync pass.  A sync that ends with a
+        held position lacking a LIVE broker stop is an incident, not a log
+        line in passing (2026-09-22: a restart left two shorts naked for 34
+        hours and nothing said so).  Returns the symbols still unprotected.
+
+        ``heal`` re-places a missing stop (throttled per symbol) unless
+        another non-stop working order for that symbol is in flight, where a
+        new stop would only bounce off the broker's wash-trade filter.
+
+        The level placed here is ALWAYS market-anchored (short: market * 1.06,
+        long: market * 0.94): the audit protects the position from now, and for
+        a position that has drifted away from its entry an entry-anchored level
+        either lands on the wrong side of the market or sits a fraction of a
+        percent from it, turning the safety net into an immediate exit.
+        A position whose entry band is spent is reported loudly — a human
+        decides whether it should be closed — while the market-anchored stop
+        does the protecting.
+        """
+        self._scalp_init_state()
+        main_set = {s.upper() for s in SYMBOLS}
+        held = [s for s in self.pm.get_open_symbols() if s in main_set]
+        if not held:
+            return []
+        try:
+            open_orders = await self.broker.get_open_orders()
+        except Exception as exc:
+            logger.error(
+                "🚨 PROTECTION UNVERIFIED (%s): cannot fetch open orders (%s) — %d held "
+                "position(s) (%s) are of UNKNOWN protection state",
+                context, exc, len(held), ", ".join(sorted(held)),
+            )
+            return []
+        throttles = getattr(self, "_protection_retry_ts", None)
+        if throttles is None:
+            throttles = {}
+            self._protection_retry_ts = throttles
+        unprotected: list[str] = []
+        for sym in sorted(held):
+            pos = self.pm.get_positions().get(sym)
+            if pos is None:
+                continue
+            is_short = pos.quantity < 0
+            if any(
+                str(getattr(o, "symbol", "")).upper() == sym
+                and _order_is_protective_for(o, is_short)
+                for o in open_orders
+            ):
+                self._mark_protected(sym)
+                continue
+            busy = any(
+                str(getattr(o, "symbol", "")).upper() == sym
+                and _order_is_live_working(o)
+                and not _order_is_protective_for(o, is_short)
+                and not _order_is_limit(o)
+                for o in open_orders
+            )
+            logger.warning(
+                "🚨 PROTECTION GAP (%s): %s (%s %s @ $%.2f) has NO live broker stop; "
+                "%s",
+                context, sym, "short" if is_short else "long", abs(pos.quantity),
+                pos.entry_price,
+                "another order is in flight — re-placing on the next pass"
+                if busy else ("attempting placement now" if heal else "no re-placement attempted"),
+            )
+            market = await self._market_reference_price(sym)
+            entry_stop = _entry_anchored_stop(pos.entry_price, is_short)
+            if market is not None and _entry_anchor_is_spent(entry_stop, is_short, market):
+                logger.error(
+                    "🚨 PROTECTION GAP (%s): %s has moved BEYOND its entry-anchored "
+                    "%s%.0f%% band (entry $%.2f, entry band %s, live market $%.2f) — an "
+                    "entry-anchored stop there would be an immediate exit rather than a "
+                    "safety net; the stop placed now is MARKET-anchored %s%.0f%% "
+                    "($%.2f) and a HUMAN should decide whether this position is worth "
+                    "holding at all",
+                    context, sym, "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100,
+                    pos.entry_price,
+                    f"${entry_stop:.2f}" if entry_stop is not None else "n/a",
+                    market, "+" if is_short else "-", PROTECTIVE_STOP_PCT * 100,
+                    round(market * (1 + PROTECTIVE_STOP_PCT) if is_short
+                          else market * (1 - PROTECTIVE_STOP_PCT), 2),
+                )
+            if busy or not heal:
+                unprotected.append(sym)
+                continue
+            now = time.monotonic()
+            if now - float(throttles.get(sym) or 0.0) < SCALP_NO_STOP_WARN_SECONDS:
+                unprotected.append(sym)
+                continue
+            throttles[sym] = now
+            ok = await self._place_protective_stop(
+                sym, int(abs(pos.quantity)), pos.entry_price, is_short=is_short,
+                market_price=market, anchor="market",
+            )
+            if not ok:
+                unprotected.append(sym)
+                logger.error(
+                    "🚨 PROTECTION GAP (%s): %s is STILL unprotected after a placement "
+                    "attempt — a gap move would be unhedged", context, sym,
+                )
+        return unprotected
 
 # ══════════════════════════════════════════════════════════════════
     # Scalp strategy set — data assembly, evaluation, execution (PR #37)
@@ -1648,6 +2370,11 @@ class LiveTrader:
             self._scalp_entries_day: str = ""
         if not hasattr(self, "_scalp_cap_warned"):
             self._scalp_cap_warned: set[str] = set()
+        if not hasattr(self, "_entry_order_ids"):
+            # sym -> the ENTRY order the recorded position came from.  Kept so
+            # a "position vanished" pass can tell "the entry never filled"
+            # (phantom position) apart from "the broker closed it" (2026-09-23).
+            self._entry_order_ids: dict[str, str] = {}
 
     # ── Entry accounting / fill resolution (2026-09-16 fix) ──────────
     def _scalp_entries_today(self, sym: str) -> int:
@@ -1734,6 +2461,185 @@ class LiveTrader:
             "signal-time price %.2f (last resort)", sym, float(fallback),
         )
         return float(fallback)
+
+    async def _broker_order_state(self, order_id: str):
+        """Re-read ONE order from the broker (``None`` when unreadable/absent).
+
+        The submission response is a snapshot taken before the broker had a
+        chance to match anything; every "did this actually execute?" decision
+        re-reads the order instead of trusting that snapshot.
+        """
+        if not order_id:
+            return None
+        getter = getattr(self.broker, "get_order", None)
+        if getter is None:
+            return None
+        try:
+            return await getter(order_id)
+        except Exception as exc:
+            logger.warning("Could not re-read order %s: %s", order_id, exc)
+            return None
+
+    async def _await_verified_entry_fill(
+        self, sym: str, result, requested_qty: float,
+    ) -> tuple[float, float] | None:
+        """Wait for the broker to CONFIRM the entry execution.
+
+        Returns ``(filled_qty, filled_avg_price)`` ONLY for a real fill, and
+        ``None`` when the order was rejected / canceled / expired, when the
+        broker cannot be polled, or when it was still working after
+        ``SCALP_ENTRY_FILL_TIMEOUT_SECONDS``.
+
+        This is the settlement barrier the stop placement always needed: at
+        the 2026-09-23 open Alpaca answered the submission with an "accepted"
+        order at 13:30:01.844 that it did not even submit until 13:30:08.104
+        and never filled, and the trader had already booked the position.
+        """
+        verified = _verified_fill_qty_price(result)
+        if verified is not None:
+            return verified
+        status = _order_status_token(result)
+        order_id = str(getattr(result, "order_id", "") or "")
+        if not is_order_alive(status) or not order_id:
+            return None
+        waiter = getattr(self.broker, "wait_for_order_fill", None)
+        if waiter is None:
+            logger.error(
+                "🚨 SCALP %s: entry order %s is NOT filled (status=%s) and the "
+                "broker cannot poll it — NO position recorded; if it does fill, "
+                "the next position sync adopts and protects it",
+                sym, order_id, status or "unknown",
+            )
+            return None
+        logger.info(
+            "⏳ SCALP %s: entry order %s is still WORKING (status=%s, filled_qty=0) "
+            "— waiting up to %.0fs for the broker to confirm the execution before "
+            "this becomes a position",
+            sym, order_id, status or "unknown", SCALP_ENTRY_FILL_TIMEOUT_SECONDS,
+        )
+        try:
+            filled = await waiter(
+                order_id,
+                timeout=SCALP_ENTRY_FILL_TIMEOUT_SECONDS,
+                poll_interval=SCALP_ENTRY_FILL_POLL_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("SCALP %s: fill poll for entry %s failed: %s", sym, order_id, exc)
+            return None
+        if filled is None or isinstance(filled, bool):
+            return None
+        verified = _verified_fill_qty_price(filled)
+        if verified is None:
+            logger.error(
+                "🚨 SCALP %s: the broker's poll of entry order %s returned "
+                "status=%s filled_qty=%s — not a verifiable execution; refusing to "
+                "record a position, place a stop or book P&L for it",
+                sym, order_id, _order_status_token(filled) or "unknown",
+                getattr(filled, "filled_quantity", None),
+            )
+            return None
+        logger.info(
+            "✅ SCALP %s: broker CONFIRMED the entry fill — %.6f shares @ $%.2f "
+            "(order %s, requested %.6f)",
+            sym, verified[0], verified[1], order_id, requested_qty,
+        )
+        return verified
+
+    async def _abandon_unfilled_entry(
+        self, sym: str, result, requested_qty: float, *, is_short: bool,
+    ) -> tuple[float, float] | None:
+        """Give up on an entry that never filled — record NOTHING for it.
+
+        The working order is cancelled (an unmanaged entry order can fill
+        later into a position no one protects) and the final state is
+        re-read.  If that read confirms a fill the cancel raced, the position
+        DOES exist at the broker and is returned to the caller to be adopted
+        and protected on the spot; otherwise this is a phantom entry and a
+        loud INCIDENT is logged — no position, no stop, no P&L.
+        """
+        status = _order_status_token(result)
+        order_id = str(getattr(result, "order_id", "") or "")
+        final = None
+        try:
+            if order_id and is_order_alive(status):
+                await self.broker.cancel_order_and_wait(order_id, timeout=5.0)
+            final = await self._broker_order_state(order_id)
+        except Exception as exc:
+            logger.warning(
+                "SCALP %s: could not cancel/verify the unfilled entry %s: %s",
+                sym, order_id or "?", exc,
+            )
+        verified = _verified_fill_qty_price(final)
+        if verified is not None:
+            logger.warning(
+                "⚠️  SCALP %s: entry %s FILLED (%s x %.2f) while it was being "
+                "abandoned — the broker DOES hold this position; adopting it and "
+                "placing its protective stop now",
+                sym, order_id or "?", verified[0], verified[1],
+            )
+            return verified
+        logger.error(
+            "🚨 INCIDENT SCALP %s: entry order %s (%s %.6f) NEVER FILLED — broker "
+            "status=%s, filled_qty=%s. NO position was recorded, NO protective "
+            "order was placed and NO P&L will be booked: the account never held "
+            "this position. Nothing to unwind.",
+            sym, order_id or "?", "SELL" if is_short else "BUY", requested_qty,
+            _order_status_token(final) or status or "unknown",
+            getattr(final, "filled_quantity", None),
+        )
+        return None
+
+    async def _verified_exit_execution(self, sym: str, pos) -> tuple[float, str] | None:
+        """The broker's OWN fill that CLOSED *pos*: ``(price, order_id)``.
+
+        Never "the most recent fill for this symbol" — that is what priced the
+        2026-09-23 phantom positions at the PREVIOUS session's executions
+        (NVDA 227.36, TSLA 376.96, COIN 200.11, all filled 2026-09-22) and
+        booked +97.78 of realised P&L on three trades that never happened.
+        Only an execution on the CLOSING side (BUY covers a short, SELL closes
+        a long) at or after the position was opened counts.
+        """
+        is_short = float(getattr(pos, "quantity", 0.0)) < 0
+        want_side = "BUY" if is_short else "SELL"
+        getter = getattr(self.broker, "get_recent_fills", None)
+        if getter is None:
+            return None
+        try:
+            fills = await getter(sym, limit=20)
+        except Exception as exc:
+            logger.warning("Exit-fill lookup for %s failed: %s", sym, exc)
+            return None
+        since = self._entry_times.get(sym)
+        best = None
+        best_ts = None
+        for o in fills or []:
+            if _verified_fill_qty_price(o) is None:
+                continue
+            if _order_side_token(o) != want_side:
+                continue
+            ts = _order_fill_timestamp(o)
+            if since is not None and ts is not None and ts < since:
+                continue
+            if best is None or (ts is not None and (best_ts is None or ts >= best_ts)):
+                best, best_ts = o, ts
+        if best is None:
+            return None
+        return _verified_fill_qty_price(best)[1], str(getattr(best, "id", "") or "")
+
+    async def _entry_order_ever_filled(self, sym: str) -> bool | None:
+        """``True``/``False`` when the recorded ENTRY order's state is readable.
+
+        ``None`` = unknown (no order id on record, or the broker could not be
+        asked).  This is what separates "the tracker held a position the
+        broker never had" from "the position genuinely closed at the broker".
+        """
+        order_id = getattr(self, "_entry_order_ids", {}).get(sym)
+        if not order_id:
+            return None
+        state = await self._broker_order_state(order_id)
+        if state is None:
+            return None
+        return _verified_fill_qty_price(state) is not None
 
     def _warn_no_broker_stop(self, sym: str, state: dict, entry: float) -> None:
         """Loud, rate-limited (default: per-minute) "no broker stop" warning.
@@ -2161,32 +3067,52 @@ class LiveTrader:
             if is_short:
                 self._record_short_rejection(sym, str(err))
             return False
-        self._last_signal_key[sym] = self._signal_key(signal)
-        self._record_scalp_entry(sym)
         if order_type == OrderType.MARKET:
-            # Anchor every SL/TP level to the ACTUAL fill, never the
-            # signal-time reference — MARKET fills land points away from the
-            # signal price on fast tape, which is how the stop ended up on
-            # the wrong side of the market (live COIN 2026-09-16).
-            fill_price = await self._resolve_fill_price(
-                sym, result,
-                current_price if current_price > 0 else signal.entry_price,
-            )
+            # ── VERIFIED FILL, OR NO POSITION AT ALL (2026-09-23) ──────
+            # A submission response is NOT an execution.  The 13:30Z open
+            # booked three positions (NVDA/TSLA/COIN) whose entry orders were
+            # still working at the broker, then admitted +102.90/-80.34/+75.22
+            # of P&L on them — the account was never in those trades.
+            # Until the broker CONFIRMS a fill there is no position here: no
+            # slot in the position limit, no protective order, no P&L.  The
+            # level anchor is the confirmed FILL, never the signal-time
+            # reference (MARKET fills land points away on fast tape; live
+            # COIN 2026-09-16 put the strategy stop on the wrong side).
+            fill = await self._await_verified_entry_fill(sym, result, qty)
+            if fill is None:
+                fill = await self._abandon_unfilled_entry(
+                    sym, result, qty, is_short=is_short,
+                )
+            if fill is None:
+                return False
+            filled_qty, fill_price = fill
+            self._last_signal_key[sym] = self._signal_key(signal)
+            self._record_scalp_entry(sym)
+            if filled_qty + 1e-9 < qty:
+                logger.warning(
+                    "⚠️  SCALP %s: only %.6f of %.6f shares filled — tracking and "
+                    "protecting the VERIFIED quantity only",
+                    sym, filled_qty, qty,
+                )
             self.pm.open_position(
-                sym, -qty if is_short else qty, fill_price,
+                sym, -filled_qty if is_short else filled_qty, fill_price,
                 stop_loss_price=signal.stop_loss,
                 take_profit_price=signal.take_profit,
             )
             self._entry_times[sym] = datetime.now(timezone.utc)
+            self._entry_order_ids[sym] = str(getattr(result, "order_id", "") or "")
             logger.info(
-                "📈 %s %s: %s @ $%.2f | qty=%.2f (%s%d%% equity%s) | strategy=%s",
+                "📈 %s %s: %s @ $%.2f | qty=%.2f (%s%d%% equity%s) | strategy=%s "
+                "[broker-verified fill]",
                 "SHORT" if is_short else "BUY", sym,
                 "MARKET" if order_type == OrderType.MARKET else "LIMIT",
-                fill_price, qty, "-" if is_short else "", POSITION_SIZE_PCT * 100,
+                fill_price, filled_qty, "-" if is_short else "", POSITION_SIZE_PCT * 100,
                 " BP-capped" if bp_capped else "", signal.strategy,
             )
-            await self._finalize_open_bundle(sym, qty, fill_price, signal)
+            await self._finalize_open_bundle(sym, filled_qty, fill_price, signal)
         else:
+            self._last_signal_key[sym] = self._signal_key(signal)
+            self._record_scalp_entry(sym)
             self._scalp_bundles[sym] = {
                 "qty": qty, "direction": "SHORT" if is_short else "LONG",
                 "sl": signal.stop_loss, "tp": signal.take_profit,
@@ -2618,6 +3544,7 @@ class LiveTrader:
         self._scalp_positions.pop(sym, None)
         self._scalp_bundles.pop(sym, None)
         self._last_signal_key.pop(sym, None)
+        self._entry_order_ids.pop(sym, None)
 
     # ── Per-tick position sync (limit fills, TP fills, orphan cleanup) ─
 
@@ -2653,23 +3580,69 @@ class LiveTrader:
                 continue
             if sym in by_sym:
                 continue
-            fill_price = await self.broker.get_last_fill_price(sym)
-            if fill_price is not None:
-                self.pm.close_position(sym, exit_price=fill_price, exit_reason="scalp_sync_removed")
+            pos = self.pm.get_positions().get(sym)
+            if pos is None:
+                continue
+            # ── VERIFIED EXIT OR NOTHING (2026-09-23) ──────────────────
+            # P&L is booked ONLY against an execution the broker actually
+            # reports for THIS position (15-25s after the open the account was
+            # credited with +102.90/-80.34/+75.22 from three trades that never
+            # happened, priced at the previous session's fills).
+            exit_fill = await self._verified_exit_execution(sym, pos)
+            if exit_fill is not None:
+                exit_price, exit_order_id = exit_fill
+                self.pm.close_position(
+                    sym, exit_price=exit_price, exit_reason="scalp_sync_removed")
+                logger.info(
+                    "👻 SCALP %s: position closed at the broker — booked P&L at the "
+                    "broker's VERIFIED exit fill $%.2f (order %s)",
+                    sym, exit_price, (exit_order_id or "?")[:8],
+                )
             else:
-                self.pm.discard_position(sym, reason="scalp_sync_removed_no_fill")
-            # Never leave an orphaned GTC stop after the position is gone.
+                # No execution to price it with — and NEVER "the most recent
+                # fill for the symbol", which is the previous session's
+                # execution.  "Never filled" and "genuinely gone" are told
+                # apart by the recorded ENTRY order's own state.
+                entry_filled = await self._entry_order_ever_filled(sym)
+                entry_order_id = getattr(self, "_entry_order_ids", {}).get(sym, "?")
+                if entry_filled is False:
+                    logger.error(
+                        "🚨 INCIDENT SCALP %s: the tracker held %s x %.2f @ $%.2f — a "
+                        "position the broker NEVER HAD: entry order %s reports "
+                        "filled_qty=0, so this entry NEVER FILLED. NO P&L booked, "
+                        "nothing to unwind, the account was never in this trade.",
+                        sym, "SHORT" if float(pos.quantity) < 0 else "LONG",
+                        abs(float(pos.quantity)), pos.entry_price, entry_order_id,
+                    )
+                else:
+                    logger.error(
+                        "🚨 INCIDENT SCALP %s: tracked %s x %.2f @ $%.2f has "
+                        "DISAPPEARED from the broker with NO verified execution to "
+                        "price it (entry order %s, entry fill %s) — REALISED P&L NOT "
+                        "BOOKED: an unverifiable exit is not a $0.00 exit. Reconcile "
+                        "this trade by hand at the broker.",
+                        sym, "SHORT" if float(pos.quantity) < 0 else "LONG",
+                        abs(float(pos.quantity)), pos.entry_price, entry_order_id,
+                        "confirmed" if entry_filled else "UNKNOWN",
+                    )
+                self.pm.discard_position(sym, reason="scalp_sync_removed_no_execution")
+            # Never leave an orphaned GTC stop after the position is gone —
+            # and ONLY the stop.  This cleanup used to cancel EVERY open order
+            # for the symbol, which is how it killed a still-WORKING entry
+            # order at the 2026-09-23 open (NVDA entry f1cc2e8d: status
+            # canceled, filled_qty=0) and then reported it as "Cancelled 1
+            # protective order(s) for NVDA".
             try:
-                await self._cancel_protective_stops(sym)
+                await self._cancel_protective_stops(
+                    sym, protective_only=True, is_short=float(pos.quantity) < 0)
             except Exception as exc:
                 logger.warning("Could not cancel leftover orders for %s: %s", sym, exc)
             self._entry_times.pop(sym, None)
             self._cooldown_until[sym] = time.monotonic() + SCALP_COOLDOWN_BARS * 60.0
             self._scalp_cleanup_state(sym)
             logger.info(
-                "👻 SCALP %s: position vanished from broker (fill=%s) — booked/cleaned, cooldown %dmin",
-                sym, f"{fill_price:.2f}" if fill_price is not None else "UNKNOWN",
-                SCALP_COOLDOWN_BARS,
+                "👻 SCALP %s: position gone from the broker — state cleaned, cooldown %dmin",
+                sym, SCALP_COOLDOWN_BARS,
             )
         # ── Added: limit-entry filled or inherited ──
         for sym, p in by_sym.items():
@@ -2714,7 +3687,13 @@ class LiveTrader:
                     "🛡️  SCALP %s: inherited position %s x %.2f @ $%.2f — placing default protective stop",
                     sym, sym, qty, price,
                 )
-                await self._place_protective_stop(sym, int(qty), price, is_short=False)
+                # The SIDE comes from the broker's SIGNED quantity, and the
+                # quantity is passed as a magnitude: `int(qty)` on a short is
+                # negative, which the placement refuses as "qty <= 0" and the
+                # position ends up with no stop at all.
+                await self._place_protective_stop(
+                    sym, int(abs(qty)), price, is_short=qty < 0, anchor="market",
+                )
 
         # ── Shrunk: a partial exit left a residual ────────────────────
         # A tracked position that lost shares on the broker (a partial fill
@@ -2736,6 +3715,10 @@ class LiveTrader:
                 sym, broker_qty, tracked,
             )
             await self._reprotect_residual(sym, "partial exit (position sync)")
+
+        # ── Protection audit: a sync pass must never END with a naked
+        # position (2026-09-22).  Warns loudly and attempts re-placement.
+        await self._audit_position_protection(context="position sync")
 
     # ── Scalp tick loop ──────────────────────────────────────────────
 
@@ -2801,6 +3784,7 @@ class LiveTrader:
         self._scalp_entries.clear()
         self._scalp_entries_day = ""
         self._scalp_cap_warned.clear()
+        self._entry_order_ids.clear()
     async def _check_risk_stops(self):
         """Check stop-loss / take-profit for open positions."""
         for symbol in list(self.pm.get_open_symbols()):
