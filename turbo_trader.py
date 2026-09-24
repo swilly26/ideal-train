@@ -35,6 +35,23 @@ from src.strategies.liquidity_sweep import LiquiditySweepStrategy
 from src.strategies.indicators import sma, z_score
 
 # ── Configuration ──────────────────────────────────────────────────
+import os as _os
+
+# ── Strategy profiles (frozen, side-by-side comparability) ─────────
+# TURBO_PROFILE=classic  → the pre-2026-08-11 turbo configuration, frozen:
+#   base-4 pool (no VIOLENCE tier), no regime gate, long-only, legacy
+#   momentum-SELL confidence.  Intended ONLY to compare against the current
+#   profile on paper — see TURBO_PROFILE_CLASSIC.md for the provenance.
+#   TURBO_PROFILE=current (default) → unchanged behaviour.
+# Profile switches can NEVER disable the safety/accounting guards added by
+# #29 (78f746e) and #30 (3f82a9d): buying-power caps, whole-share sizing,
+# shortability gating, verified-fill close accounting stay on in both.
+TURBO_PROFILE = _os.getenv("TURBO_PROFILE", "current").strip().lower()
+CLASSIC_PROFILE = TURBO_PROFILE == "classic"
+# The pre-#23 momentum SELL confidence (``dist_pct * 10``) is restored only
+# inside the classic profile; the modern rescale stays the default.
+LEGACY_SELL_CONFIDENCE = CLASSIC_PROFILE
+
 TURBO_SYMBOLS = ["SOXL", "TQQQ", "FNGU", "SPXL"]  # 3x leveraged ETFs (LABU dropped — data errors)
 # ── High-volatility ("VIOLENCE") tier ─────────────────────────────────────
 # More aggressive instruments for the owner's "embrace volatility" direction:
@@ -50,7 +67,8 @@ VIOLENCE_SYMBOLS = [
     "NVDL",  # 2x NVDA bull — single-stock leverage, amplifies NVDA's big moves
     "TSLR",  # 2x TSLA bull — single-stock leverage
 ]
-ENABLE_VIOLENCE_TIER = True    # False → pool falls back to the original 4 turbo symbols
+ENABLE_VIOLENCE_TIER = False if CLASSIC_PROFILE else True
+                              # False → pool falls back to the original 4 turbo symbols
 # Violence-tier risk profile: tight stops get eaten alive on these names, so
 # the stop widens to 9% and take-profit to 13%; position size drops to 40%
 # (vs 50%) to survive the drawdowns.  Same max-2-positions rule.
@@ -114,15 +132,21 @@ MOMENTUM_CONFIG = {
 }
 # ── Feature flags (Recommendation #1 from the weekly trade analysis) ──
 # Each can be flipped independently for paper-trading A/B comparison.
-ENABLE_REGIME_GATE = True   # Skip mean-reversion LONGs in a confirmed downtrend
+ENABLE_REGIME_GATE = False if CLASSIC_PROFILE else True
+                            # Classic profile: no gate (pre-#23 behaviour).
+                            # Skip mean-reversion LONGs in a confirmed downtrend
                             # (price below 10-bar MA AND RSI(14) < 40).  The turbo
                             # trader went 0-for-8 this week buying 3x ETFs into
                             # falling markets; the gate stops that.
-ENABLE_SHORT_SELLING = True # Open SHORT positions when momentum SELL fires in a
+ENABLE_SHORT_SELLING = False if CLASSIC_PROFILE else True
+                            # Classic profile: long-only (pre-#23 behaviour).
+                            # Open SHORT positions when momentum SELL fires in a
                             # downtrend (price < MA, RSI < 40, high confidence),
                             # with inverted stop-loss (above entry) / take-profit
                             # (below entry).  Flattened with the EOD liquidation.
-ENABLE_MEAN_REVERSION_SHORT = True  # When the regime gate blocks a mean-reversion
+ENABLE_MEAN_REVERSION_SHORT = False if CLASSIC_PROFILE else True
+                            # Classic profile: no MR-short (pre-#26 behaviour).
+                            # When the regime gate blocks a mean-reversion
                             # LONG in a confirmed downtrend, OPEN A SHORT on the
                             # same down-tape instead of only doing nothing.  A
                             # gated MR-BUY means the instrument is oversold AND
@@ -263,10 +287,18 @@ def _generate_momentum_signals(
             # Rescaled below so a 1% move scores ~0.4 and 2–3% moves reach
             # 0.5–1.0, blended with RSI weakness and a fresh-cross bonus.
             dist_pct = abs(cur_close - cur_ma) / (abs(cur_ma) + 1e-9)
-            dist_score = min(1.0, dist_pct * 40)            # 1% away → 0.4, 2.5%+ → 1.0
-            rsi_score = max(0.0, min(1.0, (60.0 - cur_rsi) / 40.0))  # 0 @ RSI=60, 1 @ RSI<=20
-            cross_bonus = 0.15 if (cur_close < cur_ma and prev_close >= prev_ma) else 0.0
-            confidence = min(1.0, 0.3 + 0.7 * (0.5 * dist_score + 0.3 * rsi_score) + cross_bonus)
+            if LEGACY_SELL_CONFIDENCE:
+                # Classic profile: the ORIGINAL pre-#23 formula, kept verbatim so
+                # the frozen profile reproduces the winning-period exit policy
+                # (SELL confidence ≈0.1-0.3, i.e. it effectively never activated,
+                # so longs exited on the 30-min time exit / 6% stop / 8% target /
+                # EOD instead of on a momentum break).
+                confidence = min(1.0, dist_pct * 10)
+            else:
+                dist_score = min(1.0, dist_pct * 40)            # 1% away → 0.4, 2.5%+ → 1.0
+                rsi_score = max(0.0, min(1.0, (60.0 - cur_rsi) / 40.0))  # 0 @ RSI=60, 1 @ RSI<=20
+                cross_bonus = 0.15 if (cur_close < cur_ma and prev_close >= prev_ma) else 0.0
+                confidence = min(1.0, 0.3 + 0.7 * (0.5 * dist_score + 0.3 * rsi_score) + cross_bonus)
             signal = Signal(
                 symbol=symbol,
                 timestamp=ts,
@@ -649,6 +681,11 @@ class TurboTrader:
         """Main trading loop."""
         logger.info("=" * 60)
         logger.info("🚀 AlgoFlow TURBO Live Trader — STARTING")
+        logger.info(
+            f"🏷️  PROFILE: {TURBO_PROFILE} "
+            f"({'frozen pre-2026-08-11 turbo: base-4 pool, no regime gate, '
+              'long-only, legacy SELL confidence; #29/#30 guards remain active' if CLASSIC_PROFILE else 'current'})"
+        )
         logger.info(f"Symbols: {SYMBOLS}")
         if ENABLE_VIOLENCE_TIER:
             logger.info(
