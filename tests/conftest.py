@@ -159,3 +159,80 @@ def make_frame():
         )
 
     return _make
+
+
+# ── Trading-stack containment (2026-09-23) ──────────────────────────────────
+# A full-suite run must be INCAPABLE of touching the live stack.  See
+# tests/containment.py for the mechanism and the incident behind it.  The
+# guard is installed before collection and torn down after the last test:
+# every spawn of a live-stack script is inspected BEFORE it exists (fail
+# closed), every child carries the ALGOFLOW_TEST_SESSION marker that makes the
+# shell scripts refuse a production engine root, whatever the tests are
+# allowed to spawn is reaped by process group, and the session FAILS if a
+# live-stack process appeared that was not there when the session started.
+import tempfile as _tempfile
+from pathlib import Path as _Path
+
+from tests import containment as _containment
+
+_GUARD = None
+
+
+@pytest.fixture(scope="session")
+def containment_guard():
+    """The session's containment guard (for the containment tests)."""
+    if _GUARD is None:  # pragma: no cover - hooks always install it first
+        raise RuntimeError("containment guard was not installed")
+    return _GUARD
+
+
+def pytest_sessionstart(session):
+    global _GUARD
+    if _GUARD is None and not getattr(session.config.option, "collectonly", False):
+        _GUARD = _containment.ContainmentGuard(
+            _tempfile.mkdtemp(prefix="pytest-containment-")
+        )
+        _GUARD.install()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    global _GUARD
+    if _GUARD is None:
+        return
+    escaped = _GUARD.escaped_pids()
+    if escaped:
+        _containment.report(
+            "LIVE-STACK PROCESSES APPEARED DURING THIS TEST SESSION -- the suite "
+            "touched the live stack.  Killing them by process group and failing "
+            "the run:"
+        )
+        for pid, cmd in sorted(escaped.items()):
+            _containment.report(f"  pid {pid}: {cmd}")
+        for pid in escaped:
+            _containment.kill_pid_group(pid, 15)
+        import time as _time
+        _time.sleep(0.4)
+        for pid in _GUARD.escaped_pids():
+            _containment.kill_pid_group(pid, 9)
+        session.exitstatus = 1
+    reaped = _GUARD.reap()
+    if reaped:
+        _containment.report(
+            f"reaped {len(reaped)} stray process(es) started by this session: "
+            f"{sorted(reaped)}"
+        )
+    if _GUARD.refusals:
+        _containment.report(
+            f"{len(_GUARD.refusals)} spawn(s) refused before a process was "
+            "created (an offending test failed loudly instead of touching the "
+            "live stack):"
+        )
+        for line in _GUARD.refusals:
+            _containment.report(f"  {line}")
+    remaining = _GUARD.resolved_pids()
+    _containment.report(
+        "containment summary: "
+        f"{len(_GUARD.refusals)} refusal(s), {len(reaped)} stray(s) reaped, "
+        f"{len(remaining)} live-stack process(es) on the box at session end"
+    )
+    _GUARD.uninstall()

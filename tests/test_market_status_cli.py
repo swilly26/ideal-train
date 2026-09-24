@@ -7,6 +7,7 @@ network clock) and CLOSED otherwise.  The cron supervisor
 pre-open boot can never trigger the post-startup cleanup liquidation.
 """
 import subprocess
+from pathlib import Path
 import sys
 from datetime import datetime
 
@@ -38,7 +39,7 @@ def test_cli_prints_open_or_closed():
     """The supervisor parses this output; it must be exactly OPEN or CLOSED."""
     out = subprocess.run(
         [sys.executable, "-m", "src.watchdog.market_status"],
-        capture_output=True, text=True, cwd="/home/team/shared/engine",
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parents[1]),
     )
     assert out.returncode == 0
     assert out.stdout.strip() in ("OPEN", "CLOSED")

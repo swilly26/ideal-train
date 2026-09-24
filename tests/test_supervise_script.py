@@ -32,7 +32,8 @@ environment, even if the script under test regresses:
   (``_make_fake_engine``), never the real watchdog.sh — the script builds
   its launch command as ``$ENGINE_DIR/watchdog.sh``, so a stub engine dir
   is sufficient (verified; there is no hardcoded engine path in the launch
-  block).
+  block).  The supervisor is launched THROUGH ``tests.containment`` as well,
+  so a future edit that reaches for the live root fails before it forks.
 * Fake watchdogs started via the real launch block are killed by process
   GROUP (setsid makes the watchdog its own PG leader) plus a pgrep pattern
   scoped to that test's fake engine dir, so NO background process survives
@@ -47,8 +48,17 @@ import subprocess
 import time
 from pathlib import Path
 
+#: The LIVE engine root.  Used only by the hermeticity assertion below: the
+#: suite must never aim its throwaway engine dir at the live one.
 ENGINE = Path("/home/team/shared/engine")
-SCRIPT = os.environ.get("SUPERVISE_SCRIPT", f"{ENGINE}/scripts/supervise_traders.sh")
+#: The tree under test -- the tree this file lives in.  The script executed
+#: MUST come from here, never from the live root: on 2026-09-23 a test that
+#: defaulted to ``/home/team/shared/engine/watchdog.sh`` ran the *production*
+#: script with a throwaway engine dir, the production copy ignored the
+#: redirect, and the suite restarted the live traders 61 times.  See
+#: tests/containment.py and docs/SAFE_TEST_RUN.md.
+TREE = Path(__file__).resolve().parents[1]
+SCRIPT = os.environ.get("SUPERVISE_SCRIPT", f"{TREE}/scripts/supervise_traders.sh")
 
 PATH_ENV = os.environ.get("PATH", "/usr/bin:/bin")
 
