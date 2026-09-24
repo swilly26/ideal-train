@@ -57,7 +57,11 @@ def _make_engine(tmp_path, *, live_pids="", turbo_pids="5252", live_age=60, turb
     """
     root = tmp_path / "engine"
     (root / "logs").mkdir(parents=True, exist_ok=True)
-    (root / "src").symlink_to(ENGINE / "src")
+    #: symlink the tree under test's own ``src`` -- never the live root's.
+    #: Pointing at ENGINE made the branch's watchdog.sh import MAIN's
+    #: src/watchdog/policy.py, which lacks this branch's API, so the helper
+    #: returned no verdict and the missed-session incident was never reported.
+    (root / "src").symlink_to(TREE / "src")
     for name in ("start_trader.sh", "start_turbo.sh"):
         stub = root / name
         stub.write_text(
