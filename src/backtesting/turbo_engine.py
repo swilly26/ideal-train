@@ -69,6 +69,16 @@ Costs mirror ``ScalpSetConfig`` (the ScalpSet replay's model): ``baseline`` is
 2 bps or 1 cent of adverse slippage per fill, whichever is larger; ``zero_cost``
 turns every cost off as a gross-edge diagnostic; ``pessimistic`` adds a 1 bp
 half-spread and $0.005/share.
+
+**How to read the cost lines.** Slippage and half-spread are applied *inside the
+fill price*, and commissions are charged separately.  So ``pnl_gross`` — the sum
+of ``(exit_fill - entry_fill) * qty`` — is P&L before *commissions*, not P&L
+before costs: under the baseline model (commission 0) it is numerically equal to
+``pnl_after_costs`` by construction.  Do not read it as a zero-cost figure; the
+zero-cost figure requires ``--variant zero_cost``.  Both ``pnl_gross`` and
+``cost_drag_same_fills`` (embedded slippage + spread + commissions on the fills
+this run actually took) are reported, so the label can never imply a cost model
+that was not run.
 """
 
 from __future__ import annotations
@@ -92,7 +102,8 @@ BASE4 = ("SOXL", "TQQQ", "FNGU", "SPXL")
 TRADE_COLUMNS = [
     "symbol", "side", "qty", "entry_time", "entry_price", "exit_time",
     "exit_price", "hold_minutes", "exit_reason", "entry_conf",
-    "entry_strategy", "pnl_gross", "fees", "pnl_after_costs", "ret_pct",
+    "entry_strategy", "pnl_gross", "fees", "cost_drag", "pnl_after_costs",
+    "ret_pct",
 ]
 
 
@@ -132,6 +143,20 @@ class TurboConfig:
     min_bars: int = 25                       # live `len(data) < 25 → skip`
     one_entry_per_bar: bool = True           # live max 1 entry per tick
 
+    # ── measurement knobs (defaults reproduce the live classic rule set) ──
+    # These exist so a single behaviour can be varied and measured without
+    # touching the code path the faithful replay uses.  Every default below is
+    # the live behaviour, so `TurboConfig.classic()` is unchanged.
+    window_tie: str = "earliest"             # "earliest" (live) | "latest"
+    mr_conf_mode: str = "capped"             # "capped" (live) | "linear" (rank by |z|)
+    max_signal_age_bars: int = 0             # 0 = off; else the winning signal bar
+    #                                          must be within this many bars
+    max_entries_per_session: int = 0         # 0 = off; else hard cap per session
+
+    # flags that the classic/current *configs* set but this engine does not
+    # implement; kept explicit so an artifact can never imply they were tested
+    INERT_FLAGS = ("regime_gate", "allow_shorts", "mr_short")
+
     # ── costs (mirror ScalpSetConfig) ──
     slippage_pct: float = 0.0002
     slippage_abs: float = 0.01
@@ -141,6 +166,28 @@ class TurboConfig:
 
     # ── bookkeeping ──
     verbose: bool = False
+
+    def __post_init__(self) -> None:
+        if self.window_tie not in ("earliest", "latest"):
+            raise ValueError(f"window_tie must be 'earliest' or 'latest', got "
+                             f"{self.window_tie!r}")
+        if self.mr_conf_mode not in ("capped", "linear"):
+            raise ValueError(f"mr_conf_mode must be 'capped' or 'linear', got "
+                             f"{self.mr_conf_mode!r}")
+        for name in ("max_signal_age_bars", "max_entries_per_session"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0 (0 = off)")
+
+    def inert_flags(self) -> tuple[str, ...]:
+        """Configured flags this engine never reads (set = NOT tested by a run).
+
+        The replay is long-only and has no regime gate, so ``regime_gate``,
+        ``allow_shorts`` and ``mr_short`` are inert: ``current_base4()`` sets
+        all three, and a run that reports them as "the current policy" would be
+        claiming a comparison it did not make.  Any artifact should carry this
+        list so that cannot happen by accident.
+        """
+        return tuple(f for f in self.INERT_FLAGS if getattr(self, f))
 
     # ── constructors ───────────────────────────────────────────────────
     @classmethod
@@ -157,6 +204,12 @@ class TurboConfig:
         *policy* changes (regime gate, shorts, MR-short, modern SELL
         confidence), not the pool change.  Use it as a directional comparison
         only, and label it as such wherever it is reported.
+
+        **Three of the four flags it sets are inert in this engine.**  It is
+        long-only (no short side), has no regime gate and no MR-short: see
+        ``inert_flags()``.  The only policy this engine can actually execute
+        for ``current_base4()`` is the modern momentum SELL confidence, so a
+        run of it measures that one formula and nothing else.
         """
         base = dict(
             legacy_sell_confidence=False,
@@ -268,42 +321,53 @@ def _momentum_candidate(close: pd.Series, cfg: TurboConfig) -> list[_Candidate]:
 
 
 def _mr_candidate(close: pd.Series, cfg: TurboConfig) -> list[_Candidate]:
-    """Mean-reversion signals, one candidate per bar (live MeanReversionStrategy)."""
+    """Mean-reversion signals, one candidate per bar (live MeanReversionStrategy).
+
+    ``mr_conf_mode`` chooses between the live formula (``capped``,
+    ``min(1, |z| / (2 * threshold))``, which saturates at |z| = 1.0 and so makes
+    the window argmax a tie most of the time) and ``linear`` (the same ratio
+    *without* the cap, so the strongest |z| in the window wins outright).  The
+    threshold test is identical in both modes (conf >= 0.4 ⟺ |z| > threshold).
+    """
     z = _z_score(close, cfg.mr_lookback).to_numpy(dtype=float)
     thr = abs(cfg.mr_entry_threshold)
+    linear = cfg.mr_conf_mode == "linear"
     out: list[_Candidate] = []
     for zv in z:
         if math.isnan(zv):
             out.append(_Candidate())
             continue
+        raw = abs(zv) / (2.0 * thr)
+        conf = round(raw if linear else min(1.0, raw), 6)
         if zv < -thr:
-            out.append(_Candidate(round(min(1.0, abs(zv) / (2.0 * thr)), 6), 1,
-                                  "mean_reversion"))
+            out.append(_Candidate(conf, 1, "mean_reversion"))
         elif zv > thr:
-            out.append(_Candidate(round(min(1.0, abs(zv) / (2.0 * thr)), 6), -1,
-                                  "mean_reversion"))
+            out.append(_Candidate(conf, -1, "mean_reversion"))
         else:
             out.append(_Candidate())
     return out
 
 
-def _window_best(values: np.ndarray, session_start: np.ndarray, window: int
-                 ) -> tuple[np.ndarray, np.ndarray]:
+def _window_best(values: np.ndarray, session_start: np.ndarray, window: int,
+                 tie: str = "earliest") -> tuple[np.ndarray, np.ndarray]:
     """Sliding-window argmax over *values* within each session.
 
     Returns ``(best_value, best_index)`` per bar where the window is the last
     ``window`` bars of the same session (the live fetch cannot see across the
-    overnight boundary and never exceeds 60 minutes).  Ties keep the EARLIEST
-    index, matching the live loop's strict ``>`` comparison.
+    overnight boundary and never exceeds 60 minutes).  ``tie="earliest"`` keeps
+    the EARLIEST index attaining the window maximum (the live loop's strict
+    ``>`` comparison); ``tie="latest"`` keeps the most recent one.
     """
     n = len(values)
     best_v = np.full(n, -np.inf)
     best_i = np.full(n, -1, dtype=np.int64)
     dq: deque[int] = deque()
+    pops_equal = tie == "latest"
     for i in range(n):
         if session_start[i]:
             dq.clear()
-        while dq and values[dq[-1]] < values[i]:
+        while dq and (values[dq[-1]] <= values[i] if pops_equal
+                      else values[dq[-1]] < values[i]):
             dq.pop()
         dq.append(i)
         lo = i - window + 1
@@ -311,8 +375,8 @@ def _window_best(values: np.ndarray, session_start: np.ndarray, window: int
             lo = i                       # first bar of a session: window = {i}
         while dq and dq[0] < lo:
             dq.popleft()
-        # the deque is monotonic with equal values retained, so its front is the
-        # earliest bar attaining the window maximum.
+        # the deque is monotonic with equal values retained (earliest) or
+        # dropped (latest), so its front is the index that wins the tie.
         j = dq[0]
         best_v[i] = values[j]
         best_i[i] = j
@@ -333,6 +397,7 @@ class _Position:
     target: float
     entry_conf: float
     entry_strategy: str
+    entry_slip: float = 0.0      # adverse slippage paid on the entry fill
 
 
 @dataclass
@@ -348,7 +413,10 @@ class TurboReplayResult:
     def summary(self) -> str:
         s = self.stats
         return (f"trades={s['round_trips']} net=${s['pnl_after_costs']:,.0f} "
-                f"({s['total_return']:+.1%}) zero-cost=${s['pnl_gross']:,.0f} "
+                f"({s['total_return']:+.1%}) "
+                f"gross(before fees)=${s['pnl_gross']:,.0f} "
+                f"fees=${s['fees_paid']:,.0f} "
+                f"cost-drag(same fills)=${s['cost_drag_same_fills']:,.0f} "
                 f"PF={s['profit_factor']:.2f} win={s['win_rate']:.1%} "
                 f"maxDD={s['max_drawdown']:.1%}")
 
@@ -409,8 +477,10 @@ class TurboReplay:
             mr = _per_session(close, sess_start, lambda c: _mr_candidate(c, cfg))
             mom_v = np.array([x.conf for x in mom], dtype=float)
             mr_v = np.array([x.conf for x in mr], dtype=float)
-            mom_bv, mom_bi = _window_best(mom_v, sess_start, cfg.lookback_bars)
-            mr_bv, mr_bi = _window_best(mr_v, sess_start, cfg.lookback_bars)
+            mom_bv, mom_bi = _window_best(mom_v, sess_start, cfg.lookback_bars,
+                                          cfg.window_tie)
+            mr_bv, mr_bi = _window_best(mr_v, sess_start, cfg.lookback_bars,
+                                        cfg.window_tie)
 
             n = len(df)
             direction = np.zeros(n, dtype=np.int64)
@@ -504,13 +574,16 @@ class TurboReplay:
             "signals_seen": 0,
             "entries": 0,
             "entries_by_symbol": {},
-            "skipped": {"min_bars": 0, "max_positions": 0, "cash": 0, "threshold": 0},
+            "skipped": {"min_bars": 0, "max_positions": 0, "cash": 0,
+                        "threshold": 0, "stale_signal": 0, "session_cap": 0},
             "exits": {},
             "fees_paid": 0.0,
+            "cost_drag_same_fills": 0.0,
             "eod_flats": 0,
         }
         last_day = None
         session_done = False
+        self._session_entries = 0
         for t64 in axis:
             t = pd.Timestamp(t64)
             day = t.date()
@@ -518,6 +591,7 @@ class TurboReplay:
                 self.stats["sessions"] += 1
                 last_day = day
                 session_done = False
+                self._session_entries = 0
             session_done = self._process_bar(t, local, axis, session_done, symbols)
             equity_rows.append((t, self._equity()))
 
@@ -603,6 +677,17 @@ class TurboReplay:
             strategy = str(self.best_strat[sym][j])
             self.stats["signals_seen"] += 1
             price = float(self.c[sym][j])
+            if cfg.max_signal_age_bars:
+                # the live window can hand an entry to a bar up to an hour old;
+                # this gate demands the winning signal bar be recent
+                age = j - int(self.best_idx[sym][j])
+                if age > cfg.max_signal_age_bars:
+                    self.stats["skipped"]["stale_signal"] += 1
+                    continue
+            if cfg.max_entries_per_session and \
+                    self._session_entries >= cfg.max_entries_per_session:
+                self.stats["skipped"]["session_cap"] += 1
+                continue
             if direction > 0:                                    # BUY
                 if sym in self.positions:
                     continue
@@ -613,6 +698,7 @@ class TurboReplay:
                 if qty <= 0:
                     self.stats["skipped"]["cash"] += 1
                     continue
+                slip = self._slip(price)
                 fill = self._market_fill(price, is_buy=True)
                 fee = self._fees(qty, fill)
                 self.cash -= qty * fill + fee
@@ -620,8 +706,9 @@ class TurboReplay:
                     symbol=sym, qty=qty, entry_price=fill, entry_time=t, entry_index=j,
                     stop=fill * (1 - cfg.stop_loss_pct),
                     target=fill * (1 + cfg.take_profit_pct),
-                    entry_conf=conf, entry_strategy=strategy)
+                    entry_conf=conf, entry_strategy=strategy, entry_slip=slip)
                 self.stats["entries"] += 1
+                self._session_entries += 1
                 self.stats["entries_by_symbol"][sym] = \
                     self.stats["entries_by_symbol"].get(sym, 0) + 1
                 self.stats["fees_paid"] += fee
@@ -636,11 +723,18 @@ class TurboReplay:
     def _close(self, sym: str, price: float, t: pd.Timestamp, j: int, reason: str) -> None:
         pos = self.positions.pop(sym)
         fee = self._fees(pos.qty, price)
+        fees_total = fee + self._fees(pos.qty, pos.entry_price)
         self.cash += pos.qty * price - fee
         self.stats["fees_paid"] += fee
         self.stats["exits"][reason] = self.stats["exits"].get(reason, 0) + 1
         gross = (price - pos.entry_price) * pos.qty
-        net = gross - fee - self._fees(pos.qty, pos.entry_price)
+        net = gross - fees_total
+        # Costs paid *on these same fills*: the adverse slippage embedded in both
+        # fill prices plus commissions.  This is the honest single-run cost drag;
+        # it is not the same thing as baseline-minus-zero_cost, which is
+        # path-dependent (different fills, different sizing).
+        drag = pos.qty * (pos.entry_slip + self._slip(price)) + fees_total
+        self.stats["cost_drag_same_fills"] += drag
         self.trades.append({
             "symbol": sym, "side": "long", "qty": pos.qty,
             "entry_time": pos.entry_time, "entry_price": pos.entry_price,
@@ -648,7 +742,7 @@ class TurboReplay:
             "hold_minutes": (t - pos.entry_time).total_seconds() / 60.0,
             "exit_reason": reason, "entry_conf": pos.entry_conf,
             "entry_strategy": pos.entry_strategy,
-            "pnl_gross": gross, "fees": fee + self._fees(pos.qty, pos.entry_price),
+            "pnl_gross": gross, "fees": fees_total, "cost_drag": drag,
             "pnl_after_costs": net,
             "ret_pct": (price / pos.entry_price - 1.0) if pos.entry_price else 0.0,
         })
@@ -718,6 +812,7 @@ class TurboReplay:
                 pnl=("pnl_after_costs", "sum"),
                 win_rate=("pnl_after_costs", lambda s: float((s > 0).mean())),
                 gross=("pnl_gross", "sum"),
+                cost_drag=("cost_drag", "sum"),
                 best=("pnl_after_costs", "max"), worst=("pnl_after_costs", "min"),
             ).sort_values("pnl", ascending=False)
         else:

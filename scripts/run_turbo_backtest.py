@@ -22,6 +22,7 @@ so the indicator windows are warm (used for the live-fidelity check).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -55,6 +56,37 @@ def build_config(logic: str, variant: str) -> TurboConfig:
     raise SystemExit(f"unknown variant: {variant}")
 
 
+def apply_overrides(cfg: TurboConfig, pairs: list[str]) -> TurboConfig:
+    """Apply ``--set KEY=VALUE`` overrides to *cfg* (typed by the current value).
+
+    Round 1 of the edge search varies one behaviour at a time, so the knobs are
+    set from the command line rather than by editing a config constructor: the
+    artifact then carries exactly what was run (the stats JSON holds the full
+    config), and the file name says it too.
+    """
+    known = {f.name: f for f in dataclasses.fields(cfg)}
+    updates: dict = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise SystemExit(f"--set expects KEY=VALUE, got {pair!r}")
+        if key not in known:
+            raise SystemExit(f"--set: unknown TurboConfig field {key!r}")
+        cur = getattr(cfg, key)
+        if isinstance(cur, bool):
+            updates[key] = raw.strip().lower() in ("1", "true", "yes", "on")
+        elif isinstance(cur, int):
+            updates[key] = int(raw)
+        elif isinstance(cur, float):
+            updates[key] = float(raw)
+        elif isinstance(cur, tuple):
+            updates[key] = tuple(x.strip() for x in raw.split(",") if x.strip())
+        else:
+            updates[key] = raw
+    return dataclasses.replace(cfg, **updates) if updates else cfg
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -69,11 +101,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="last TRADED timestamp (defaults to --end)")
     ap.add_argument("--out-dir", default="data/backtest_out")
     ap.add_argument("--tag", default=None, help="override the artifact filename tag")
+    ap.add_argument("--set", dest="overrides", action="append", default=[],
+                    metavar="KEY=VALUE",
+                    help="override a TurboConfig field, repeatable "
+                         "(e.g. --set window_tie=latest --set max_entries_per_session=2)")
     args = ap.parse_args(argv)
 
     cfg = build_config(args.logic, args.variant)
+    cfg = apply_overrides(cfg, args.overrides)
     symbols = tuple(s.strip().upper() for s in args.symbols.split(",") if s.strip())
     cfg = cfg.__class__(**{**vars(cfg), "symbols": symbols})
+    if args.overrides:
+        print("knob overrides: " + " ".join(args.overrides), flush=True)
 
     t0 = time.time()
     frames = load_frames(symbols, start=args.start, end=args.end)
@@ -94,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.time() - t1
 
     tag = args.tag or f"{args.logic}_{args.variant}"
+    if args.overrides and not args.tag:
+        tag += "__" + "__".join(sorted(s.replace("=", "-") for s in args.overrides))
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     res.trades.to_csv(out / f"turbo_trades_{tag}.csv", index=False)
@@ -106,6 +147,10 @@ def main(argv: list[str] | None = None) -> int:
     stats = dict(res.stats)
     stats["config"] = {k: (list(v) if isinstance(v, tuple) else v)
                        for k, v in vars(cfg).items()}
+    stats["knob_overrides"] = list(args.overrides)
+    stats["inert_flags"] = list(cfg.inert_flags())
+    stats["variant"] = args.variant
+    stats["logic"] = args.logic
     stats["window"] = list(window) if window else [args.start, args.end]
     stats["replay_seconds"] = round(elapsed, 1)
     (out / f"turbo_stats_{tag}.json").write_text(json.dumps(stats, indent=2, default=str))
