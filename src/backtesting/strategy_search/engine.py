@@ -29,6 +29,19 @@ Fill conventions (no lookahead, stated once and pinned by a test):
   except through arrays a family deliberately builds from a completed prior
   session.
 
+**Leg-fill symmetry (stage 2 §1).**  Both legs of a pair are priced by the same
+two functions and nothing else: ``_leg_fills`` opens (buying a leg whose
+effective side is long, selling one whose effective side is short) and
+``_exit_fills`` closes (buying back a short leg, selling a long one).  Every
+exit path — a signalled exit, the mandatory EOD flatten, a time exit, a stop
+and a target — goes through ``_exit_fills``, and each charged the same
+``max(slippage_pct × price, slippage_abs)`` adverse slippage on the same bar
+under the same t+1 convention.  Both legs therefore pay the toll twice per
+round trip, and the mirror direction (+1 ↔ −1) pays exactly the same toll on
+the same tape.  ``tests/test_strategy_search_engine.py`` pins this with a
+synthetic flat-pair fixture that must lose two full tolls and never book a
+profit.
+
 Sizing: ``fixed_notional`` puts a fixed $ notional on each new trade (reported
 at $50k), ``equity_fraction`` reproduces the live engine's 50 %-of-equity,
 95 %-of-cash convention.  Both are reported for every config, so a config
@@ -38,6 +51,7 @@ cannot look good merely by making fewer, bigger trades.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping as MappingABC
 from dataclasses import asdict, dataclass, field
 from typing import Mapping, Optional, Sequence
 
@@ -203,6 +217,12 @@ class _OpenPos:
     extreme: float             # running high (long) / low (short) of the reference
     direction: int = 1         # the signal direction this position was opened with
     trail_pct: Optional[float] = None
+    #: Value of ``exit_now`` that closes this position.  A single-leg position
+    #: exits when the family signals *its own* side; a pair's ``side`` is 0 by
+    #: construction, so it must be compared against the signal direction, never
+    #: against 0 (which would exit a pair on a *no-signal* bar and hold it
+    #: through a signalled exit).
+    exit_side: int = 0
 
 
 class SearchReplay:
@@ -258,6 +278,34 @@ class SearchReplay:
             side = int(leg.side) * int(direction)
             buy = (side > 0) if is_entry else (side < 0)
             fills[leg.symbol] = self.costs.fill_price(raw, is_buy=buy)
+        return fills
+
+    def _exit_fills(self, pos: _OpenPos, k: int, price=None) -> dict[str, float]:
+        """Fill prices that **close** *pos* at bar *k* — every exit path's only door.
+
+        ``pos.legs`` carry the **actual** sides (the entry side is already
+        mirrored by the signal direction), so a short leg is *bought back* and a
+        long leg *sold*.  That is the mirror of ``_leg_fills`` on the entry
+        side; getting it wrong prices a short's exit as a sell, which books the
+        slippage of the exit as a profit and turns a flat pair trip into a
+        cost-free (or positive) one.
+
+        *price* is ``None`` for each leg's own bar **open** (the t+1 fill
+        convention), a ``float`` for one shared level (a stop or target), or a
+        mapping of symbol → price (the per-leg **close**, used by the mandatory
+        EOD flatten and the time exit).
+        """
+        fills: dict[str, float] = {}
+        for leg in pos.legs:
+            if isinstance(price, MappingABC):
+                raw = float(price[leg.symbol])
+            elif price is not None:
+                raw = float(price)
+            else:
+                raw = float(self.m.o[leg.symbol][k])
+            if math.isnan(raw):
+                return {}
+            fills[leg.symbol] = self.costs.fill_price(raw, is_buy=leg.side < 0)
         return fills
 
     def _leg_target_notional(self) -> float:
@@ -354,7 +402,8 @@ class SearchReplay:
             side=primary.side if single else 0,
             ref_symbol=primary.symbol, ref_entry=ref_fill,
             stop=stop, target=target, extreme=ref_fill, direction=int(direction),
-            trail_pct=trail_pct if single else None)
+            trail_pct=trail_pct if single else None,
+            exit_side=primary.side if single else int(direction))
         self.stats["entries"] += 1
         self.entries_by_session[inst.key] = self.entries_by_session.get(inst.key, 0) + 1
         self.last_entry_minute[inst.key] = int(self.m.minute[k])
@@ -421,8 +470,7 @@ class SearchReplay:
                 if key in pending_exit and key in self.positions:
                     reason = pending_exit.pop(key)
                     pos = self.positions[key]
-                    fills = self._leg_fills(inst, k, is_entry=False,
-                                            direction=pos.direction)
+                    fills = self._exit_fills(pos, k)
                     if fills:
                         self._close(key, k, fills, reason)
                     else:
@@ -437,26 +485,27 @@ class SearchReplay:
                     self._manage(inst, k)
                 # 4) mandatory end-of-day flatten
                 if minute >= cfg.eod_flat_min and key in self.positions:
-                    fills = {l.symbol: self.costs.fill_price(float(self.m.c[l.symbol][k]),
-                                                             is_buy=l.side < 0)
-                             for l in inst.legs}
-                    self._close(key, k, fills, "eod", at_time=self.m.axis[k])
+                    pos = self.positions[key]
+                    fills = self._exit_fills(
+                        pos, k,
+                        price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                    if fills:
+                        self._close(key, k, fills, "eod", at_time=self.m.axis[k])
                 if minute >= cfg.eod_flat_min:
                     continue
                 # 5) signal pass on this bar's close -> fill on the next bar
                 if key in self.positions:
                     want = int(inst.exit_now[k])
                     pos = self.positions.get(key)
-                    if pos is not None and (want == 2 or want == pos.side):
+                    if pos is not None and (want == 2 or want == pos.exit_side):
                         pending_exit[key] = "signal"
                     if cfg.time_exit_minutes is not None and key in self.positions:
                         pos = self.positions.get(key)
                         if pos is not None and (k - pos.entry_index) >= cfg.time_exit_minutes:
-                            raw = float(self.m.c[inst.legs[0].symbol][k])
-                            if all(not math.isnan(float(self.m.c[l.symbol][k]))
-                                   for l in inst.legs):
-                                fills = {l.symbol: self.costs.fill_price(raw, is_buy=l.side < 0)
-                                         for l in inst.legs}
+                            closes = {l.symbol: float(self.m.c[l.symbol][k])
+                                      for l in pos.legs}
+                            if all(not math.isnan(v) for v in closes.values()):
+                                fills = self._exit_fills(pos, k, price=closes)
                                 self._close(key, k, fills, "time")
                     continue
                 if key in pending_entry:
@@ -525,14 +574,12 @@ class SearchReplay:
                                              else low <= target)
         if hit_stop:
             price = min(o, stop) if pos.side > 0 else max(o, stop)
-            fills = {l_.symbol: self.costs.fill_price(price, is_buy=l_.side < 0)
-                     for l_ in pos.legs}
+            fills = self._exit_fills(pos, k, price=price)
             self._close(inst.key, k, fills,
                         "trail" if pos.trail_pct is not None else "stop")
         elif hit_target:
             price = max(o, target) if pos.side > 0 else min(o, target)
-            fills = {l_.symbol: self.costs.fill_price(price, is_buy=l_.side < 0)
-                     for l_ in pos.legs}
+            fills = self._exit_fills(pos, k, price=price)
             self._close(inst.key, k, fills, "target")
 
     # ── result assembly ────────────────────────────────────────────────

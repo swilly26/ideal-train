@@ -262,6 +262,148 @@ def test_a_negative_signal_mirrors_both_legs_of_a_pair():
     assert res.trades.iloc[0]["pnl_after_costs"] < 0, "flat prices, costs only"
 
 
+# ── §1 leg-fill symmetry: a flat pair must lose two full tolls ─────────
+#
+# The stage-2 brief's decisive test.  Two legs, identical price paths, so the
+# true spread P&L is exactly zero and the only thing a round trip can book is
+# the cost of four fills (entry and exit, both legs).  Both entries were
+# signalled and, on the mirror, the *side* of each leg is flipped; a harness
+# that flips the side but not the fill prices a short's exit as a sell and
+# books that slippage as profit — which is how a flat tape turns into edge.
+
+FLAT_PX = 100.0
+FILLS_PER_TRIP = 4          # two legs × (entry + exit)
+
+
+def _flat_pair(kind: str = "pair", n: int = 390, px: float = FLAT_PX):
+    bars = flat_session("2025-01-02", px, n)
+    m = Market({"SOXL": mk_frame({"2025-01-02": bars}),
+                "TQQQ": mk_frame({"2025-01-02": bars})})
+    return m, bars
+
+
+def _pair_trip(direction: int, mode: str, n: int = 390,
+               time_exit: int | None = None, eod: int = 15 * 60 + 30,
+               costs: CostModel | None = None):
+    """One pair trip on a flat tape; *mode* selects the exit path.
+
+    ``mode="signal"`` emits the family's "either side may exit" value (2), so
+    the trip closes on the bar after the signal.  ``mode="hold"`` emits the
+    value that belongs to the *other* side, which no correct engine treats as
+    an exit, so the trip is carried to the mandatory EOD flatten.  ``mode="no
+    signal"`` emits 0 — the family saying "hold", which must also never exit.
+    """
+    m, _ = _flat_pair()
+    entry = np.zeros(m.n(), dtype=np.int8)
+    entry[5] = direction
+    value = {"signal": 2, "hold": -direction, "no_signal": 0}[mode]
+    legs = (Leg("SOXL", 1, 1.0), Leg("TQQQ", -1, 1.0))
+    inst = Instrument(key="SOXL/TQQQ", legs=legs, entry_dir=entry,
+                      exit_now=np.full(m.n(), value, dtype=np.int8),
+                      valid=m.valid(legs), kind="pair")
+    cfg = simple_cfg(allow_short=True, max_positions=4, eod_flat_min=eod,
+                     time_exit_minutes=time_exit)
+    return run_search(m, {"SOXL/TQQQ": inst}, cfg,
+                      costs if costs is not None else CostModel.baseline())
+
+
+def _expected_toll(qty_leg: float, px: float = FLAT_PX,
+                   costs: CostModel | None = None) -> float:
+    """Two full tolls: four fills (entry + exit on each of two legs)."""
+    c = costs if costs is not None else CostModel.baseline()
+    return FILLS_PER_TRIP * qty_leg * c.slip_per_share(px)
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+@pytest.mark.parametrize("mode,exit_reason,hold", [
+    ("signal", "signal", 1.0),   # a signalled exit, filled at t+1's open
+    ("hold", "eod", None),       # held to the mandatory flatten, also t+1
+])
+def test_a_flat_pair_loses_two_full_tolls_and_never_books_a_profit(
+        direction, mode, exit_reason, hold):
+    res = _pair_trip(direction, mode)
+    assert len(res.trades) == 1, "the fixture signals exactly one trip"
+    tr = res.trades.iloc[0]
+    assert tr["exit_reason"] == exit_reason
+    if hold is not None:
+        assert tr["hold_minutes"] == pytest.approx(hold)
+    qty_leg = tr["notional"] / 2.0 / FLAT_PX          # $25k per leg at $100
+    toll = _expected_toll(qty_leg)
+    # The fills already carry the toll, so the *same-fill* gross is −toll and
+    # adding the drag back reconstructs the strategy's own P&L: on identical
+    # price paths that must be exactly zero, never a profit.
+    assert tr["pnl_gross"] + tr["cost_drag"] == pytest.approx(0.0, abs=1e-6), \
+        "identical price paths: the strategy's own spread P&L is exactly zero"
+    assert tr["pnl_gross"] == pytest.approx(-toll, rel=1e-6)
+    assert tr["cost_drag"] == pytest.approx(toll, rel=1e-6)
+    assert tr["pnl_after_costs"] == pytest.approx(-toll, rel=1e-6), \
+        "a flat pair must lose exactly one adverse fill per leg per side"
+    assert tr["pnl_after_costs"] < 0, "never a positive P&L on a flat tape"
+
+
+@pytest.mark.parametrize("mode", ["signal", "hold"])
+def test_the_mirror_direction_pays_exactly_the_same_toll(mode):
+    """Short SOXL / long TQQQ must cost what long SOXL / short TQQQ costs."""
+    longs = _pair_trip(1, mode).trades.iloc[0]
+    mirror = _pair_trip(-1, mode).trades.iloc[0]
+    assert longs["exit_reason"] == mirror["exit_reason"]
+    assert mirror["symbols"] == "SOXL-,TQQQ+"
+    assert mirror["cost_drag"] == pytest.approx(longs["cost_drag"], rel=1e-12)
+    assert mirror["pnl_after_costs"] == pytest.approx(longs["pnl_after_costs"],
+                                                      rel=1e-12)
+    assert mirror["pnl_after_costs"] < 0
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_every_exit_path_prices_both_legs_the_same_way(direction):
+    """Entry, signalled exit, time exit and the EOD flatten, leg by leg.
+
+    The fills are asserted against the cost model directly, so this fails if
+    any exit path ever stops mirroring a leg's side.
+    """
+    c = CostModel.baseline()
+    slip = c.slip_per_share(FLAT_PX)
+
+    # entry (t+1 open) and signalled exit (t+1 open)
+    tr = _pair_trip(direction, "signal").trades.iloc[0]
+    soxl_long = direction > 0
+    want_entry = FLAT_PX + slip if soxl_long else FLAT_PX - slip
+    assert tr["entry_price"] == pytest.approx(want_entry)
+    assert tr["exit_price"] == pytest.approx(
+        FLAT_PX - slip if soxl_long else FLAT_PX + slip)
+
+    # the mandatory EOD flatten, on the same tape
+    eod = _pair_trip(direction, "hold").trades.iloc[0]
+    qty_leg = eod["notional"] / 2.0 / FLAT_PX
+    assert eod["exit_reason"] == "eod"
+    assert eod["pnl_after_costs"] == pytest.approx(
+        -FILLS_PER_TRIP * qty_leg * slip, rel=1e-6)
+
+    # the time exit, which fills at the completing bar's close
+    t = _pair_trip(direction, "hold", time_exit=3).trades.iloc[0]
+    assert t["exit_reason"] == "time"
+    qty_leg = t["notional"] / 2.0 / FLAT_PX
+    assert t["pnl_after_costs"] == pytest.approx(
+        -FILLS_PER_TRIP * qty_leg * slip, rel=1e-6)
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_a_pair_is_not_exited_on_a_bar_the_family_says_hold(direction):
+    """``exit_now == 0`` means hold — it must never trigger an exit.
+
+    A pair's reference side is 0 (it holds two legs), so comparing the exit
+    signal against ``pos.side`` used to make *no signal* an exit and a
+    *signalled* exit a hold, silently converting "exit at z = 0 or EOD" into
+    "always hold to EOD".
+    """
+    res = _pair_trip(direction, "no_signal")
+    assert len(res.trades) == 1
+    tr = res.trades.iloc[0]
+    assert tr["exit_reason"] == "eod", \
+        "exit_now == 0 must hold the position, not close it on the next bar"
+    assert tr["hold_minutes"] > 1.0
+
+
 # ── family C is a real breakout family, gated ──────────────────────────
 
 def test_family_c_only_trades_breakouts_after_the_opening_range():
