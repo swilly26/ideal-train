@@ -46,7 +46,9 @@ function SignupPage() {
       <div className="auth-container">
         <div className="auth-card">
           <h1>Create your account</h1>
-          <p className="auth-sub">Start trading with AI-powered strategies.</p>
+          <p className="auth-sub">
+            The strategy engine is paused and no plans are on sale yet.
+          </p>
 
           {error && <div className="auth-error">{error}</div>}
 
