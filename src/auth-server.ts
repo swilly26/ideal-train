@@ -23,11 +23,27 @@ const TOKEN_COOKIE = "apextrade_token";
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 7; // 7 days
 
 // ── Encryption for Alpaca keys ──────────────────────────────────────────
-// Derive a 256-bit key from a fixed passphrase so keys survive server
-// restarts. In production this would be an env var.
-const ENC_PASSPHRASE = "apextrade-alpaca-encryption-key-2026";
+// Derive a 256-bit key from a passphrase supplied through the environment
+// (the owner's Secrets) so the encrypted keys survive server restarts — and
+// so the key that protects them is never in this repository. There is no
+// default and no fallback: a committed passphrase is a published one, so if
+// it is unset we refuse to start rather than encrypt anything.
+const ENC_PASSPHRASE = process.env.APEXTRADE_ENC_PASSPHRASE?.trim() ?? "";
 const ENC_SALT = "apextrade-salt";
 const ENC_ALGO = "aes-256-gcm";
+
+if (!ENC_PASSPHRASE) {
+  console.error(
+    [
+      "FATAL: APEXTRADE_ENC_PASSPHRASE is not set — refusing to start.",
+      "It is the passphrase that encrypts stored Alpaca API keys for signed-up users.",
+      "Save it in the owner's Secrets (Settings → Secrets) as APEXTRADE_ENC_PASSPHRASE,",
+      "then restart this server. There is deliberately no default value.",
+    ].join("\n"),
+  );
+  process.exit(1);
+}
+
 const encKey = pbkdf2Sync(ENC_PASSPHRASE, ENC_SALT, 100_000, 32, "sha256");
 
 function encrypt(text: string): string {
@@ -349,21 +365,43 @@ function freePort(port: number): string {
   );
 }
 
-// ── Startup: seed admin user ────────────────────────────────────────────
+// ── Startup: seed admin user (owner-provided credentials only) ──────────
+// There is no built-in default account and no default password: a hardcoded
+// pair in this file is a published backdoor, since the source is public and
+// the startup line used to be written to a log. If the owner wants an admin,
+// they set APEXTRADE_ADMIN_EMAIL and APEXTRADE_ADMIN_PASSWORD in Secrets.
+// Nothing but the email is ever logged.
 async function seedAdmin() {
-  const adminEmail = "admin@apextrade.com";
+  const adminEmail =
+    process.env.APEXTRADE_ADMIN_EMAIL?.toLowerCase().trim() ?? "";
+  const adminPassword = process.env.APEXTRADE_ADMIN_PASSWORD ?? "";
+
+  if (!adminEmail || !adminPassword) {
+    console.log(
+      "No admin seeded: set APEXTRADE_ADMIN_EMAIL and APEXTRADE_ADMIN_PASSWORD to create or repair an admin account.",
+    );
+    return;
+  }
+  if (adminPassword.length < 12) {
+    console.error(
+      `Refusing to seed ${adminEmail}: APEXTRADE_ADMIN_PASSWORD must be at least 12 characters.`,
+    );
+    return;
+  }
+
   const existing = findUserByEmail(adminEmail);
   if (existing) {
-    // Ensure existing admin has the admin role
+    // Ensure the named account has the admin role
     if (existing.role !== "admin") {
       updateUser(existing.id, { role: "admin" });
-      console.log(`Updated ${adminEmail} to admin role`);
+      console.log(`Granted admin role to ${adminEmail}`);
     }
     return;
   }
-  const passwordHash = await Bun.password.hash("admin123");
+
+  const passwordHash = await Bun.password.hash(adminPassword);
   createUser(adminEmail, passwordHash, "admin");
-  console.log(`Seeded admin user: ${adminEmail} / admin123`);
+  console.log(`Created admin account from Secrets: ${adminEmail}`);
 }
 
 await seedAdmin();

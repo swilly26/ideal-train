@@ -178,7 +178,8 @@ function DashboardPage() {
                 {alpacaStatus.paperTrading ? " (Paper Trading)" : " (Live)"}
               </h2>
               <p>
-                Your Alpaca account is linked and ready for AI-powered trading.
+                Your Alpaca account is linked. The strategy engine is paused, so
+                no trades will be placed for now.
               </p>
             </div>
             <button
@@ -194,8 +195,9 @@ function DashboardPage() {
             <div className="connect-body">
               <h2>Connect your brokerage</h2>
               <p>
-                Link your Alpaca account to start trading with AI-powered
-                strategies.
+                Linking an Alpaca account stores your keys for when the engine
+                runs again. The strategy engine is paused, so nothing will be
+                traded.
               </p>
             </div>
             <button
@@ -273,7 +275,10 @@ function DashboardPage() {
         <div className="empty-state">
           <div className="empty-icon">📊</div>
           <h3>No trades yet</h3>
-          <p>Connect your brokerage to get started with automated trading.</p>
+          <p>
+            Nothing is trading while the engine is paused — this page will have
+            nothing to show until it is switched back on.
+          </p>
         </div>
       </div>
     </main>
