@@ -220,8 +220,9 @@ def _family_d(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
             spread = np.log(ca) - beta * np.log(cb)
             s = pd.Series(spread, index=axis)
             day = pd.Series(axis.normalize(), index=axis)
-            mean = s.groupby(day).transform(lambda x: x.rolling(30).mean())
-            sd = s.groupby(day).transform(lambda x: x.rolling(30).std())
+            zw = int(p.get("z_window", 30))     # bars of the rolling z, per session
+            mean = s.groupby(day).transform(lambda x: x.rolling(zw).mean())
+            sd = s.groupby(day).transform(lambda x: x.rolling(zw).std())
             z = ((s - mean) / sd.replace(0.0, np.nan)).to_numpy(dtype=float)
             z_entry = float(p["z_entry"])
             longs = z <= -z_entry          # leg A cheap vs leg B
