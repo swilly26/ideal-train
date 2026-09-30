@@ -201,6 +201,7 @@ class _OpenPos:
     stop: Optional[float]
     target: Optional[float]
     extreme: float             # running high (long) / low (short) of the reference
+    direction: int = 1         # the signal direction this position was opened with
     trail_pct: Optional[float] = None
 
 
@@ -241,15 +242,21 @@ class SearchReplay:
                     eq += leg.side * leg.qty * px
         return float(eq)
 
-    def _leg_fills(self, inst: Instrument, k: int, is_entry: bool
-                   ) -> dict[str, float]:
-        """Fill price of each leg's symbol at bar *k* for an entry or an exit."""
+    def _leg_fills(self, inst: Instrument, k: int, is_entry: bool,
+                   direction: int = 1) -> dict[str, float]:
+        """Fill price of each leg's symbol at bar *k* for an entry or an exit.
+
+        *direction* mirrors the declared legs: a −1 signal on ``Leg(A,+1)``
+        enters **short** A, so its fill must be the sell price.  Getting this
+        wrong books the slippage of a short trade as a profit.
+        """
         fills: dict[str, float] = {}
         for leg in inst.legs:
             raw = float(self.m.o[leg.symbol][k])
             if math.isnan(raw):
                 return {}
-            buy = (leg.side > 0) if is_entry else (leg.side < 0)
+            side = int(leg.side) * int(direction)
+            buy = (side > 0) if is_entry else (side < 0)
             fills[leg.symbol] = self.costs.fill_price(raw, is_buy=buy)
         return fills
 
@@ -288,9 +295,15 @@ class SearchReplay:
             return None, None, None      # no ATR yet: the config cannot be priced
         return stop, target, trail
 
-    def _try_open(self, inst: Instrument, k: int, sig_k: int) -> None:
+    def _try_open(self, inst: Instrument, k: int, sig_k: int, direction: int) -> None:
+        """Open the instrument with *direction* (+1 as declared, −1 mirrored).
+
+        A short entry is not a separate instrument: the legs' declared sides are
+        multiplied by the signal direction, so a −1 signal on
+        ``Leg(A,+1) + Leg(B,−1)`` opens short A / long B.
+        """
         cfg = self.config
-        fills = self._leg_fills(inst, k, is_entry=True)
+        fills = self._leg_fills(inst, k, is_entry=True, direction=direction)
         if not fills:
             return
         stop_pct, target_pct, trail_pct = self._effective_pcts(inst, sig_k)
@@ -306,6 +319,7 @@ class SearchReplay:
         outlay = 0.0
         for leg in inst.legs:
             fill = fills[leg.symbol]
+            side = int(leg.side) * int(direction)
             leg_notional = notional * abs(leg.weight) / total_w
             qty = leg_notional / fill
             if qty < MIN_ENTRY_QTY:
@@ -314,8 +328,8 @@ class SearchReplay:
             raw = float(self.m.o[leg.symbol][k])
             slip = self.costs.slip_per_share(raw)
             fee = self.costs.fees(qty, fill)
-            outlay += leg.side * (qty * fill) + fee
-            open_legs.append(_OpenLeg(symbol=leg.symbol, side=leg.side, qty=qty,
+            outlay += side * (qty * fill) + fee
+            open_legs.append(_OpenLeg(symbol=leg.symbol, side=side, qty=qty,
                                       entry_fill=fill, entry_signal=raw,
                                       entry_slip=slip, entry_fee=fee))
         if outlay > self.cash:
@@ -339,7 +353,7 @@ class SearchReplay:
             entry_time=self.m.axis[k], entry_index=k,
             side=primary.side if single else 0,
             ref_symbol=primary.symbol, ref_entry=ref_fill,
-            stop=stop, target=target, extreme=ref_fill,
+            stop=stop, target=target, extreme=ref_fill, direction=int(direction),
             trail_pct=trail_pct if single else None)
         self.stats["entries"] += 1
         self.entries_by_session[inst.key] = self.entries_by_session.get(inst.key, 0) + 1
@@ -406,16 +420,18 @@ class SearchReplay:
                 # 1) fill an exit signalled on the previous bar
                 if key in pending_exit and key in self.positions:
                     reason = pending_exit.pop(key)
-                    fills = self._leg_fills(inst, k, is_entry=False)
+                    pos = self.positions[key]
+                    fills = self._leg_fills(inst, k, is_entry=False,
+                                            direction=pos.direction)
                     if fills:
                         self._close(key, k, fills, reason)
                     else:
                         pending_exit[key] = reason
                 # 2) fill an entry signalled on the previous bar
                 if key in pending_entry:
-                    sig_k = pending_entry.pop(key)
+                    sig_k, entry_dir = pending_entry.pop(key)
                     if same_session and key not in self.positions:
-                        self._open_or_count(inst, k, sig_k)
+                        self._open_or_count(inst, k, sig_k, entry_dir)
                 # 3) intrabar management (stops / targets / trailing)
                 if key in self.positions:
                     self._manage(inst, k)
@@ -467,19 +483,20 @@ class SearchReplay:
                 if minute > cfg.entry_end_min:
                     self.stats["skipped"]["late"] += 1
                     continue
-                pending_entry[key] = k
+                pending_entry[key] = (k, direction)
             self.equity.append(self._equity())
         result = SearchResult(trades=self._trades_df(), equity_curve=self._equity_series(),
                               stats=self._stats(), config=cfg)
         return result
 
-    def _open_or_count(self, inst: Instrument, k: int, sig_k: int) -> None:
+    def _open_or_count(self, inst: Instrument, k: int, sig_k: int,
+                       direction: int) -> None:
         """Open unless a gate refuses; counts mirror the signal-path skips."""
         cfg = self.config
         if len(self.positions) >= cfg.max_positions:
             self.stats["skipped"]["max_positions"] += 1
             return
-        self._try_open(inst, k, sig_k)
+        self._try_open(inst, k, sig_k, direction)
 
     def _manage(self, inst: Instrument, k: int) -> None:
         """Intrabar stop / target / trailing-stop for a single-leg position."""

@@ -225,8 +225,44 @@ def test_a_pair_pays_costs_on_both_legs_and_is_one_round_trip():
     _ = market
 
 
-# ── family C is a real breakout family, gated ──────────────────────────
+def test_a_negative_signal_actually_shorts():
+    """A −1 signal must mirror the declared legs, not re-open them long."""
+    falling = [(100.0 - 0.01 * i, 100.2 - 0.01 * i, 99.8 - 0.01 * i, 100.0 - 0.01 * i)
+               for i in range(390)]
+    market, axis = _one_symbol_market({"2025-01-02": falling})
+    entry = np.zeros(len(axis), dtype=np.int8)
+    entry[60] = -1
+    inst = Instrument(key="SOXL", legs=(Leg("SOXL", 1, 1.0),), entry_dir=entry,
+                      exit_now=np.zeros(len(axis), dtype=np.int8),
+                      valid=market.valid((Leg("SOXL", 1, 1.0),)))
+    res = run_search(market, {"SOXL": inst},
+                     simple_cfg(allow_short=True), CostModel.baseline())
+    assert len(res.trades) == 1
+    trade = res.trades.iloc[0]
+    assert trade["symbols"] == "SOXL-"
+    assert trade["entry_price"] > trade["exit_price"], "a short sells high, buys low"
+    assert trade["pnl_after_costs"] > 0, "a short in a falling tape must make money"
 
+
+def test_a_negative_signal_mirrors_both_legs_of_a_pair():
+    bars = [(100.0, 100.2, 99.8, 100.0)] * 390
+    m2 = Market({"SOXL": mk_frame({"2025-01-02": bars}),
+                 "TQQQ": mk_frame({"2025-01-02": bars})})
+    entry = np.zeros(m2.n(), dtype=np.int8)
+    entry[60] = -1
+    legs = (Leg("SOXL", 1, 1.0), Leg("TQQQ", -1, 1.0))
+    inst = Instrument(key="SOXL/TQQQ", legs=legs, entry_dir=entry,
+                      exit_now=np.full(m2.n(), 2, dtype=np.int8),
+                      valid=m2.valid(legs), kind="pair")
+    res = run_search(m2, {"SOXL/TQQQ": inst},
+                     simple_cfg(max_positions=2, allow_short=True),
+                     CostModel.baseline())
+    assert len(res.trades) == 1
+    assert res.trades.iloc[0]["symbols"] == "SOXL-,TQQQ+"
+    assert res.trades.iloc[0]["pnl_after_costs"] < 0, "flat prices, costs only"
+
+
+# ── family C is a real breakout family, gated ──────────────────────────
 
 def test_family_c_only_trades_breakouts_after_the_opening_range():
     or_bars = [(100.0, 100.6, 99.4, 100.0)] * 30
