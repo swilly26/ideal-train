@@ -2,12 +2,22 @@
 """Run the turbo-trader replay (classic / current logic) over cached 1m bars.
 
 Writes, per (logic, variant):
-    <out-dir>/turbo_trades_<logic>_<variant>.csv      one row per round trip
-    <out-dir>/turbo_equity_<logic>_<variant>.csv      portfolio mark-to-market per 1m bar
-    <out-dir>/turbo_per_symbol_<logic>_<variant>.csv  P&L / win rate / PF per symbol
-    <out-dir>/turbo_folds_monthly_<logic>_<variant>.csv  per-calendar-month slice
-    <out-dir>/turbo_stats_<logic>_<variant>.json      config + metrics + counters
-    <out-dir>/turbo_summary_<logic>_<variant>.md      human-readable dump
+    <out-dir>/turbo_trades_<tag>.csv      one row per round trip
+    <out-dir>/turbo_equity_<tag>.csv      portfolio mark-to-market per 1m bar
+    <out-dir>/turbo_per_symbol_<tag>.csv  P&L / win rate / PF per symbol
+    <out-dir>/turbo_folds_monthly_<tag>.csv  per-calendar-month slice
+    <out-dir>/turbo_stats_<tag>.json      config + metrics + counters
+    <out-dir>/turbo_summary_<tag>.md      human-readable dump
+
+``<tag>`` is built by :func:`artifact_tag` and always carries the logic, the
+cost-model variant, every ``--set`` knob and the traded window (and the
+``--tag`` label first, when given)::
+
+    [<label>__]<logic>__<variant>[__<knob>-<value>...][__<start>_<end>]
+
+Round-1 bug this fixes: the ``--tag`` value used to be the WHOLE filename, so
+a ``--tag Vcap2`` *baseline* run silently overwrote the *zero-cost* run's
+stats/trades/folds and the second half of an experiment was lost.
 
 Usage (from the tree under test)::
 
@@ -26,6 +36,7 @@ import dataclasses
 import json
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
@@ -87,6 +98,37 @@ def apply_overrides(cfg: TurboConfig, pairs: list[str]) -> TurboConfig:
     return dataclasses.replace(cfg, **updates) if updates else cfg
 
 
+def _slug(text: str) -> str:
+    """Filename-safe form of *text* (keep alphanumerics, ``-``, ``_``, ``.``)."""
+    out = "".join(ch if (ch.isalnum() or ch in "-_.") else "-" for ch in str(text))
+    return out.strip("-") or "x"
+
+
+def artifact_tag(logic: str, variant: str, tag: str | None = None,
+                 overrides: Iterable[str] = (),
+                 window: tuple[str | None, str | None] | None = None) -> str:
+    """Build the artifact filename tag from everything that identifies the run.
+
+    ``<label>__<logic>__<variant>[__<knob>-<value>...][__<start>_<end>]`` —
+    every part is always present (when it exists), so two runs that differ in
+    *any* of logic, cost model, knobs or window can never write the same file.
+    The part order is fixed and the pieces are deterministic (knobs sorted), so
+    the same run always lands on the same name.
+    """
+    parts: list[str] = []
+    if tag:
+        parts.append(_slug(tag))
+    parts.append(_slug(logic))
+    parts.append(_slug(variant))
+    if overrides:
+        parts.append("__".join(sorted(_slug(o.replace("=", "-")) for o in overrides)))
+    if window:
+        start, end = window
+        if start or end:
+            parts.append(f"{_slug(start or 'start')}_{_slug(end or 'end')}")
+    return "__".join(parts)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -132,9 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     res = replay(frames, cfg, trade_window=window)
     elapsed = time.time() - t1
 
-    tag = args.tag or f"{args.logic}_{args.variant}"
-    if args.overrides and not args.tag:
-        tag += "__" + "__".join(sorted(s.replace("=", "-") for s in args.overrides))
+    tag = artifact_tag(args.logic, args.variant, tag=args.tag,
+                       overrides=args.overrides, window=window or (args.start, args.end))
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     res.trades.to_csv(out / f"turbo_trades_{tag}.csv", index=False)
