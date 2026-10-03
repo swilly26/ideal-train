@@ -42,6 +42,12 @@ FEATURE_NAMES = (
     "or60_hi", "or60_lo", "prev_hi", "prev_lo", "prev_close", "prev_ret",
     "sess_open",
 )
+#: The raw OHLCV columns :func:`build_features` passes through.
+OHLCV_NAMES = ("open", "high", "low", "close", "volume")
+#: **The declared feature set** (E4): a family may read these names and nothing
+#: else.  Anything outside it raises rather than reading as an all-NaN column,
+#: which used to turn a typo into a false "killed: too few trips".
+DECLARED_FEATURES = frozenset(FEATURE_NAMES) | frozenset(OHLCV_NAMES)
 
 
 def load_window(symbols: Iterable[str], start: str, end: str,

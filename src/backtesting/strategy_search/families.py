@@ -22,20 +22,210 @@ sizing mode.  The grids below were written before any result was seen.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from src.backtesting.strategy_search.engine import (
+    EOD_FLAT_NEIGHBOURS,
+    EOD_PINNED_MIN,
     Instrument,
     Leg,
     Market,
     SearchConfig,
 )
+from src.backtesting.strategy_search.features import DECLARED_FEATURES
 
 RTH_OPEN_MIN = 9 * 60 + 30
 ETF4 = ("SOXL", "TQQQ", "FNGU", "SPXL")
+
+#: Every ``SearchConfig`` field a spec's ``params`` may set (besides the
+#: identity fields ``family``/``name`` and ``extras``).
+PARAM_FIELDS = ("sizing", "initial_equity", "position_size_pct", "bp_usage_pct",
+                "notional_usd", "max_positions", "entry_start_min",
+                "entry_end_min", "max_entries_per_session",
+                "min_minutes_between_entries", "stop_pct", "target_pct",
+                "trail_pct", "time_exit_minutes", "allow_short", "eod_flat_min")
+#: Behaviour-changing params with **no default**: a spec must declare every one
+#: of them.  The E2 failure was a knob the engine reads (``z_window``) being
+#: absent from the recorded artefact because the declaration could omit it and
+#: the builder silently merged a whitelist.
+REQUIRED_PARAMS = ("sizing", "initial_equity", "position_size_pct", "bp_usage_pct",
+                   "notional_usd", "max_positions", "entry_start_min",
+                   "entry_end_min", "max_entries_per_session",
+                   "min_minutes_between_entries", "allow_short", "eod_flat_min")
+#: The only declared ``extras`` keys (ATR-scaled exits).
+EXTRA_KEYS = ("stop_atr_mult", "target_atr_mult", "trail_atr_mult")
+
+#: Signal keys a family may read, and those it must be given.
+SIGNAL_KEYS: dict[str, tuple[str, ...]] = {
+    "A": ("entry_mode", "regime", "exit_mode"),
+    "B": ("z_entry", "z_exit", "regime", "vol_floor", "max_abs_spy_ret"),
+    "C": ("or_minutes", "allow_short"),
+    "D": ("kind", "leg_long", "leg_short", "z_entry", "z_exit", "beta",
+          "z_window", "at_minute", "threshold"),
+}
+SIGNAL_REQUIRED: dict[str, tuple[str, ...]] = {
+    "A": ("entry_mode", "regime", "exit_mode"),
+    "B": ("z_entry", "regime"),
+    "C": ("or_minutes", "allow_short"),
+    "D": ("kind",),
+}
+#: The declared value sets of the discrete signal knobs.
+SIGNAL_CHOICES: dict[str, dict[str, tuple]] = {
+    "A": {"entry_mode": ("vwap_ema", "prev_break"),
+          "regime": ("spy_trend", "none"),
+          "exit_mode": ("vwap", "none")},
+    "B": {"regime": ("lowtrend", "none")},
+    "C": {"or_minutes": (30, 60)},
+    "D": {"kind": ("ratio_z", "rs30", "hedge_rs")},
+}
+
+
+class SpecError(ValueError):
+    """A declared config that the engine cannot honestly execute."""
+
+
+def canonical_json(obj: object) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def canonical_hash(obj: object) -> str:
+    """Stable short hash of a resolved config (E2's identity for it)."""
+    return hashlib.sha256(canonical_json(obj).encode()).hexdigest()[:16]
+
+
+def resolved_name(family: str, resolved: Mapping[str, object]) -> str:
+    """The config's name, generated from its *resolved* parameters."""
+    return f"{family.lower()}-{canonical_hash(resolved)}"
+
+
+def resolve_params(family: str, spec: Mapping) -> dict:
+    """Validate a spec's ``params`` and return them with nothing left implicit."""
+    given = dict(spec.get("params", {}))
+    unknown = sorted(set(given) - set(PARAM_FIELDS))
+    if unknown:
+        raise SpecError(
+            f"family {family} spec {spec.get('name')!r}: unknown param key(s) "
+            f"{unknown}; declared keys are {list(PARAM_FIELDS)}")
+    missing = sorted(k for k in REQUIRED_PARAMS if k not in given)
+    if missing:
+        raise SpecError(
+            f"family {family} spec {spec.get('name')!r}: required param(s) "
+            f"{missing} are missing — every behaviour-changing field must be "
+            f"declared, with no default")
+    sizings = ("fixed_notional", "equity_fraction")
+    if given["sizing"] not in sizings:
+        raise SpecError(f"sizing {given['sizing']!r} not in {sizings}")
+    if int(given["eod_flat_min"]) not in EOD_FLAT_NEIGHBOURS:
+        raise SpecError(
+            f"eod_flat_min={given['eod_flat_min']} is not a declared value "
+            f"{list(EOD_FLAT_NEIGHBOURS)} (pinned at {EOD_PINNED_MIN})")
+    return given
+
+
+def resolve_extras(family: str, spec: Mapping) -> dict:
+    given = dict(spec.get("extras", {}))
+    unknown = sorted(set(given) - set(EXTRA_KEYS))
+    if unknown:
+        raise SpecError(
+            f"family {family} spec {spec.get('name')!r}: unknown extras key(s) "
+            f"{unknown}; declared keys are {list(EXTRA_KEYS)}")
+    return given
+
+
+def resolve_signal(family: str, spec: Mapping) -> dict:
+    """Validate a spec's ``signal`` and return it with every default resolved.
+
+    Every knob the family builder reads is present in the returned dict, so the
+    artefact can record what actually ran instead of the declaration.  An
+    unknown key, a missing required key or an undeclared value is an error, not
+    a silent default.
+    """
+    given = dict(spec.get("signal", {}))
+    if family not in SIGNAL_KEYS:
+        raise SpecError(f"unknown family {family!r}")
+    unknown = sorted(set(given) - set(SIGNAL_KEYS[family]))
+    if unknown:
+        raise SpecError(
+            f"family {family} spec {spec.get('name')!r}: unknown signal key(s) "
+            f"{unknown}; declared keys are {list(SIGNAL_KEYS[family])}")
+    missing = sorted(k for k in SIGNAL_REQUIRED[family] if k not in given)
+    if missing:
+        raise SpecError(
+            f"family {family} spec {spec.get('name')!r}: required signal key(s) "
+            f"{missing} are missing (no default)")
+    out = dict(given)
+    for key, choices in SIGNAL_CHOICES.get(family, {}).items():
+        if key in out and out[key] not in choices:
+            raise SpecError(
+                f"family {family} spec {spec.get('name')!r}: {key}="
+                f"{out[key]!r} is not one of {list(choices)}")
+    if family == "B":
+        out.setdefault("z_exit", 0.0)
+        if out["regime"] == "lowtrend":
+            for k in ("vol_floor", "max_abs_spy_ret"):
+                if k not in out:
+                    raise SpecError(
+                        f"family B spec {spec.get('name')!r}: regime "
+                        f"'lowtrend' needs {k!r} declared (no default)")
+    elif family == "D":
+        kind = out["kind"]
+        out.setdefault("beta", 1.0)
+        if kind in ("ratio_z", "hedge_rs"):
+            for k in ("leg_long", "leg_short", "z_entry"):
+                if k not in out:
+                    raise SpecError(
+                        f"family D spec {spec.get('name')!r}: kind {kind!r} "
+                        f"needs {k!r} declared (no default)")
+            out.setdefault("z_exit", 0.0)
+            out.setdefault("z_window", 30)
+        else:                                             # rs30
+            for k in ("leg_long", "leg_short", "at_minute", "threshold"):
+                if k not in out:
+                    raise SpecError(
+                        f"family D spec {spec.get('name')!r}: kind {kind!r} "
+                        f"needs {k!r} declared (no default)")
+    return out
+
+
+def resolve_spec(family: str, spec: Mapping) -> dict:
+    """The whole resolved spec — what the run actually executes.
+
+    It carries **no declaration name**: the hash and the generated config name
+    are functions of behaviour only, so two cells that declare the same
+    behaviour resolve to the same config, and two cells that declare different
+    behaviour can never share one.
+    """
+    return {
+        "params": resolve_params(family, spec),
+        "signal": resolve_signal(family, spec),
+        "extras": resolve_extras(family, spec),
+        "symbols": list(spec.get("symbols", ())),
+    }
+
+
+def _check_universe(family: str, instruments: Mapping[str, Instrument],
+                    market: Market) -> None:
+    """``2k <= |U| - 1``: a k-leg instrument needs 2k+1 symbols available.
+
+    The rule the lead declared for round 2 (E1).  A universe too small for its
+    instruments is a universe in which the legs cannot be spread honestly over
+    distinct symbols, so the builder refuses rather than trades a degenerate
+    book.
+    """
+    n_u = len(market.symbols)
+    for key, inst in instruments.items():
+        k = len(inst.legs)
+        if k >= 2 and 2 * k > n_u - 1:
+            raise SpecError(
+                f"family {family}: instrument {key!r} has {k} legs but the "
+                f"universe U has only {n_u} symbols; the declared rule "
+                f"2k <= |U| - 1 requires at least {2 * k + 1}")
 
 
 # ── helpers ────────────────────────────────────────────────────────────
@@ -43,11 +233,24 @@ ETF4 = ("SOXL", "TQQQ", "FNGU", "SPXL")
 
 def _col(feats: Mapping[str, pd.DataFrame], sym: str, name: str,
          axis: pd.DatetimeIndex) -> np.ndarray:
-    f = feats.get(sym)
-    if f is None:
-        return np.full(len(axis), np.nan)
-    return f[name].to_numpy(dtype=float) if name in f.columns \
-        else np.full(len(axis), np.nan)
+    """One declared feature column, or raise.
+
+    Returning all-NaN for an unknown name turned a typo into "killed: too few
+    trips" — a false negative that looks like a result (E4).  A family may only
+    read the declared feature set, and a symbol whose features are missing is
+    an error, not an empty column.
+    """
+    if name not in DECLARED_FEATURES:
+        raise SpecError(
+            f"feature {name!r} is not in the declared feature set "
+            f"({len(DECLARED_FEATURES)} names, see features.FEATURE_NAMES)")
+    if sym not in feats:
+        raise SpecError(f"no features for symbol {sym!r}: the family asked for "
+                        f"{name!r}")
+    f = feats[sym]
+    if name not in f.columns:
+        raise SpecError(f"symbol {sym!r} has no feature column {name!r}")
+    return f[name].to_numpy(dtype=float)
 
 
 def _shift1(a: np.ndarray) -> np.ndarray:
@@ -102,15 +305,15 @@ def _family_a(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
         if p["entry_mode"] == "prev_break":
             base_long = c > prev_hi
             base_short = c < prev_lo
-        if p.get("regime") == "spy_trend":
+        if p["regime"] == "spy_trend":
             up = _col_feat(spy, "sess_ret") > 0
             up &= _col_feat(spy, "ema_fast") > _col_feat(spy, "ema_slow")
             down = ~up
             base_long = base_long & up
             base_short = base_short & down
-        shorts = base_short if spec["params"].get("allow_short") else np.zeros(len(c), bool)
+        shorts = base_short if spec["params"]["allow_short"] else np.zeros(len(c), bool)
         entry = _dir_array(base_long, shorts)
-        if p.get("exit_mode") == "vwap":
+        if p["exit_mode"] == "vwap":
             exit_long = c < vwap
             exit_short = c > vwap
         else:
@@ -125,14 +328,17 @@ def _family_a(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
 def _close(feats: Mapping[str, pd.DataFrame], sym: str, axis: pd.DatetimeIndex) -> np.ndarray:
     f = feats.get(sym)
     if f is None or "close" not in f.columns:
-        return np.full(len(axis), np.nan)
+        raise SpecError(f"no close series for symbol {sym!r}")
     return f["close"].to_numpy(dtype=float)
 
 
 def _col_feat(df: pd.DataFrame, name: str) -> np.ndarray:
-    if name in df.columns:
-        return df[name].to_numpy(dtype=float)
-    return np.full(len(df), np.nan)
+    """One declared feature column of an *aligned* frame, or raise (E4)."""
+    if name not in DECLARED_FEATURES:
+        raise SpecError(f"feature {name!r} is not in the declared feature set")
+    if name not in df.columns:
+        raise SpecError(f"aligned frame has no feature column {name!r}")
+    return df[name].to_numpy(dtype=float)
 
 
 # ── family C — volatility / breakout ───────────────────────────────────
@@ -155,7 +361,7 @@ def _family_c(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
         ready = _col(feats, sym, "sess_min", axis) >= or_min
         cross_up = (c > hi) & (cp <= hp) & ready
         cross_dn = (c < lo) & (cp >= lp) & ready
-        if not p.get("allow_short", False):
+        if not p["allow_short"]:
             cross_dn = np.zeros(len(c), bool)
         entry = _dir_array(cross_up, cross_dn)
         out[sym] = Instrument(key=sym, legs=(Leg(sym, 1, 1.0),), entry_dir=entry,
@@ -174,21 +380,21 @@ def _family_b(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
     axis = market.axis
     spy = _market(feats, axis)
     z_entry = float(p["z_entry"])
-    z_exit = float(p.get("z_exit", 0.0))
+    z_exit = float(p["z_exit"])
     out: dict[str, Instrument] = {}
     for sym in spec["symbols"]:
         c = _close(feats, sym, axis)
         z = _col(feats, sym, "z20", axis)
         longs = z <= -z_entry
         shorts = z >= z_entry
-        if p.get("regime") == "lowtrend":
+        if p["regime"] == "lowtrend":
             vol = _col_feat(spy, "rvol30")
             quiet = np.abs(_col_feat(spy, "sess_ret")) <= float(p["max_abs_spy_ret"])
             noisy = vol >= float(p["vol_floor"])
             ok = quiet & noisy
             longs = longs & ok
             shorts = shorts & ok
-        if not spec["params"].get("allow_short", False):
+        if not spec["params"]["allow_short"]:
             shorts = np.zeros(len(c), bool)
         exit_long = z >= z_exit
         exit_short = z <= -z_exit
@@ -210,7 +416,7 @@ def _family_d(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
     out: dict[str, Instrument] = {}
     if kind in ("ratio_z", "rs30", "hedge_rs"):
         a_sym, b_sym = p["leg_long"], p["leg_short"]
-        beta = float(p.get("beta", 1.0))
+        beta = float(p["beta"])
         ca = _close(feats, a_sym, axis)
         cb = _close(feats, b_sym, axis)
         valid = market.valid((Leg(a_sym, 1, 1.0), Leg(b_sym, -1, 1.0)))
@@ -220,15 +426,15 @@ def _family_d(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
             spread = np.log(ca) - beta * np.log(cb)
             s = pd.Series(spread, index=axis)
             day = pd.Series(axis.normalize(), index=axis)
-            zw = int(p.get("z_window", 30))     # bars of the rolling z, per session
+            zw = int(p["z_window"])     # bars of the rolling z, per session
             mean = s.groupby(day).transform(lambda x: x.rolling(zw).mean())
             sd = s.groupby(day).transform(lambda x: x.rolling(zw).std())
             z = ((s - mean) / sd.replace(0.0, np.nan)).to_numpy(dtype=float)
             z_entry = float(p["z_entry"])
             longs = z <= -z_entry          # leg A cheap vs leg B
             shorts = z >= z_entry
-            exit_long = z >= float(p.get("z_exit", 0.0))
-            exit_short = z <= -float(p.get("z_exit", 0.0))
+            exit_long = z >= float(p["z_exit"])
+            exit_short = z <= -float(p["z_exit"])
             entry = _dir_array(longs, shorts)
             exit_now = _exit_array(exit_long, exit_short)
         else:                              # rs30: relative strength at one minute
@@ -253,19 +459,56 @@ def _family_d(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
 BUILDERS = {"A": _family_a, "C": _family_c, "B": _family_b, "D": _family_d}
 
 
+def _check_multileg_exits(family: str, cfg: SearchConfig,
+                          instruments: Mapping[str, Instrument]) -> None:
+    """A multi-leg config may not declare a stop / target / trail (E5).
+
+    Stops and targets are built only for ``single`` instruments and ``_manage``
+    returns immediately when a pair's ``side`` is 0, so a multi-leg config could
+    *declare* ``stop_pct``, *record* it in the artefact, and run with no stop at
+    all.  Until the engine wires multi-leg management (with its own test), the
+    builder refuses the combination outright.
+    """
+    atr_mult = any(float(cfg.extras.get(k) or 0.0)
+                   for k in ("stop_atr_mult", "target_atr_mult", "trail_atr_mult"))
+    declares = (cfg.stop_pct is not None or cfg.target_pct is not None
+                or cfg.trail_pct is not None or atr_mult)
+    if not declares:
+        return
+    bad = sorted(k for k, inst in instruments.items() if len(inst.legs) > 1)
+    if bad:
+        raise SpecError(
+            f"family {family}: instrument(s) {bad} have more than one leg but "
+            f"the config declares a stop/target/trail "
+            f"(stop_pct={cfg.stop_pct}, target_pct={cfg.target_pct}, "
+            f"trail_pct={cfg.trail_pct}, extras={dict(cfg.extras)}): the engine "
+            f"would record a stop it never runs")
+
+
 def build(family: str, spec: dict, market: Market,
-          feats: Mapping[str, pd.DataFrame]) -> tuple[SearchConfig, dict[str, Instrument]]:
-    cfg_keys = {"sizing", "initial_equity", "position_size_pct", "bp_usage_pct",
-                "notional_usd", "max_positions", "entry_start_min", "entry_end_min",
-                "max_entries_per_session", "min_minutes_between_entries",
-                "stop_pct", "target_pct", "trail_pct", "time_exit_minutes",
-                "allow_short", "eod_flat_min"}
-    params = dict(spec.get("params", {}))
+          feats: Mapping[str, pd.DataFrame]
+          ) -> tuple[SearchConfig, dict[str, Instrument], dict]:
+    """Build the resolved config and its instruments.
+
+    Returns ``(cfg, instruments, resolved)``.  ``resolved`` is what the run
+    actually executes — every param, signal knob and extra with its value
+    filled in — and ``cfg.name`` is generated from it, so two different
+    resolved configs can never share a name and the artefact cannot record a
+    declaration that the engine did not run (E2).
+    """
+    if family not in BUILDERS:
+        raise SpecError(f"unknown family {family!r}")
+    resolved = resolve_spec(family, spec)
     cfg = SearchConfig(family=family, name=spec["name"],
-                       extras=dict(spec.get("extras", {})),
-                       **{k: v for k, v in params.items() if k in cfg_keys})
-    instruments = BUILDERS[family](spec, market, feats)
-    return cfg, instruments
+                       extras=dict(resolved["extras"]),
+                       **resolved["params"])
+    rspec = dict(resolved)
+    rspec["symbols"] = list(spec.get("symbols", ()))
+    instruments = BUILDERS[family](rspec, market, feats)
+    _check_universe(family, instruments, market)
+    _check_multileg_exits(family, cfg, instruments)
+    cfg = dataclasses.replace(cfg, name=resolved_name(family, resolved))
+    return cfg, instruments, resolved
 
 
 # ── the pre-declared grids ─────────────────────────────────────────────
@@ -277,7 +520,8 @@ def _base_params(**kw) -> dict:
              max_positions=2, entry_start_min=10 * 60, entry_end_min=14 * 60,
              max_entries_per_session=1, min_minutes_between_entries=0,
              stop_pct=None, target_pct=None, trail_pct=None,
-             time_exit_minutes=None, allow_short=False)
+             time_exit_minutes=None, allow_short=False,
+             eod_flat_min=EOD_PINNED_MIN)
     p.update(kw)
     return p
 

@@ -32,8 +32,49 @@ from __future__ import annotations
 from typing import Callable, Iterable, Mapping, Sequence
 
 POWER_FLOOR = 150
+#: Reinstated power floor, plus the pinned per-month minimum: a calendar month
+#: with **zero** trips fails the config outright (P2).
+MIN_TRIPS_PER_MONTH = 1
 MIN_POSITIVE_FOLDS = 7
+MONTHS_PER_WINDOW = 12
 SIZING_MODES = ("fixed_notional", "equity_fraction")
+
+
+def positive_months(folds: Iterable[Mapping]) -> int:
+    """Months with at least one trip and a positive mean bps/trip (pinned)."""
+    return sum(1 for f in (folds or [])
+               if int(f.get("round_trips", 0)) >= MIN_TRIPS_PER_MONTH
+               and float(f.get("net_bps_per_trip", 0.0)) > 0)
+
+
+def fold_stability(folds: Iterable[Mapping]) -> tuple[bool, str, int]:
+    """The **one** pinned sub-period stability rule (P2).
+
+    A fixed config's sub-period stability is the **mean bps/trip per calendar
+    month**: it passes when the window has all
+    :data:`MONTHS_PER_WINDOW` months, no month has fewer than
+    :data:`MIN_TRIPS_PER_MONTH` trips (a zero-trip month fails the config), and
+    at least :data:`MIN_POSITIVE_FOLDS` of those months have a positive mean
+    bps/trip.  This is a *concentration guard, not validation* — nothing is
+    re-fitted, so it is never called walk-forward.
+
+    Returns ``(pass, why, months_with_zero_trips)``.
+    """
+    rows = list(folds or [])
+    total = len(rows)
+    zero_trip = sum(1 for f in rows
+                    if int(f.get("round_trips", 0)) < MIN_TRIPS_PER_MONTH)
+    pos = positive_months(rows)
+    if zero_trip:
+        return (False, f"{zero_trip} calendar month(s) with fewer than "
+                       f"{MIN_TRIPS_PER_MONTH} trip(s)", zero_trip)
+    if total < MONTHS_PER_WINDOW:
+        return (False, f"only {total} month(s) with trades "
+                       f"(< {MONTHS_PER_WINDOW})", zero_trip)
+    if pos < MIN_POSITIVE_FOLDS:
+        return (False, f"{pos}/{total} months positive (< {MIN_POSITIVE_FOLDS})",
+                zero_trip)
+    return (True, f"{pos}/{total} months positive", zero_trip)
 
 
 def gate_power_and_net(rec: Mapping) -> tuple[bool, str]:
@@ -48,15 +89,11 @@ def gate_power_and_net(rec: Mapping) -> tuple[bool, str]:
 
 
 def breadth(rec: Mapping) -> tuple[bool, str]:
-    """Rule 3: zero-cost expectancy positive in >= 7 of the window's folds."""
-    folds = rec.get("folds") or []
-    total = len(folds)
-    pos = sum(1 for f in folds if float(f.get("net_bps_per_trip", 0.0)) > 0)
-    if total < 12:
-        return False, f"only {total} folds with trades (< 12)"
-    if pos < MIN_POSITIVE_FOLDS:
-        return False, f"{pos}/{total} zero-cost folds positive < {MIN_POSITIVE_FOLDS}"
-    return True, f"{pos}/{total} zero-cost folds positive"
+    """Rule 3: the pinned per-month stability rule on the zero-cost run."""
+    ok, why, _zero = fold_stability(rec.get("folds") or [])
+    if not ok:
+        return False, f"zero-cost {why}"
+    return True, f"zero-cost {why}"
 
 
 def screen_family(family: str,
@@ -126,7 +163,7 @@ def screen_family(family: str,
             net_pct = (float(r1["net_pct"]) + float(r2["net_pct"])) / 2.0
             bps = (float(r1["net_bps_per_trip"]) + float(r2["net_bps_per_trip"])) / 2.0
             folds_pos = min(int(r1["folds_positive"]), int(r2["folds_positive"]))
-            ranked.append({
+            row = {
                 "config": name, "sizing": sizing,
                 "net_pct_w1": float(r1["net_pct"]), "net_pct_w2": float(r2["net_pct"]),
                 "net_pct_equal_weighted": net_pct,
@@ -136,16 +173,126 @@ def screen_family(family: str,
                 "trips_w1": int(r1["trips"]), "trips_w2": int(r2["trips"]),
                 "t_stat_w1": float(r1.get("net_bps_t_stat", 0.0)),
                 "t_stat_w2": float(r2.get("net_bps_t_stat", 0.0)),
+                "max_drawdown_w1": float(r1.get("max_drawdown", 0.0)),
+                "max_drawdown_w2": float(r2.get("max_drawdown", 0.0)),
+                "max_drawdown_worst": min(float(r1.get("max_drawdown", 0.0)),
+                                          float(r2.get("max_drawdown", 0.0))),
+                "cost_drag_bps_w1": float(r1.get("cost_drag_per_trip_bps", 0.0)),
+                "cost_drag_bps_w2": float(r2.get("cost_drag_per_trip_bps", 0.0)),
                 "folds_positive_min": folds_pos,
-                "conservative_score": min(net_pct, bps / 100.0),
                 "zero_cost_breadth": zero_why,
-            })
-    ranked.sort(key=lambda r: r["conservative_score"], reverse=True)
+            }
+            row["rank"] = rank_row(row)
+            ranked.append(row)
+    ranked.sort(key=lambda r: r["rank"], reverse=True)
     verdict = "SURVIVORS" if ranked else (
         "NO_W2_SURVIVOR" if not confirmed else "FAILED_BREADTH")
     return {"family": family, "verdict": verdict,
             "w1_survivors": sorted(w1_pass), "w2_survivors": sorted(confirmed),
             "ranked": ranked, "runs": runs}
+
+
+def rank_row(row: Mapping) -> tuple:
+    """The ranked order the deliverable promises (P2/E6).
+
+    Lexicographic, in this order: **net** (equal-weighted net %) → **drawdown**
+    (the shallower of the two windows' max drawdowns) → **trips** (more evidence
+    is better) → **costs** (lower cost drag in bps is better) → **most positive
+    months** (the pinned stability count).  ``conservative_score =
+    min(net_pct, bps/100)`` mixed a percentage with a bps-scaled number and
+    collapsed to ``bps/100`` whenever bps was the smaller of the two; it is gone.
+    """
+    return (
+        round(float(row.get("net_pct_equal_weighted", 0.0)), 8),
+        round(float(row.get("max_drawdown_worst", 0.0)), 8),
+        int(row.get("trips_w1", 0)) + int(row.get("trips_w2", 0)),
+        -round(float(row.get("cost_drag_bps_w1", 0.0))
+               + float(row.get("cost_drag_bps_w2", 0.0)), 8),
+        int(row.get("folds_positive_min", 0)),
+    )
+
+
+def declared_axes(family: str, specs: Sequence[dict]) -> dict[str, tuple]:
+    """Every axis declared inside the grid: a knob with >= 2 distinct values.
+
+    Values are read from the **resolved** spec, so an axis that only exists
+    because two cells silently resolved to different values is not missed.
+    """
+    from src.backtesting.strategy_search import families as _families
+    seen: dict[str, set] = {}
+    for spec in specs:
+        res = _families.resolve_spec(family, spec)
+        flat = {**res["params"], **res["signal"], **res["extras"]}
+        for key, val in flat.items():
+            seen.setdefault(key, set()).add(_families.canonical_json(val))
+    return {k: v for k, v in seen.items() if len(v) >= 2}
+
+
+def neighbour_cells(family: str, specs: Sequence[dict], survivor: str) -> dict:
+    """Per-axis neighbour sets of the *survivor* cell (P2).
+
+    The neighbour set of axis *a* is the cells that differ from the survivor in
+    exactly that axis, deduped by resolved-config hash, **the survivor itself
+    excluded**.  The criterion then applies *per axis*: an axis with >= 2
+    neighbours needs two of them positive on both windows; an axis with exactly
+    one neighbour needs that one positive on both windows.
+    """
+    from src.backtesting.strategy_search import families as _families
+    axes = declared_axes(family, specs)
+    resolved = {s["name"]: _families.resolve_spec(family, s) for s in specs}
+    survivors = [s for s in specs if s["name"] == survivor]
+    if len(survivors) != 1:
+        raise ValueError(f"survivor {survivor!r} is not exactly one cell")
+    base = resolved[survivor]
+    base_flat = {**base["params"], **base["signal"], **base["extras"]}
+    base_hash = _families.canonical_hash(base)
+    out: dict[str, list[str]] = {}
+    for axis in axes:
+        neighbours: dict[str, str] = {}
+        for spec in specs:
+            if spec["name"] == survivor:
+                continue
+            res = resolved[spec["name"]]
+            flat = {**res["params"], **res["signal"], **res["extras"]}
+            if _families.canonical_hash(res) == base_hash:
+                continue                       # a duplicate resolved config
+            if all(flat.get(k) == base_flat.get(k) for k in flat
+                   if k != axis) and flat.get(axis) != base_flat.get(axis):
+                neighbours.setdefault(_families.canonical_hash(res),
+                                      spec["name"])
+        out[axis] = sorted(neighbours.values())
+    return out
+
+
+def neighbour_verdict(neighbours: Mapping[str, Sequence[str]],
+                      positive_both: Mapping[str, bool]) -> tuple[bool, str]:
+    """Apply the per-axis neighbour rule (P2).
+
+    ``positive_both[cell]`` is True when the cell is net-positive on both
+    windows.  An axis needs two neighbours positive on both windows when it has
+    at least two, and its single neighbour to be positive on both when it has
+    exactly one.  An axis with no neighbour at all is a *failure*: a declared
+    axis that cannot be perturbed is not tested.
+    """
+    problems: list[str] = []
+    if not neighbours:
+        return False, "no axis has a neighbour cell"
+    for axis, cells in sorted(neighbours.items()):
+        if not cells:
+            problems.append(f"{axis}: declared axis with no neighbour cell "
+                            f"(a declared axis that cannot be perturbed is not "
+                            f"tested)")
+            continue
+        pos = [c for c in cells if positive_both.get(c, False)]
+        if len(cells) == 1 and not pos:
+            problems.append(f"{axis}: its only neighbour {cells[0]} is not "
+                            f"positive on both windows")
+        elif len(cells) >= 2 and len(pos) < 2:
+            problems.append(f"{axis}: only {len(pos)}/{len(cells)} neighbours "
+                            f"positive on both windows (need 2)")
+    if problems:
+        return False, "; ".join(problems)
+    return True, f"per-axis neighbours hold ({len(neighbours)} axes)"
 
 
 def _best_w1(runs: Mapping[str, Mapping], window: str, cost: str) -> dict:

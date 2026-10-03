@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.backtesting.replay_costs import CostModel            # noqa: E402
-from src.backtesting.strategy_search import families          # noqa: E402
+from src.backtesting.strategy_search import families, screen   # noqa: E402
 from src.backtesting.strategy_search.engine import (          # noqa: E402
     Market, SearchConfig, run_search)
 from src.backtesting.strategy_search.features import (        # noqa: E402
@@ -76,8 +76,8 @@ class Windows:
     def run(self, spec: dict, w: str, sizing: str = "fixed_notional",
             costs: CostModel | None = None, tag: str = "") -> tuple:
         win = self.get(w)
-        cfg, insts = families.build("D", dict(spec), win["market"],
-                                    win["aligned"])
+        cfg, insts, _resolved = families.build(
+            "D", dict(spec), win["market"], win["aligned"])
         cfg = dataclasses.replace(cfg, sizing=sizing)
         costs = costs if costs is not None else CostModel.baseline()
         t0 = time.time()
@@ -228,7 +228,10 @@ def concentration(trades: pd.DataFrame) -> dict:
         "top10_trips_pnl": float(top10),
         "top10_share_of_total": float(top10 / tot),
         "minus_best_month": drop(best), "minus_worst_month": drop(worst),
-        "net_folds_positive": int((g > 0).sum()), "folds_total": int(len(g)),
+        # the ONE pinned stability definition (screen.fold_stability):
+        # mean bps/trip per calendar month, and a zero-trip month fails.
+        "net_folds_positive": screen.positive_months(
+            folds_table(trades).to_dict("records")), "folds_total": int(len(g)),
     }
 
 
@@ -331,8 +334,11 @@ def main(argv=None) -> int:
                 row[f"{w}_net_bps"] = s["net_bps_per_trip"]
                 row[f"{w}_t"] = s["net_bps_t_stat"]
                 row[f"{w}_net_pct"] = s["net_pct"]
-                row[f"{w}_net_folds_positive"] = int(
-                    (folds_table(res.trades)["net_bps_per_trip"] > 0).sum())
+                frows = folds_table(res.trades).to_dict("records")
+                fok, fwhy, _fzero = screen.fold_stability(frows)
+                row[f"{w}_net_folds_positive"] = screen.positive_months(frows)
+                row[f"{w}_fold_stability_pass"] = bool(fok)
+                row[f"{w}_fold_stability_why"] = fwhy
                 row[f"{w}_zero_cost_bps"] = s["zero_cost_bps_per_trip"]
             rows.append(row)
         report["neighbours"] = rows

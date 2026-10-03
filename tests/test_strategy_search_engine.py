@@ -416,7 +416,7 @@ def test_family_c_only_trades_breakouts_after_the_opening_range():
     aligned = book.align(market.axis)
     spec = dict(families.GRID_C[1])
     spec["symbols"] = ["SOXL"]
-    cfg, instruments = families.build("C", spec, market, aligned)
+    cfg, instruments, _resolved = families.build("C", spec, market, aligned)
     res = run_search(market, instruments, cfg, CostModel.baseline())
     assert len(res.trades) >= 1, "a post-opening-range breakout must trade"
     minutes = [pd.Timestamp(t).hour * 60 + pd.Timestamp(t).minute
@@ -481,7 +481,8 @@ def test_a_full_survivor_is_ranked_and_reports_both_windows():
                 "win_rate": 0.55, "break_even_win_rate": 0.5,
                 "folds_positive": 9, "folds_total": 12, "avg_hold_minutes": 40.0,
                 "trips_per_session": 0.8,
-                "folds": [{"month": f"2025-{m:02d}", "net_bps_per_trip": 1.0}
+                "folds": [{"month": f"2025-{m:02d}", "round_trips": 20,
+                           "net_bps_per_trip": 1.0}
                           for m in range(1, 13)]}
 
     verdict = screen.screen_family("X", [{"name": "x1", "params": {}, "signal": {}}],

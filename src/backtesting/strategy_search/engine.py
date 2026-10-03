@@ -61,7 +61,19 @@ import pandas as pd
 from src.backtesting.replay_costs import CostModel
 
 EOD_FLAT_MIN = 15 * 60 + 30      # 15:30 ET — the live mandatory flatten
+#: The only declared EOD-flatten values (P2): the pinned 15:30 and the 15:25
+#: neighbour cell.  Any other value is refused by the builder — an edge that
+#: only exists in the last five minutes is an artefact of where the flatten is.
+EOD_PINNED_MIN = EOD_FLAT_MIN
+EOD_FLAT_NEIGHBOURS = (15 * 60 + 25, 15 * 60 + 30)
 MIN_ENTRY_QTY = 1.0
+MAX_HOLD_MINUTES = 390.0         # one RTH session; a longer hold is a bug
+#: Skip counters every run carries.  A silent drop is not allowed: each one of
+#: these is incremented on a counted signal, and every run asserts
+#: ``entries + Σ skipped == signals`` before it returns.
+SKIP_KEYS = ("max_positions", "cash", "min_qty", "session_cap", "min_gap",
+             "late", "gate", "allow_short", "no_fill", "no_atr", "stale_entry",
+             "already_held", "survived_session")
 
 
 # ── instruments ────────────────────────────────────────────────────────
@@ -248,9 +260,8 @@ class SearchReplay:
         self.equity: list[float] = []
         self.stats: dict = {
             "entries": 0, "signals": 0, "exits": {},
-            "skipped": {"max_positions": 0, "cash": 0, "min_qty": 0,
-                        "session_cap": 0, "min_gap": 0, "late": 0,
-                        "no_next_bar": 0, "gate": 0, "already_held": 0},
+            "identity_max_abs_residual": 0.0,
+            "skipped": {k: 0 for k in SKIP_KEYS},
         }
 
     def _equity(self) -> float:
@@ -263,24 +274,31 @@ class SearchReplay:
         return float(eq)
 
     def _leg_fills(self, inst: Instrument, k: int, is_entry: bool,
-                   direction: int = 1) -> dict[str, float]:
-        """Fill price of each leg's symbol at bar *k* for an entry or an exit.
+                   direction: int = 1) -> dict[tuple[int, str], float]:
+        """Fill price of each leg at bar *k* for an entry or an exit.
+
+        Keyed by ``(leg_index, symbol)``, **never by symbol alone**: two legs of
+        one instrument may be the same symbol (a same-symbol pair), and a
+        symbol-keyed dict silently collapses them into one fill — the cash then
+        cancels to exactly zero toll for that symbol while ``cost_drag`` still
+        books both legs' theoretical toll, fabricating a profit equal to the
+        cancelled toll.  The index is what keeps the two legs distinct.
 
         *direction* mirrors the declared legs: a −1 signal on ``Leg(A,+1)``
         enters **short** A, so its fill must be the sell price.  Getting this
         wrong books the slippage of a short trade as a profit.
         """
-        fills: dict[str, float] = {}
-        for leg in inst.legs:
+        fills: dict[tuple[int, str], float] = {}
+        for i, leg in enumerate(inst.legs):
             raw = float(self.m.o[leg.symbol][k])
             if math.isnan(raw):
                 return {}
             side = int(leg.side) * int(direction)
             buy = (side > 0) if is_entry else (side < 0)
-            fills[leg.symbol] = self.costs.fill_price(raw, is_buy=buy)
+            fills[(i, leg.symbol)] = self.costs.fill_price(raw, is_buy=buy)
         return fills
 
-    def _exit_fills(self, pos: _OpenPos, k: int, price=None) -> dict[str, float]:
+    def _exit_fills(self, pos: _OpenPos, k: int, price=None) -> dict[tuple[int, str], float]:
         """Fill prices that **close** *pos* at bar *k* — every exit path's only door.
 
         ``pos.legs`` carry the **actual** sides (the entry side is already
@@ -293,10 +311,11 @@ class SearchReplay:
         *price* is ``None`` for each leg's own bar **open** (the t+1 fill
         convention), a ``float`` for one shared level (a stop or target), or a
         mapping of symbol → price (the per-leg **close**, used by the mandatory
-        EOD flatten and the time exit).
+        EOD flatten and the time exit).  The result is keyed by
+        ``(leg_index, symbol)`` for the same reason as :meth:`_leg_fills`.
         """
-        fills: dict[str, float] = {}
-        for leg in pos.legs:
+        fills: dict[tuple[int, str], float] = {}
+        for i, leg in enumerate(pos.legs):
             if isinstance(price, MappingABC):
                 raw = float(price[leg.symbol])
             elif price is not None:
@@ -305,7 +324,7 @@ class SearchReplay:
                 raw = float(self.m.o[leg.symbol][k])
             if math.isnan(raw):
                 return {}
-            fills[leg.symbol] = self.costs.fill_price(raw, is_buy=leg.side < 0)
+            fills[(i, leg.symbol)] = self.costs.fill_price(raw, is_buy=leg.side < 0)
         return fills
 
     def _leg_target_notional(self) -> float:
@@ -353,10 +372,14 @@ class SearchReplay:
         cfg = self.config
         fills = self._leg_fills(inst, k, is_entry=True, direction=direction)
         if not fills:
+            self.stats["skipped"]["no_fill"] += 1
             return
         stop_pct, target_pct, trail_pct = self._effective_pcts(inst, sig_k)
         if (cfg.stop_pct is not None or cfg.extras.get("stop_atr_mult")) and stop_pct is None:
-            self.stats["skipped"]["min_qty"] += 1
+            # the config asked for an ATR-scaled stop but the ATR of the signal
+            # bar is not known yet: the entry cannot be priced, and it is *this*
+            # that is skipped — not a minimum-quantity refusal.
+            self.stats["skipped"]["no_atr"] += 1
             return
         total_w = sum(abs(leg.weight) for leg in inst.legs) or 1.0
         notional = self._leg_target_notional()
@@ -365,8 +388,8 @@ class SearchReplay:
             return
         open_legs: list[_OpenLeg] = []
         outlay = 0.0
-        for leg in inst.legs:
-            fill = fills[leg.symbol]
+        for i, leg in enumerate(inst.legs):
+            fill = fills[(i, leg.symbol)]
             side = int(leg.side) * int(direction)
             leg_notional = notional * abs(leg.weight) / total_w
             qty = leg_notional / fill
@@ -387,7 +410,7 @@ class SearchReplay:
             self.cash -= ol.side * ol.qty * ol.entry_fill + ol.entry_fee
         primary = open_legs[0]
         single = inst.kind == "single"
-        ref_fill = fills[inst.legs[0].symbol]
+        ref_fill = fills[(0, inst.legs[0].symbol)]
         stop = target = None
         if single and stop_pct is not None:
             stop = (ref_fill * (1 - stop_pct) if primary.side > 0
@@ -414,8 +437,11 @@ class SearchReplay:
         gross = 0.0
         fees = 0.0
         drag = 0.0
-        for leg in pos.legs:
-            fill = fills[leg.symbol]
+        gross_notional = 0.0
+        net_outlay = 0.0
+        detail: list[str] = []
+        for i, leg in enumerate(pos.legs):
+            fill = float(fills[(i, leg.symbol)])
             raw = float(self.m.o[leg.symbol][k])
             exit_slip = self.costs.slip_per_share(raw)
             exit_fee = self.costs.fees(leg.qty, fill)
@@ -423,21 +449,50 @@ class SearchReplay:
             gross += leg.side * (fill - leg.entry_fill) * leg.qty
             fees += leg.entry_fee + exit_fee
             drag += leg.qty * (leg.entry_slip + exit_slip) + leg.entry_fee + exit_fee
+            gross_notional += abs(leg.qty * leg.entry_fill)
+            net_outlay += leg.side * (leg.qty * leg.entry_fill) + leg.entry_fee
+            detail.append(f"{i}|{leg.symbol}|{leg.side:+d}|{leg.qty:.6f}|"
+                          f"{leg.entry_fill:.6f}|{fill:.6f}")
         net = gross - fees
+        # Per-trip accounting identity, recomputed leg by leg from the recorded
+        # fills: pnl_after_costs == Σ leg.side·(exit_fill − entry_fill)·qty − fees.
+        identity = sum(leg.side * (float(fills[(i, leg.symbol)]) - leg.entry_fill)
+                       * leg.qty for i, leg in enumerate(pos.legs)) - fees
+        residual = float(net - identity)
+        self.stats["identity_max_abs_residual"] = max(
+            float(self.stats.get("identity_max_abs_residual", 0.0)), abs(residual))
+        if abs(residual) > 1e-6:
+            raise RuntimeError(
+                f"per-trip accounting identity violated on {key}: net={net!r} "
+                f"vs leg-by-leg={identity!r} (residual {residual!r})")
         t = at_time if at_time is not None else self.m.axis[k]
+        hold = (t - pos.entry_time).total_seconds() / 60.0
+        if pd.Timestamp(t).date() != pd.Timestamp(pos.entry_time).date():
+            raise RuntimeError(
+                f"{key} was held across the session boundary: "
+                f"{pos.entry_time} -> {t}")
+        if not hold < MAX_HOLD_MINUTES:
+            raise RuntimeError(
+                f"{key} hold {hold:.1f} min >= {MAX_HOLD_MINUTES} min "
+                f"({pos.entry_time} -> {t})")
         self.stats["exits"][reason] = self.stats["exits"].get(reason, 0) + 1
         self.trades.append({
             "instrument": key,
             "symbols": ",".join(f"{l.symbol}{'+' if l.side > 0 else '-'}" for l in pos.legs),
             "legs": len(pos.legs),
             "notional": pos.notional,
+            "gross_notional": gross_notional,
+            "net_outlay": net_outlay,
             "entry_time": pos.entry_time, "exit_time": t,
             "entry_price": pos.legs[0].entry_fill,
-            "exit_price": fills[pos.legs[0].symbol],
-            "hold_minutes": (t - pos.entry_time).total_seconds() / 60.0,
+            "exit_price": fills[(0, pos.legs[0].symbol)],
+            "hold_minutes": hold,
             "exit_reason": reason,
             "pnl_gross": gross, "fees": fees, "cost_drag": drag,
             "pnl_after_costs": net,
+            "identity_check": identity,
+            "identity_residual": residual,
+            "leg_detail": ";".join(detail),
             "ret_pct": net / pos.notional if pos.notional else 0.0,
             "net_bps": (net / pos.notional * 1e4) if pos.notional else 0.0,
         })
@@ -457,12 +512,35 @@ class SearchReplay:
                 if not math.isnan(px):
                     self.last_close[sym] = px
             if new_session:
+                if self.positions:
+                    # A position that survived the boundary means the EOD
+                    # flatten never ran (a missing bar at the flatten time is
+                    # fatal, not something to carry overnight).
+                    self.stats["skipped"]["survived_session"] += len(self.positions)
+                    raise RuntimeError(
+                        f"{len(self.positions)} position(s) survived the session "
+                        f"boundary into {self.m.axis[k]}: the mandatory EOD "
+                        f"flatten did not run")
                 self.entries_by_session.clear()
                 self.last_entry_minute.clear()
-                # a position never survives the session: EOD flatten already ran
             for key in keys:
                 inst = self.instruments[key]
-                if not bool(inst.valid[k]):
+                valid_here = bool(inst.valid[k])
+                if not valid_here:
+                    pos = self.positions.get(key)
+                    if minute >= cfg.eod_flat_min and pos is not None:
+                        # the mandatory flatten must happen even on a bar the
+                        # instrument does not have; if it cannot be priced that
+                        # is fatal for the run, never a position carried on.
+                        fills = self._exit_fills(
+                            pos, k,
+                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                        if not fills:
+                            raise RuntimeError(
+                                f"{key}: mandatory EOD flatten at "
+                                f"{self.m.axis[k]} could not be priced (a leg has "
+                                f"no bar): refusing to carry the position")
+                        self._close(key, k, fills, "eod", at_time=self.m.axis[k])
                     continue
                 prev = k - 1
                 same_session = prev >= 0 and not new_session
@@ -475,10 +553,21 @@ class SearchReplay:
                         self._close(key, k, fills, reason)
                     else:
                         pending_exit[key] = reason
-                # 2) fill an entry signalled on the previous bar
+                # 2) fill an entry signalled on the previous bar — or discard it
                 if key in pending_entry:
                     sig_k, entry_dir = pending_entry.pop(key)
-                    if same_session and key not in self.positions:
+                    if minute >= cfg.eod_flat_min:
+                        self.stats["skipped"]["stale_entry"] += 1
+                    elif k != sig_k + 1 or not same_session:
+                        # "discard, not delay": a pending entry whose fill bar is
+                        # not the immediately-next bar for this instrument is
+                        # dropped.  Filling it at a *later* bar's open hands the
+                        # config a free option, systematically flattering any
+                        # gap/reversal family.
+                        self.stats["skipped"]["stale_entry"] += 1
+                    elif key in self.positions:
+                        self.stats["skipped"]["already_held"] += 1
+                    else:
                         self._open_or_count(inst, k, sig_k, entry_dir)
                 # 3) intrabar management (stops / targets / trailing)
                 if key in self.positions:
@@ -489,8 +578,11 @@ class SearchReplay:
                     fills = self._exit_fills(
                         pos, k,
                         price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
-                    if fills:
-                        self._close(key, k, fills, "eod", at_time=self.m.axis[k])
+                    if not fills:
+                        raise RuntimeError(
+                            f"{key}: mandatory EOD flatten at {self.m.axis[k]} "
+                            f"could not be priced: refusing to carry the position")
+                    self._close(key, k, fills, "eod", at_time=self.m.axis[k])
                 if minute >= cfg.eod_flat_min:
                     continue
                 # 5) signal pass on this bar's close -> fill on the next bar
@@ -501,7 +593,9 @@ class SearchReplay:
                         pending_exit[key] = "signal"
                     if cfg.time_exit_minutes is not None and key in self.positions:
                         pos = self.positions.get(key)
-                        if pos is not None and (k - pos.entry_index) >= cfg.time_exit_minutes:
+                        if pos is not None and (
+                                self.m.axis[k] - pos.entry_time
+                                >= pd.Timedelta(minutes=int(cfg.time_exit_minutes))):
                             closes = {l.symbol: float(self.m.c[l.symbol][k])
                                       for l in pos.legs}
                             if all(not math.isnan(v) for v in closes.values()):
@@ -513,9 +607,10 @@ class SearchReplay:
                 direction = int(inst.entry_dir[k])
                 if direction == 0:
                     continue
-                if direction < 0 and not cfg.allow_short:
-                    continue
                 self.stats["signals"] += 1
+                if direction < 0 and not cfg.allow_short:
+                    self.stats["skipped"]["allow_short"] += 1
+                    continue
                 if not (cfg.entry_start_min <= minute <= cfg.entry_end_min):
                     self.stats["skipped"]["gate"] += 1
                     continue
@@ -534,6 +629,18 @@ class SearchReplay:
                     continue
                 pending_entry[key] = (k, direction)
             self.equity.append(self._equity())
+        if self.positions:
+            raise RuntimeError(
+                f"run ended with {len(self.positions)} open position(s) "
+                f"(last bar {self.m.axis[-1] if n else 'none'}): the EOD flatten "
+                f"did not run")
+        self.stats["skipped"]["stale_entry"] += len(pending_entry)
+        total_skipped = sum(self.stats["skipped"].values())
+        if self.stats["entries"] + total_skipped != self.stats["signals"]:
+            raise RuntimeError(
+                f"signal accounting broken: entries={self.stats['entries']} + "
+                f"skipped={total_skipped} != signals={self.stats['signals']} "
+                f"({self.stats['skipped']})")
         result = SearchResult(trades=self._trades_df(), equity_curve=self._equity_series(),
                               stats=self._stats(), config=cfg)
         return result
@@ -584,10 +691,12 @@ class SearchReplay:
 
     # ── result assembly ────────────────────────────────────────────────
     def _trades_df(self) -> pd.DataFrame:
-        cols = ["instrument", "symbols", "legs", "notional", "entry_time",
+        cols = ["instrument", "symbols", "legs", "notional", "gross_notional",
+                "net_outlay", "entry_time",
                 "exit_time", "entry_price", "exit_price", "hold_minutes",
                 "exit_reason", "pnl_gross", "fees",
-                "cost_drag", "pnl_after_costs", "ret_pct", "net_bps"]
+                "cost_drag", "pnl_after_costs", "identity_check",
+                "identity_residual", "leg_detail", "ret_pct", "net_bps"]
         return pd.DataFrame(self.trades, columns=cols)
 
     def _equity_series(self) -> pd.Series:
@@ -600,6 +709,19 @@ class SearchReplay:
         eq = self._equity_series()
         s["round_trips"] = int(len(trades))
         s["initial_equity"] = float(cfg.initial_equity)
+        s["skipped_total"] = int(sum(s["skipped"].values()))
+        #: ``max_drawdown`` marks stale closes: the equity series carries the
+        #: last known close of a symbol that has no bar at a timestamp, so a
+        #: drawdown that happens entirely while a symbol is not printing is
+        #: understated.  Quote it with this caveat (P2/E6).
+        s["max_drawdown_note"] = ("equity marks stale closes (last known close) "
+                                  "for a symbol with no bar at that timestamp")
+        if len(trades):
+            s["gross_notional_per_trip"] = float(trades["gross_notional"].mean())
+            s["net_outlay_per_trip"] = float(trades["net_outlay"].mean())
+        else:
+            s["gross_notional_per_trip"] = 0.0
+            s["net_outlay_per_trip"] = 0.0
         final = float(eq.iloc[-1]) if len(eq) else cfg.initial_equity
         s["final_equity"] = final
         s["total_return"] = final / cfg.initial_equity - 1.0
@@ -695,3 +817,52 @@ def per_symbol(trades: pd.DataFrame) -> pd.DataFrame:
 def run_search(market: Market, instruments: Mapping[str, Instrument],
                config: SearchConfig, costs: CostModel) -> SearchResult:
     return SearchReplay(market, instruments, config, costs).run()
+
+
+def reconcile_zero_cost(baseline: SearchResult, zero: SearchResult,
+                        tol: float = 1e-6) -> dict:
+    """Reconcile ``pnl_gross + cost_drag − fees`` against a real zero-cost run.
+
+    The same config is replayed with every cost switched off, so the fills are
+    the same *raw* prices: on the same trips and the same fill timestamps the
+    zero-cost net must equal the baseline's own reconstruction,
+
+        pnl_gross + cost_drag − fees == Σ side·(raw_exit − raw_entry)·qty
+
+    because the reported gross is computed from *slipped* fills (which carries
+    ``−Σ qty·slip`` on entry and on exit) and ``cost_drag`` adds exactly those
+    slips back, plus the fees that the gross also already had removed.  A
+    mismatch means the reconstruction the screen's zero-cost column runs on is
+    not the P&L the engine actually books.
+    """
+    b = baseline.trades
+    z = zero.trades
+    out: dict = {
+        "trips_baseline": int(len(b)), "trips_zero_cost": int(len(z)),
+        "same_trips": bool(len(b) == len(z)),
+        "same_fill_timestamps": False,
+        "reconstructed": 0.0, "zero_cost_net": 0.0,
+        "difference": 0.0, "within_tolerance": False, "mismatches": [],
+    }
+    if len(b) != len(z):
+        out["mismatches"].append(
+            f"trip count differs: baseline {len(b)} vs zero-cost {len(z)}")
+        return out
+    ts_ok = True
+    for i in range(len(b)):
+        for col in ("entry_time", "exit_time", "instrument"):
+            if str(b.iloc[i][col]) != str(z.iloc[i][col]):
+                ts_ok = False
+                out["mismatches"].append(
+                    f"trip {i}: {col} differs ({b.iloc[i][col]} vs {z.iloc[i][col]})")
+    out["same_fill_timestamps"] = bool(ts_ok)
+    recon = float((b["pnl_gross"] + b["cost_drag"] - b["fees"]).sum())
+    out["reconstructed"] = recon
+    out["zero_cost_net"] = float(z["pnl_after_costs"].sum())
+    out["difference"] = float(out["zero_cost_net"] - recon)
+    out["within_tolerance"] = abs(out["difference"]) <= tol
+    if not out["within_tolerance"]:
+        out["mismatches"].append(
+            f"reconstruction {recon!r} != zero-cost net {out['zero_cost_net']!r} "
+            f"(difference {out['difference']!r})")
+    return out
