@@ -1,0 +1,1834 @@
+FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF.FFFFF                                     [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+__________ test_a_flat_pair_can_never_book_a_profit[one_symbol_equal] __________
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'gross_notional'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+label = 'one_symbol_equal'
+
+    @pytest.mark.parametrize("label", sorted(LEG_SETS))
+    def test_a_flat_pair_can_never_book_a_profit(label):
+        """A flat tape: spread P&L is exactly zero, so only the toll may be booked.
+    
+        Two legs on one symbol used to collapse into a single fill per symbol, and
+        ``pnl_gross + cost_drag`` then came out **positive** by the cancelled toll —
+        a fabricated profit, which is the mechanism that made round 1's survivor
+        look positive.  Both shapes must lose exactly the four adverse fills.
+        """
+        legs = LEG_SETS[label]
+        res = flat_trip(legs, key=f"pair-{label}")
+        assert len(res.trades) == 1, "the fixture signals exactly one trip"
+        tr = res.trades.iloc[0]
+>       toll = 2.0 * SLIP * (tr["gross_notional"] / FLAT_PX)
+                             ^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:102: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'gross_notional'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+_________ test_a_flat_pair_can_never_book_a_profit[one_symbol_unequal] _________
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'gross_notional'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+label = 'one_symbol_unequal'
+
+    @pytest.mark.parametrize("label", sorted(LEG_SETS))
+    def test_a_flat_pair_can_never_book_a_profit(label):
+        """A flat tape: spread P&L is exactly zero, so only the toll may be booked.
+    
+        Two legs on one symbol used to collapse into a single fill per symbol, and
+        ``pnl_gross + cost_drag`` then came out **positive** by the cancelled toll —
+        a fabricated profit, which is the mechanism that made round 1's survivor
+        look positive.  Both shapes must lose exactly the four adverse fills.
+        """
+        legs = LEG_SETS[label]
+        res = flat_trip(legs, key=f"pair-{label}")
+        assert len(res.trades) == 1, "the fixture signals exactly one trip"
+        tr = res.trades.iloc[0]
+>       toll = 2.0 * SLIP * (tr["gross_notional"] / FLAT_PX)
+                             ^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:102: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'gross_notional'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+_________ test_a_flat_pair_can_never_book_a_profit[two_symbols_equal] __________
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'gross_notional'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+label = 'two_symbols_equal'
+
+    @pytest.mark.parametrize("label", sorted(LEG_SETS))
+    def test_a_flat_pair_can_never_book_a_profit(label):
+        """A flat tape: spread P&L is exactly zero, so only the toll may be booked.
+    
+        Two legs on one symbol used to collapse into a single fill per symbol, and
+        ``pnl_gross + cost_drag`` then came out **positive** by the cancelled toll —
+        a fabricated profit, which is the mechanism that made round 1's survivor
+        look positive.  Both shapes must lose exactly the four adverse fills.
+        """
+        legs = LEG_SETS[label]
+        res = flat_trip(legs, key=f"pair-{label}")
+        assert len(res.trades) == 1, "the fixture signals exactly one trip"
+        tr = res.trades.iloc[0]
+>       toll = 2.0 * SLIP * (tr["gross_notional"] / FLAT_PX)
+                             ^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:102: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'gross_notional'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+________ test_a_flat_pair_can_never_book_a_profit[two_symbols_unequal] _________
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'gross_notional'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+label = 'two_symbols_unequal'
+
+    @pytest.mark.parametrize("label", sorted(LEG_SETS))
+    def test_a_flat_pair_can_never_book_a_profit(label):
+        """A flat tape: spread P&L is exactly zero, so only the toll may be booked.
+    
+        Two legs on one symbol used to collapse into a single fill per symbol, and
+        ``pnl_gross + cost_drag`` then came out **positive** by the cancelled toll —
+        a fabricated profit, which is the mechanism that made round 1's survivor
+        look positive.  Both shapes must lose exactly the four adverse fills.
+        """
+        legs = LEG_SETS[label]
+        res = flat_trip(legs, key=f"pair-{label}")
+        assert len(res.trades) == 1, "the fixture signals exactly one trip"
+        tr = res.trades.iloc[0]
+>       toll = 2.0 * SLIP * (tr["gross_notional"] / FLAT_PX)
+                             ^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:102: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'gross_notional'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+________ test_the_flat_pair_toll_is_reported_honestly[one_symbol_equal] ________
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'gross_notional'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+label = 'one_symbol_equal'
+
+    @pytest.mark.parametrize("label", sorted(LEG_SETS))
+    def test_the_flat_pair_toll_is_reported_honestly(label):
+        """``cost_drag`` must equal what the fills actually charged."""
+        legs = LEG_SETS[label]
+        tr = flat_trip(legs, key=f"pair-{label}").trades.iloc[0]
+        assert tr["cost_drag"] == pytest.approx(
+>           2.0 * SLIP * (tr["gross_notional"] / FLAT_PX), rel=1e-3)
+                          ^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:116: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'gross_notional'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+_______ test_the_flat_pair_toll_is_reported_honestly[one_symbol_unequal] _______
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'gross_notional'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+label = 'one_symbol_unequal'
+
+    @pytest.mark.parametrize("label", sorted(LEG_SETS))
+    def test_the_flat_pair_toll_is_reported_honestly(label):
+        """``cost_drag`` must equal what the fills actually charged."""
+        legs = LEG_SETS[label]
+        tr = flat_trip(legs, key=f"pair-{label}").trades.iloc[0]
+        assert tr["cost_drag"] == pytest.approx(
+>           2.0 * SLIP * (tr["gross_notional"] / FLAT_PX), rel=1e-3)
+                          ^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:116: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'gross_notional'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+_______ test_the_flat_pair_toll_is_reported_honestly[two_symbols_equal] ________
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'gross_notional'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+label = 'two_symbols_equal'
+
+    @pytest.mark.parametrize("label", sorted(LEG_SETS))
+    def test_the_flat_pair_toll_is_reported_honestly(label):
+        """``cost_drag`` must equal what the fills actually charged."""
+        legs = LEG_SETS[label]
+        tr = flat_trip(legs, key=f"pair-{label}").trades.iloc[0]
+        assert tr["cost_drag"] == pytest.approx(
+>           2.0 * SLIP * (tr["gross_notional"] / FLAT_PX), rel=1e-3)
+                          ^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:116: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'gross_notional'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+______ test_the_flat_pair_toll_is_reported_honestly[two_symbols_unequal] _______
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'gross_notional'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+label = 'two_symbols_unequal'
+
+    @pytest.mark.parametrize("label", sorted(LEG_SETS))
+    def test_the_flat_pair_toll_is_reported_honestly(label):
+        """``cost_drag`` must equal what the fills actually charged."""
+        legs = LEG_SETS[label]
+        tr = flat_trip(legs, key=f"pair-{label}").trades.iloc[0]
+        assert tr["cost_drag"] == pytest.approx(
+>           2.0 * SLIP * (tr["gross_notional"] / FLAT_PX), rel=1e-3)
+                          ^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:116: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'gross_notional'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'gross_notional'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+____________ test_a_same_symbol_pair_mirrors_like_a_distinct_one[1] ____________
+
+direction = 1
+
+    @pytest.mark.parametrize("direction", [1, -1])
+    def test_a_same_symbol_pair_mirrors_like_a_distinct_one(direction):
+        """The mirror of a same-symbol pair pays the same toll as the original."""
+        same = flat_trip(LEG_SETS["one_symbol_equal"], key="SOXL/SOXL",
+                         direction=direction).trades.iloc[0]
+        distinct = flat_trip(LEG_SETS["two_symbols_equal"], key="SOXL/TQQQ",
+                             direction=direction).trades.iloc[0]
+>       assert same["cost_drag"] == pytest.approx(distinct["cost_drag"], rel=1e-12)
+E       assert np.float64(20.004000800160032) == 20.00000080000003 ± 2.0e-11
+E         
+E         comparison failed
+E         Obtained: 20.004000800160032
+E         Expected: 20.00000080000003 ± 2.0e-11
+
+tests/test_strategy_search_round2_gate.py:127: AssertionError
+___________ test_a_same_symbol_pair_mirrors_like_a_distinct_one[-1] ____________
+
+direction = -1
+
+    @pytest.mark.parametrize("direction", [1, -1])
+    def test_a_same_symbol_pair_mirrors_like_a_distinct_one(direction):
+        """The mirror of a same-symbol pair pays the same toll as the original."""
+        same = flat_trip(LEG_SETS["one_symbol_equal"], key="SOXL/SOXL",
+                         direction=direction).trades.iloc[0]
+        distinct = flat_trip(LEG_SETS["two_symbols_equal"], key="SOXL/TQQQ",
+                             direction=direction).trades.iloc[0]
+>       assert same["cost_drag"] == pytest.approx(distinct["cost_drag"], rel=1e-12)
+E       assert np.float64(19.996000799840033) == 20.00000080000003 ± 2.0e-11
+E         
+E         comparison failed
+E         Obtained: 19.996000799840033
+E         Expected: 20.00000080000003 ± 2.0e-11
+
+tests/test_strategy_search_round2_gate.py:127: AssertionError
+_______________ test_every_trip_carries_the_accounting_identity ________________
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'identity_residual'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+>           return self._engine.get_loc(casted_key)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+pandas/_libs/index.pyx:168: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:197: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7668: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   KeyError: 'identity_residual'
+
+pandas/_libs/hashtable_class_helper.pxi:7676: KeyError
+
+The above exception was the direct cause of the following exception:
+
+    def test_every_trip_carries_the_accounting_identity():
+        """``pnl_after_costs == Σ leg.side·(exit_fill − entry_fill)·qty − fees``."""
+        tr = flat_trip(LEG_SETS["one_symbol_unequal"], key="SOXL/SOXL").trades.iloc[0]
+>       assert tr["identity_residual"] == pytest.approx(0.0, abs=1e-9)
+               ^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_gate.py:134: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:959: in __getitem__
+    return self._get_value(key)
+           ^^^^^^^^^^^^^^^^^^^^
+../engine/.venv/lib/python3.12/site-packages/pandas/core/series.py:1046: in _get_value
+    loc = self.index.get_loc(label)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = Index(['instrument', 'symbols', 'legs', 'notional', 'entry_time', 'exit_time',
+       'entry_price', 'exit_price', 'ho...', 'exit_reason', 'pnl_gross',
+       'fees', 'cost_drag', 'pnl_after_costs', 'ret_pct', 'net_bps'],
+      dtype='str')
+key = 'identity_residual'
+
+    def get_loc(self, key):
+        """
+        Get integer location, slice or boolean mask for requested label.
+    
+        Parameters
+        ----------
+        key : label
+            The key to check its location if it is present in the index.
+    
+        Returns
+        -------
+        int if unique index, slice if monotonic index, else mask
+            Integer location, slice or boolean mask.
+    
+        See Also
+        --------
+        Index.get_slice_bound : Calculate slice bound that corresponds to
+            given label.
+        Index.get_indexer : Computes indexer and mask for new index given
+            the current index.
+        Index.get_non_unique : Returns indexer and masks for new index given
+            the current index.
+        Index.get_indexer_for : Returns an indexer even when non-unique.
+    
+        Examples
+        --------
+        >>> unique_index = pd.Index(list("abc"))
+        >>> unique_index.get_loc("b")
+        1
+    
+        >>> monotonic_index = pd.Index(list("abbc"))
+        >>> monotonic_index.get_loc("b")
+        slice(1, 3, None)
+    
+        >>> non_monotonic_index = pd.Index(list("abcb"))
+        >>> non_monotonic_index.get_loc("b")
+        array([False,  True, False,  True])
+        """
+        casted_key = self._maybe_cast_indexer(key)
+        try:
+            return self._engine.get_loc(casted_key)
+        except KeyError as err:
+            if isinstance(casted_key, slice) or (
+                isinstance(casted_key, abc.Iterable)
+                and any(isinstance(x, slice) for x in casted_key)
+            ):
+                raise InvalidIndexError(key) from err
+>           raise KeyError(key) from err
+E           KeyError: 'identity_residual'
+
+../engine/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py:3648: KeyError
+__________ test_the_zero_cost_run_reconciles_with_the_reconstruction ___________
+
+    def test_the_zero_cost_run_reconciles_with_the_reconstruction():
+        """A real zero-cost replay must equal ``pnl_gross + cost_drag − fees``.
+    
+        This is the number the screen's fold-breadth rule reads; if the engine's own
+        reconstruction of it disagrees with a replay that actually charges nothing,
+        the zero-cost column is not measuring a P&L at all.
+        """
+        legs = LEG_SETS["one_symbol_unequal"]
+        m = flat_market(["SOXL"])
+        entry = np.zeros(m.n(), dtype=np.int8)
+        entry[5] = 1
+        inst = Instrument(key="SOXL/SOXL", legs=legs, entry_dir=entry,
+                          exit_now=np.full(m.n(), 2, dtype=np.int8),
+                          valid=m.valid(legs), kind="pair")
+        cfg = simple_cfg(allow_short=True, max_positions=4)
+        base = run_search(m, {"SOXL/SOXL": inst}, cfg, CostModel.baseline())
+        zero = run_search(m, {"SOXL/SOXL": inst}, cfg, CostModel.zero_cost())
+>       rec = engine.reconcile_zero_cost(base, zero)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.engine' has no attribute 'reconcile_zero_cost'
+
+tests/test_strategy_search_round2_gate.py:156: AttributeError
+__________ test_the_builder_refuses_a_universe_too_small_for_its_legs __________
+
+    def test_the_builder_refuses_a_universe_too_small_for_its_legs():
+        """``2k <= |U| - 1``: a two-leg instrument needs a universe of five symbols."""
+        syms = ["SOXL", "TQQQ", "SPY"]
+        bars = flat_session("2025-01-02", FLAT_PX, 390)
+        m = Market({s: mk_frame({"2025-01-02": bars}) for s in syms})
+        book = FeatureBook({s: mk_frame({"2025-01-02": bars}) for s in syms})
+        spec = dict(families.GRID_D[0])
+        spec["signal"] = dict(spec["signal"])
+>       with pytest.raises(ValueError, match=r"2k|universe"):
+E       Failed: DID NOT RAISE ValueError
+
+tests/test_strategy_search_round2_gate.py:171: Failed
+___________ test_a_spec_must_declare_every_behaviour_changing_param ____________
+
+    def test_a_spec_must_declare_every_behaviour_changing_param():
+        m, aligned = a_market()
+        spec = family_a_spec()
+>       del spec["params"]["eod_flat_min"]
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'eod_flat_min'
+
+tests/test_strategy_search_round2_gate.py:215: KeyError
+________________ test_the_builder_refuses_an_unknown_param_key _________________
+
+    def test_the_builder_refuses_an_unknown_param_key():
+        m, aligned = a_market()
+        spec = family_a_spec(notional_usdz=1.0)
+>       with pytest.raises(families.SpecError, match="unknown param"):
+                           ^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.families' has no attribute 'SpecError'
+
+tests/test_strategy_search_round2_gate.py:223: AttributeError
+________________ test_the_builder_refuses_an_unknown_extras_key ________________
+
+    def test_the_builder_refuses_an_unknown_extras_key():
+        m, aligned = a_market()
+        spec = family_a_spec()
+        spec["extras"] = {"stop_atr_mul": 1.0}
+>       with pytest.raises(families.SpecError, match="unknown extras"):
+                           ^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.families' has no attribute 'SpecError'
+
+tests/test_strategy_search_round2_gate.py:231: AttributeError
+___________ test_the_resolved_spec_is_returned_and_names_the_config ____________
+
+    def test_the_resolved_spec_is_returned_and_names_the_config():
+        """``z_window`` is the knob the stage-1 artefact silently never recorded."""
+        m, aligned = five_symbol_market()
+        spec = dict(families.GRID_D[0])
+>       cfg, _inst, resolved = families.build("D", spec, m, aligned)
+        ^^^^^^^^^^^^^^^^^^^^
+E       ValueError: not enough values to unpack (expected 3, got 2)
+
+tests/test_strategy_search_round2_gate.py:239: ValueError
+_________________ test_the_resolved_hash_is_window_independent _________________
+
+    def test_the_resolved_hash_is_window_independent():
+        """W2's hash must equal W1's: the same resolved config, two bar sets."""
+        frames = {s: bars_frame(n=60) for s in ("SOXL", "TQQQ", "FNGU", "SPXL", "SPY")}
+        spec = dict(families.GRID_D[0])
+        hashes = []
+        for _ in range(2):
+            m = Market(frames)
+>           _cfg, _inst, resolved = families.build(
+            ^^^^^^^^^^^^^^^^^^^^^
+                "D", spec, m, FeatureBook(frames).align(m.axis))
+E           ValueError: not enough values to unpack (expected 3, got 2)
+
+tests/test_strategy_search_round2_gate.py:256: ValueError
+____________ test_the_recorded_run_set_must_equal_the_declared_set _____________
+
+    def test_the_recorded_run_set_must_equal_the_declared_set():
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import run_strategy_search as runner_mod
+    
+>       key = runner_mod.run_key("C", "c1", "W1", "baseline", "fixed_notional")
+              ^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'run_strategy_search' has no attribute 'run_key'
+
+tests/test_strategy_search_round2_gate.py:266: AttributeError
+______________ test_a_pending_entry_is_discarded_not_filled_later ______________
+
+    def test_a_pending_entry_is_discarded_not_filled_later():
+        """A fill bar the instrument does not have means *dropped*, not delayed.
+    
+        Filling at a later bar's open hands the config a free option — and for a
+        gap/reversal family it is systematically flattering.
+        """
+        soxl = gap_frame(list(range(0, 11)) + list(range(21, 31)))
+        spy = gap_frame(list(range(0, 31)))
+        m = Market({"SOXL": soxl, "SPY": spy})
+        entry = np.zeros(m.n(), dtype=np.int8)
+        entry[10] = 1                                     # fills on minute 10+1
+        inst = Instrument(key="SOXL", legs=(Leg("SOXL", 1, 1.0),), entry_dir=entry,
+                          exit_now=np.zeros(m.n(), dtype=np.int8),
+                          valid=m.valid((Leg("SOXL", 1, 1.0),)))
+        res = run_search(m, {"SOXL": inst}, simple_cfg(max_positions=1),
+                         CostModel.baseline())
+>       assert res.stats["skipped"]["stale_entry"] == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'stale_entry'
+
+tests/test_strategy_search_round2_gate.py:293: KeyError
+___________ test_a_missing_bar_at_the_flatten_time_is_fatal[single] ____________
+
+kind = 'single'
+
+    @pytest.mark.parametrize("kind", ["single", "pair"])
+    def test_a_missing_bar_at_the_flatten_time_is_fatal(kind):
+        """A failed EOD flatten is fatal, never a position carried into tomorrow."""
+        soxl = bars_frame(n=360)                          # 09:30 .. 15:29 only
+        other = bars_frame(n=361)                         # has the 15:30 bar
+        m = Market({"SOXL": soxl, "TQQQ": other})
+        legs = ((Leg("SOXL", 1, 1.0),) if kind == "single"
+                else (Leg("SOXL", 1, 1.0), Leg("TQQQ", -1, 1.0)))
+        entry = np.zeros(m.n(), dtype=np.int8)
+        entry[60] = 1
+        inst = Instrument(key="SOXL" if kind == "single" else "SOXL/TQQQ", legs=legs,
+                          entry_dir=entry, exit_now=np.zeros(m.n(), dtype=np.int8),
+                          valid=m.valid(legs),
+                          kind="single" if kind == "single" else "pair")
+        cfg = simple_cfg(max_positions=4, allow_short=True)
+>       with pytest.raises(RuntimeError, match="flatten"):
+E       Failed: DID NOT RAISE RuntimeError
+
+tests/test_strategy_search_round2_gate.py:314: Failed
+____________ test_a_missing_bar_at_the_flatten_time_is_fatal[pair] _____________
+
+kind = 'pair'
+
+    @pytest.mark.parametrize("kind", ["single", "pair"])
+    def test_a_missing_bar_at_the_flatten_time_is_fatal(kind):
+        """A failed EOD flatten is fatal, never a position carried into tomorrow."""
+        soxl = bars_frame(n=360)                          # 09:30 .. 15:29 only
+        other = bars_frame(n=361)                         # has the 15:30 bar
+        m = Market({"SOXL": soxl, "TQQQ": other})
+        legs = ((Leg("SOXL", 1, 1.0),) if kind == "single"
+                else (Leg("SOXL", 1, 1.0), Leg("TQQQ", -1, 1.0)))
+        entry = np.zeros(m.n(), dtype=np.int8)
+        entry[60] = 1
+        inst = Instrument(key="SOXL" if kind == "single" else "SOXL/TQQQ", legs=legs,
+                          entry_dir=entry, exit_now=np.zeros(m.n(), dtype=np.int8),
+                          valid=m.valid(legs),
+                          kind="single" if kind == "single" else "pair")
+        cfg = simple_cfg(max_positions=4, allow_short=True)
+>       with pytest.raises(RuntimeError, match="flatten"):
+E       Failed: DID NOT RAISE RuntimeError
+
+tests/test_strategy_search_round2_gate.py:314: Failed
+_____________ test_every_drop_is_counted_and_the_accounting_holds ______________
+
+    def test_every_drop_is_counted_and_the_accounting_holds():
+        """A short refused by ``allow_short`` is counted, not silently vanished."""
+        m = Market({"SOXL": bars_frame()})
+        entry = np.zeros(m.n(), dtype=np.int8)
+        entry[60] = -1
+        inst = Instrument(key="SOXL", legs=(Leg("SOXL", 1, 1.0),), entry_dir=entry,
+                          exit_now=np.zeros(m.n(), dtype=np.int8),
+                          valid=m.valid((Leg("SOXL", 1, 1.0),)))
+        res = run_search(m, {"SOXL": inst}, simple_cfg(), CostModel.baseline())
+>       assert res.stats["skipped"]["allow_short"] == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'allow_short'
+
+tests/test_strategy_search_round2_gate.py:327: KeyError
+________ test_an_unknown_feature_name_raises_instead_of_reading_as_nan _________
+
+    def test_an_unknown_feature_name_raises_instead_of_reading_as_nan():
+        """A typo used to trade zero trips and read as 'killed: too few trips'."""
+        frames = {"SOXL": bars_frame(n=60)}
+        m = Market(frames)
+        aligned = FeatureBook(frames).align(m.axis)
+>       with pytest.raises(ValueError, match="declared feature set"):
+E       Failed: DID NOT RAISE ValueError
+
+tests/test_strategy_search_round2_gate.py:341: Failed
+______________ test_an_atr_skip_is_counted_as_no_atr_not_min_qty _______________
+
+    def test_an_atr_skip_is_counted_as_no_atr_not_min_qty():
+        m = Market({"SOXL": bars_frame()})
+        entry = np.zeros(m.n(), dtype=np.int8)
+        entry[60] = 1
+        inst = Instrument(key="SOXL", legs=(Leg("SOXL", 1, 1.0),), entry_dir=entry,
+                          exit_now=np.zeros(m.n(), dtype=np.int8),
+                          valid=m.valid((Leg("SOXL", 1, 1.0),)), atr_pct=None)
+        cfg = simple_cfg()
+        cfg = engine.SearchConfig(**{**cfg.params(), "extras": {"stop_atr_mult": 1.0}})
+        res = run_search(m, {"SOXL": inst}, cfg, CostModel.baseline())
+>       assert res.stats["skipped"]["no_atr"] == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'no_atr'
+
+tests/test_strategy_search_round2_gate.py:357: KeyError
+_____________________ test_family_c_is_blind_to_the_future _____________________
+
+    def test_family_c_is_blind_to_the_future():
+        from tests.future_blindness import assert_blind_to_the_future
+    
+        frames = _blind_frames()
+        spec = dict(families.GRID_C[1])
+        spec["symbols"] = ["SOXL"]
+>       out = assert_blind_to_the_future("C", spec, frames,
+                                         pd.Timestamp("2025-01-03 10:00"))
+
+tests/test_strategy_search_round2_gate.py:367: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/future_blindness.py:82: in assert_blind_to_the_future
+    market, aligned, base = signal_arrays(family, spec, frames)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+family = 'C'
+spec = {'name': 'c_or30_long_atr1_2', 'params': {'sizing': 'fixed_notional', 'notional_usd': 50000.0, 'initial_equity': 10000...tr_mult': 1.0, 'target_atr_mult': 2.0, 'trail_atr_mult': 0.0}, 'signal': {'or_minutes': 30, 'allow_short': False}, ...}
+frames = {'SOXL':                        open    high     low   close  volume
+ts                                               ...64  117.74  117.54  117.64  1000.0
+2025-01-03 11:29:00  117.62  117.72  117.52  117.62  1000.0
+
+[240 rows x 5 columns]}
+
+    def signal_arrays(family: str, spec: dict, frames: Mapping[str, pd.DataFrame]):
+        """Run the whole pipeline and return ``(market, aligned, arrays)``."""
+        from src.backtesting.strategy_search import families as fam
+        from src.backtesting.strategy_search.engine import Market
+        from src.backtesting.strategy_search.features import FeatureBook
+    
+        market = Market(frames)
+        book = FeatureBook(frames)
+        aligned = book.align(market.axis)
+>       _cfg, instruments, _resolved = fam.build(family, spec, market, aligned)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       ValueError: not enough values to unpack (expected 3, got 2)
+
+tests/future_blindness.py:72: ValueError
+_____________________ test_family_a_is_blind_to_the_future _____________________
+
+    def test_family_a_is_blind_to_the_future():
+        from tests.future_blindness import assert_blind_to_the_future
+    
+        frames = _blind_frames()
+        spec = dict(families.GRID_A[0])
+        spec["symbols"] = ["SOXL"]
+>       out = assert_blind_to_the_future("A", spec, frames,
+                                         pd.Timestamp("2025-01-03 10:00"))
+
+tests/test_strategy_search_round2_gate.py:378: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/future_blindness.py:82: in assert_blind_to_the_future
+    market, aligned, base = signal_arrays(family, spec, frames)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+family = 'A'
+spec = {'name': 'a_trend_trail50_reg', 'params': {'sizing': 'fixed_notional', 'notional_usd': 50000.0, 'initial_equity': 1000...extras': {'stop_atr_mult': 0.0}, 'signal': {'entry_mode': 'vwap_ema', 'regime': 'spy_trend', 'exit_mode': 'none'}, ...}
+frames = {'SOXL':                        open    high     low   close  volume
+ts                                               ...64  117.74  117.54  117.64  1000.0
+2025-01-03 11:29:00  117.62  117.72  117.52  117.62  1000.0
+
+[240 rows x 5 columns]}
+
+    def signal_arrays(family: str, spec: dict, frames: Mapping[str, pd.DataFrame]):
+        """Run the whole pipeline and return ``(market, aligned, arrays)``."""
+        from src.backtesting.strategy_search import families as fam
+        from src.backtesting.strategy_search.engine import Market
+        from src.backtesting.strategy_search.features import FeatureBook
+    
+        market = Market(frames)
+        book = FeatureBook(frames)
+        aligned = book.align(market.axis)
+>       _cfg, instruments, _resolved = fam.build(family, spec, market, aligned)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       ValueError: not enough values to unpack (expected 3, got 2)
+
+tests/future_blindness.py:72: ValueError
+________________ test_a_multi_leg_config_may_not_declare_a_stop ________________
+
+    def test_a_multi_leg_config_may_not_declare_a_stop():
+        m, aligned = five_symbol_market()
+        spec = dict(families.GRID_D[0])
+        spec["params"] = dict(spec["params"], stop_pct=0.01)
+>       with pytest.raises(families.SpecError, match="more than one leg"):
+                           ^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.families' has no attribute 'SpecError'
+
+tests/test_strategy_search_round2_gate.py:399: AttributeError
+_______________ test_a_time_exit_is_measured_in_minutes_not_bars _______________
+
+    def test_a_time_exit_is_measured_in_minutes_not_bars():
+        mins = list(range(0, 6)) + list(range(30, 41))
+        df = gap_frame(mins)
+        m = Market({"SOXL": df})
+        entry = np.zeros(m.n(), dtype=np.int8)
+        entry[3] = 1                                      # filled on minute 4
+        inst = Instrument(key="SOXL", legs=(Leg("SOXL", 1, 1.0),), entry_dir=entry,
+                          exit_now=np.zeros(m.n(), dtype=np.int8),
+                          valid=m.valid((Leg("SOXL", 1, 1.0),)))
+        res = run_search(m, {"SOXL": inst}, simple_cfg(time_exit_minutes=5),
+                         CostModel.baseline())
+        tr = res.trades.iloc[0]
+        assert tr["exit_reason"] == "time"
+        assert tr["entry_time"] == m.axis[4]
+>       assert tr["exit_time"] == m.axis[6], \
+            "the first bar at or after 5 *minutes*, not the fifth bar"
+E       AssertionError: the first bar at or after 5 *minutes*, not the fifth bar
+E       assert Timestamp('2025-01-02 10:03:00') == Timestamp('2025-01-02 10:00:00')
+
+tests/test_strategy_search_round2_gate.py:417: AssertionError
+__________________ test_eod_flat_min_must_be_a_declared_value __________________
+
+    def test_eod_flat_min_must_be_a_declared_value():
+        m, aligned = a_market()
+        spec = family_a_spec(eod_flat_min=15 * 60 + 59)
+>       with pytest.raises(families.SpecError, match="eod_flat_min"):
+                           ^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.families' has no attribute 'SpecError'
+
+tests/test_strategy_search_round2_gate.py:425: AttributeError
+_______________ test_a_zero_trip_month_fails_the_stability_rule ________________
+
+    def test_a_zero_trip_month_fails_the_stability_rule():
+        good = [{"month": f"2025-{m:02d}", "round_trips": 20, "net_bps_per_trip": 1.0}
+                for m in range(1, 13)]
+>       assert screen.fold_stability(good)[0]
+               ^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'fold_stability'
+
+tests/test_strategy_search_round2_gate.py:439: AttributeError
+__ test_the_ranking_is_net_then_drawdown_then_trips_then_costs_then_stability __
+
+    def test_the_ranking_is_net_then_drawdown_then_trips_then_costs_then_stability():
+        def row(net, dd, trips, drag, folds):
+            return {"net_pct_equal_weighted": net, "max_drawdown_worst": dd,
+                    "trips_w1": trips, "trips_w2": trips,
+                    "cost_drag_bps_w1": drag, "cost_drag_bps_w2": drag,
+                    "folds_positive_min": folds}
+    
+        deep = row(0.05, -0.40, 200, 4.0, 9)
+        shallow = row(0.05, -0.10, 200, 4.0, 9)
+>       assert screen.rank_row(shallow) > screen.rank_row(deep)
+               ^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'rank_row'
+
+tests/test_strategy_search_round2_gate.py:455: AttributeError
+___________________ test_the_neighbour_rule_applies_per_axis ___________________
+
+    def test_the_neighbour_rule_applies_per_axis():
+        both_ok = {"n1": True, "n2": True, "n3": True}
+>       ok, why = screen.neighbour_verdict({"z_entry": ["n1"], "or_minutes": ["n2", "n3"]},
+                  ^^^^^^^^^^^^^^^^^^^^^^^^
+                                           both_ok)
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'neighbour_verdict'
+
+tests/test_strategy_search_round2_gate.py:467: AttributeError
+________________ test_declared_axes_come_from_the_resolved_grid ________________
+
+    def test_declared_axes_come_from_the_resolved_grid():
+>       axes = screen.declared_axes("C", families.GRID_C)
+               ^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'declared_axes'
+
+tests/test_strategy_search_round2_gate.py:480: AttributeError
+_________ test_neighbour_cells_exclude_the_baseline_and_dedupe_by_hash _________
+
+    def test_neighbour_cells_exclude_the_baseline_and_dedupe_by_hash():
+        specs = [
+            dict(name="c0", params=dict(families.GRID_C[1]["params"]),
+                 extras=dict(stop_atr_mult=1.0, target_atr_mult=2.0, trail_atr_mult=0.0),
+                 signal=dict(or_minutes=30, allow_short=False)),
+            dict(name="c1", params=dict(families.GRID_C[1]["params"]),
+                 extras=dict(stop_atr_mult=1.5, target_atr_mult=2.0, trail_atr_mult=0.0),
+                 signal=dict(or_minutes=30, allow_short=False)),
+            dict(name="c2", params=dict(families.GRID_C[1]["params"]),
+                 extras=dict(stop_atr_mult=1.5, target_atr_mult=2.0, trail_atr_mult=0.0),
+                 signal=dict(or_minutes=30, allow_short=False)),
+            # varies two axes at once, so it is a neighbour of neither
+            dict(name="c3", params=dict(families.GRID_C[1]["params"]),
+                 extras=dict(stop_atr_mult=2.0, target_atr_mult=2.0, trail_atr_mult=0.0),
+                 signal=dict(or_minutes=60, allow_short=False)),
+        ]
+>       cells = screen.neighbour_cells("C", specs, "c0")
+                ^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'neighbour_cells'
+
+tests/test_strategy_search_round2_gate.py:501: AttributeError
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_gate.py::test_a_flat_pair_can_never_book_a_profit[one_symbol_equal] - KeyError: 'gross_notional'
+FAILED tests/test_strategy_search_round2_gate.py::test_a_flat_pair_can_never_book_a_profit[one_symbol_unequal] - KeyError: 'gross_notional'
+FAILED tests/test_strategy_search_round2_gate.py::test_a_flat_pair_can_never_book_a_profit[two_symbols_equal] - KeyError: 'gross_notional'
+FAILED tests/test_strategy_search_round2_gate.py::test_a_flat_pair_can_never_book_a_profit[two_symbols_unequal] - KeyError: 'gross_notional'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_flat_pair_toll_is_reported_honestly[one_symbol_equal] - KeyError: 'gross_notional'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_flat_pair_toll_is_reported_honestly[one_symbol_unequal] - KeyError: 'gross_notional'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_flat_pair_toll_is_reported_honestly[two_symbols_equal] - KeyError: 'gross_notional'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_flat_pair_toll_is_reported_honestly[two_symbols_unequal] - KeyError: 'gross_notional'
+FAILED tests/test_strategy_search_round2_gate.py::test_a_same_symbol_pair_mirrors_like_a_distinct_one[1] - assert np.float64(20.004000800160032) == 20.00000080000003 ± 2.0e-11
+  
+  comparison failed
+  Obtained: 20.004000800160032
+  Expected: 20.00000080000003 ± 2.0e-11
+FAILED tests/test_strategy_search_round2_gate.py::test_a_same_symbol_pair_mirrors_like_a_distinct_one[-1] - assert np.float64(19.996000799840033) == 20.00000080000003 ± 2.0e-11
+  
+  comparison failed
+  Obtained: 19.996000799840033
+  Expected: 20.00000080000003 ± 2.0e-11
+FAILED tests/test_strategy_search_round2_gate.py::test_every_trip_carries_the_accounting_identity - KeyError: 'identity_residual'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_zero_cost_run_reconciles_with_the_reconstruction - AttributeError: module 'src.backtesting.strategy_search.engine' has no attribute 'reconcile_zero_cost'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_builder_refuses_a_universe_too_small_for_its_legs - Failed: DID NOT RAISE ValueError
+FAILED tests/test_strategy_search_round2_gate.py::test_a_spec_must_declare_every_behaviour_changing_param - KeyError: 'eod_flat_min'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_builder_refuses_an_unknown_param_key - AttributeError: module 'src.backtesting.strategy_search.families' has no attribute 'SpecError'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_builder_refuses_an_unknown_extras_key - AttributeError: module 'src.backtesting.strategy_search.families' has no attribute 'SpecError'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_resolved_spec_is_returned_and_names_the_config - ValueError: not enough values to unpack (expected 3, got 2)
+FAILED tests/test_strategy_search_round2_gate.py::test_the_resolved_hash_is_window_independent - ValueError: not enough values to unpack (expected 3, got 2)
+FAILED tests/test_strategy_search_round2_gate.py::test_the_recorded_run_set_must_equal_the_declared_set - AttributeError: module 'run_strategy_search' has no attribute 'run_key'
+FAILED tests/test_strategy_search_round2_gate.py::test_a_pending_entry_is_discarded_not_filled_later - KeyError: 'stale_entry'
+FAILED tests/test_strategy_search_round2_gate.py::test_a_missing_bar_at_the_flatten_time_is_fatal[single] - Failed: DID NOT RAISE RuntimeError
+FAILED tests/test_strategy_search_round2_gate.py::test_a_missing_bar_at_the_flatten_time_is_fatal[pair] - Failed: DID NOT RAISE RuntimeError
+FAILED tests/test_strategy_search_round2_gate.py::test_every_drop_is_counted_and_the_accounting_holds - KeyError: 'allow_short'
+FAILED tests/test_strategy_search_round2_gate.py::test_an_unknown_feature_name_raises_instead_of_reading_as_nan - Failed: DID NOT RAISE ValueError
+FAILED tests/test_strategy_search_round2_gate.py::test_an_atr_skip_is_counted_as_no_atr_not_min_qty - KeyError: 'no_atr'
+FAILED tests/test_strategy_search_round2_gate.py::test_family_c_is_blind_to_the_future - ValueError: not enough values to unpack (expected 3, got 2)
+FAILED tests/test_strategy_search_round2_gate.py::test_family_a_is_blind_to_the_future - ValueError: not enough values to unpack (expected 3, got 2)
+FAILED tests/test_strategy_search_round2_gate.py::test_a_multi_leg_config_may_not_declare_a_stop - AttributeError: module 'src.backtesting.strategy_search.families' has no attribute 'SpecError'
+FAILED tests/test_strategy_search_round2_gate.py::test_a_time_exit_is_measured_in_minutes_not_bars - AssertionError: the first bar at or after 5 *minutes*, not the fifth bar
+assert Timestamp('2025-01-02 10:03:00') == Timestamp('2025-01-02 10:00:00')
+FAILED tests/test_strategy_search_round2_gate.py::test_eod_flat_min_must_be_a_declared_value - AttributeError: module 'src.backtesting.strategy_search.families' has no attribute 'SpecError'
+FAILED tests/test_strategy_search_round2_gate.py::test_a_zero_trip_month_fails_the_stability_rule - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'fold_stability'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_ranking_is_net_then_drawdown_then_trips_then_costs_then_stability - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'rank_row'
+FAILED tests/test_strategy_search_round2_gate.py::test_the_neighbour_rule_applies_per_axis - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'neighbour_verdict'
+FAILED tests/test_strategy_search_round2_gate.py::test_declared_axes_come_from_the_resolved_grid - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'declared_axes'
+FAILED tests/test_strategy_search_round2_gate.py::test_neighbour_cells_exclude_the_baseline_and_dedupe_by_hash - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'neighbour_cells'
+35 failed, 1 passed in 2.69s
