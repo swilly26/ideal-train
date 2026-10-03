@@ -68,12 +68,20 @@ EOD_PINNED_MIN = EOD_FLAT_MIN
 EOD_FLAT_NEIGHBOURS = (15 * 60 + 25, 15 * 60 + 30)
 MIN_ENTRY_QTY = 1.0
 MAX_HOLD_MINUTES = 390.0         # one RTH session; a longer hold is a bug
+#: **The declared gross-leverage limit** (R3-7 E6): the *gross* notional of one
+#: basket, ``Σ|qty·fill|``, may never exceed ``initial_equity`` — i.e. the book
+#: runs at 100 % leverage at most.  The check used to be the **net** outlay,
+#: which a long+short basket passes at ~$0 of outlay while opening two full
+#: notionals of gross exposure; a $100k account could then carry an unbounded
+#: gross book, and the two-leg families (F, and any future rank rotation) are
+#: exactly the shape that does it.
+MAX_GROSS_LEVERAGE = 1.0
 #: Skip counters every run carries.  A silent drop is not allowed: each one of
 #: these is incremented on a counted signal, and every run asserts
 #: ``entries + Σ skipped == signals`` before it returns.
-SKIP_KEYS = ("max_positions", "cash", "min_qty", "session_cap", "min_gap",
-             "late", "gate", "allow_short", "no_fill", "no_atr", "stale_entry",
-             "already_held", "survived_session")
+SKIP_KEYS = ("max_positions", "cash", "gross_leverage", "min_qty", "session_cap",
+             "min_gap", "late", "gate", "allow_short", "no_fill", "no_atr",
+             "stale_entry", "already_held", "survived_session")
 
 
 # ── instruments ────────────────────────────────────────────────────────
@@ -126,10 +134,17 @@ class SearchConfig:
     extras: Mapping[str, object] = field(default_factory=dict)
 
     def params(self) -> dict:
-        d = asdict(self)
-        extras = d.pop("extras") or {}
-        d.update(extras)
-        return d
+        """The config as a plain dict, with ``extras`` a **nested** key (R3-7 E2).
+
+        ``extras`` used to be merged *over* the real fields, so an ``extras``
+        entry could **shadow** a real field: two configs that differ only in an
+        extras entry produced the same ``params()`` — and therefore hashed alike,
+        and were recorded alike.  That is the channel the stage-2 defect came
+        through (a knob the engine read that the artefact never recorded), so it
+        must stay distinguishable in the config's own identity.  Callers that
+        want the declared surface read ``params()["extras"]`` explicitly.
+        """
+        return asdict(self)
 
 
 @dataclass
@@ -388,6 +403,7 @@ class SearchReplay:
             return
         open_legs: list[_OpenLeg] = []
         outlay = 0.0
+        gross = 0.0
         for i, leg in enumerate(inst.legs):
             fill = fills[(i, leg.symbol)]
             side = int(leg.side) * int(direction)
@@ -400,9 +416,17 @@ class SearchReplay:
             slip = self.costs.slip_per_share(raw)
             fee = self.costs.fees(qty, fill)
             outlay += side * (qty * fill) + fee
+            gross += abs(qty * fill)
             open_legs.append(_OpenLeg(symbol=leg.symbol, side=side, qty=qty,
                                       entry_fill=fill, entry_signal=raw,
                                       entry_slip=slip, entry_fee=fee))
+        # **Gross** leverage first (R3-7 E6): a basket whose two sides offset
+        # passes a net-cash check at ~$0 of outlay while carrying two full
+        # notionals of exposure.  The declared limit is 100 % of
+        # ``initial_equity``, reported per basket and in the run stats.
+        if gross > MAX_GROSS_LEVERAGE * float(cfg.initial_equity):
+            self.stats["skipped"]["gross_leverage"] += 1
+            return
         if outlay > self.cash:
             self.stats["skipped"]["cash"] += 1
             return
@@ -716,6 +740,10 @@ class SearchReplay:
         #: understated.  Quote it with this caveat (P2/E6).
         s["max_drawdown_note"] = ("equity marks stale closes (last known close) "
                                   "for a symbol with no bar at that timestamp")
+        #: The declared leverage limit, so every artefact records the bound the
+        #: basket check actually enforced (R3-7 E6).
+        s["max_gross_leverage"] = float(MAX_GROSS_LEVERAGE)
+        s["gross_limit_usd"] = float(MAX_GROSS_LEVERAGE) * float(cfg.initial_equity)
         if len(trades):
             s["gross_notional_per_trip"] = float(trades["gross_notional"].mean())
             s["net_outlay_per_trip"] = float(trades["net_outlay"].mean())

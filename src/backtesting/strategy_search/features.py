@@ -40,7 +40,7 @@ FEATURE_NAMES = (
     "minute", "sess_min", "vwap", "ema_fast", "ema_slow", "slope", "z20",
     "atr", "atr_pct", "ret30", "rvol30", "sess_ret", "or30_hi", "or30_lo",
     "or60_hi", "or60_lo", "prev_hi", "prev_lo", "prev_close", "prev_ret",
-    "sess_open",
+    "sess_open", "atr_prev_abs", "atr_prev_pct",
 )
 #: The raw OHLCV columns :func:`build_features` passes through.
 OHLCV_NAMES = ("open", "high", "low", "close", "volume")
@@ -136,6 +136,23 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["prev_lo"] = day.map(prev["lo"]).to_numpy()
     out["prev_close"] = day.map(prev["close"]).to_numpy()
     out["prev_ret"] = day.map(prev["close"] / prev["open"] - 1.0).to_numpy()
+
+    # ── the prior *completed* session's ATR(14) (R3-7: a causal normaliser) ──
+    # ``atr`` above is the within-session ATR(14): it is NaN for the first 14
+    # bars of every session, so it cannot normalise an opening signal (an
+    # opening-gap or opening-range family would either skip the whole morning or
+    # silently compare against a NaN — both are the round-1 failure class).
+    # These two are the previous session's ATR **at its last bar**, i.e. a value
+    # that is final at the prior close and never revised afterwards, which is
+    # exactly the "causal, prior-session" normaliser every round-2 cell
+    # declares.  ``atr_prev_pct`` divides by that session's close, so it is a
+    # return-scale quantity the leverage of the symbol is already inside.
+    sess_atr = out["atr"].groupby(day).last()
+    sess_close_last = c.groupby(day).last()
+    prev_atr = sess_atr.shift(1)
+    prev_atr_close = sess_close_last.shift(1)
+    out["atr_prev_abs"] = day.map(prev_atr).to_numpy()
+    out["atr_prev_pct"] = (day.map(prev_atr) / day.map(prev_atr_close)).to_numpy()
     return out
 
 

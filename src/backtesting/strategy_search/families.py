@@ -25,7 +25,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -68,14 +68,25 @@ SIGNAL_KEYS: dict[str, tuple[str, ...]] = {
     "C": ("or_minutes", "allow_short"),
     "D": ("kind", "leg_long", "leg_short", "z_entry", "z_exit", "beta",
           "z_window", "at_minute", "threshold"),
+    # round 2 — one knob per declared axis and nothing else (R3-1)
+    "E1": ("gap_threshold",),
+    "E2": ("gap_threshold",),
+    "G": ("breach_atr",),
+    "H": ("dev_threshold", "rvol_min"),
 }
 SIGNAL_REQUIRED: dict[str, tuple[str, ...]] = {
     "A": ("entry_mode", "regime", "exit_mode"),
     "B": ("z_entry", "regime"),
     "C": ("or_minutes", "allow_short"),
     "D": ("kind",),
+    "E1": ("gap_threshold",),
+    "E2": ("gap_threshold",),
+    "G": ("breach_atr",),
+    "H": ("dev_threshold", "rvol_min"),
 }
-#: The declared value sets of the discrete signal knobs.
+#: The declared value sets of the discrete signal knobs.  For the round-2
+#: families these are the **declared axis levels**: a cell off the grid raises
+#: instead of quietly becoming a 37th hypothesis.
 SIGNAL_CHOICES: dict[str, dict[str, tuple]] = {
     "A": {"entry_mode": ("vwap_ema", "prev_break"),
           "regime": ("spy_trend", "none"),
@@ -83,6 +94,11 @@ SIGNAL_CHOICES: dict[str, dict[str, tuple]] = {
     "B": {"regime": ("lowtrend", "none")},
     "C": {"or_minutes": (30, 60)},
     "D": {"kind": ("ratio_z", "rs30", "hedge_rs")},
+    "E1": {"gap_threshold": (0.5, 1.0, 1.5)},
+    "E2": {"gap_threshold": (0.5, 1.0, 1.5)},
+    "G": {"breach_atr": (0.25, 0.5, 1.0)},
+    "H": {"dev_threshold": (0.5, 1.0, 1.5),
+          "rvol_min": (0.0002, 0.0005, 0.0010)},
 }
 
 
@@ -95,13 +111,47 @@ def canonical_json(obj: object) -> str:
 
 
 def canonical_hash(obj: object) -> str:
-    """Stable short hash of a resolved config (E2's identity for it)."""
+    """Stable short hash of a canonical JSON document."""
     return hashlib.sha256(canonical_json(obj).encode()).hexdigest()[:16]
+
+
+def config_hash(family: str, cfg: SearchConfig, signal: Mapping,
+                symbols: Sequence[str] = ()) -> str:
+    """The config's identity, over the **real channel** (R3-7 E2).
+
+    Hash input = {family, the ``SearchConfig`` fields with ``extras`` as a
+    **nested** key, the **resolved signal dict the family actually used**, the
+    universe}.  Three things are deliberate:
+
+    * ``extras`` is nested, **never merged over the real fields**: merged, an
+      extras entry shadows a real field and two genuinely different configs
+      hash — and are recorded — alike;
+    * the **resolved** signal dict is in, not the declaration: hashing
+      ``params()`` alone does not cover the channel that produced the stage-2
+      defect (a ``z_window`` the engine read and the artefact never recorded);
+    * ``name`` is **out**: the name is generated from this hash, so including it
+      would be circular.
+    """
+    fields_ = dataclasses.asdict(cfg)
+    fields_.pop("name", None)
+    fields_["extras"] = dict(cfg.extras)
+    payload = {"family": family, "config": fields_, "signal": dict(signal),
+               "symbols": list(symbols)}
+    return canonical_hash(payload)
+
+
+def resolved_hash(family: str, resolved: Mapping) -> str:
+    """``config_hash`` of a *resolved spec* — the value ``cfg.name`` carries."""
+    cfg = SearchConfig(family=family, name="",
+                       extras=dict(resolved["extras"]),
+                       **dict(resolved["params"]))
+    return config_hash(family, cfg, resolved["signal"],
+                       resolved.get("symbols", ()))
 
 
 def resolved_name(family: str, resolved: Mapping[str, object]) -> str:
     """The config's name, generated from its *resolved* parameters."""
-    return f"{family.lower()}-{canonical_hash(resolved)}"
+    return f"{family.lower()}-{resolved_hash(family, resolved)}"
 
 
 def resolve_params(family: str, spec: Mapping) -> dict:
@@ -211,15 +261,25 @@ def resolve_spec(family: str, spec: Mapping) -> dict:
 
 def _check_universe(family: str, instruments: Mapping[str, Instrument],
                     market: Market) -> None:
-    """``2k <= |U| - 1``: a k-leg instrument needs 2k+1 symbols available.
+    """``2k <= |U| - 1`` for rank-rotation instruments, and ``kind`` coherence.
 
     The rule the lead declared for round 2 (E1).  A universe too small for its
     instruments is a universe in which the legs cannot be spread honestly over
     distinct symbols, so the builder refuses rather than trades a degenerate
-    book.
+    book.  It is scoped to **k >= 2**: with family F struck it would otherwise
+    fire on a single-symbol family (R3-7).
+
+    ``kind == "single"`` **iff** exactly one leg — a single-leg instrument
+    marked ``pair`` (or the reverse) would silently change which exit paths run
+    (``_manage`` returns immediately when ``side == 0``), so the two must agree.
     """
     n_u = len(market.symbols)
     for key, inst in instruments.items():
+        if (inst.kind == "single") != (len(inst.legs) == 1):
+            raise SpecError(
+                f"family {family}: instrument {key!r} declares kind="
+                f"{inst.kind!r} with {len(inst.legs)} leg(s); 'single' means "
+                f"exactly one leg and anything else means more than one")
         k = len(inst.legs)
         if k >= 2 and 2 * k > n_u - 1:
             raise SpecError(
@@ -456,7 +516,224 @@ def _family_d(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
     return out
 
 
-BUILDERS = {"A": _family_a, "C": _family_c, "B": _family_b, "D": _family_d}
+# ── round-2 families: E1/E2 gap behaviour, G opening-range reversal, H VWAP ──
+#
+# Every round-2 cell declares exactly two 3-level axes and nothing else
+# (R3-1: a full 3x3 factorial, so the neighbour rule is mechanical — each cell
+# has exactly two neighbours per axis, whichever cell survives).  Everything
+# else is a family-wide literal pinned here and asserted in ``_check_round2_cell``:
+# the universe, the caps, the entry window, ``eod_flat_min = 15:30``,
+# ``allow_short = True``, and one signal per session (the first bar of the
+# session inside the window that satisfies the declared condition).
+#
+# Signal arithmetic, all of it causal (prior-session or expanding only):
+#
+#   gap_atr = (sess_open / prev_close - 1) / atr_prev_pct
+#   dev     = (close - vwap) / (atr_prev_pct * close)
+#   breach  = high >= or30_hi + b * atr_prev_abs   (down: low <= or30_lo - b*atr)
+#
+# ``prev_close`` is the prior session's 15:59 cached print while the strategy is
+# flat from 15:30, and ``atr_prev_*`` is the prior **completed** session's ATR(14)
+# at its own last bar — a value that is final at the prior close and never
+# revised.  The session's own ``atr_pct`` is NaN for its first 14 bars and cannot
+# normalise an opening signal; that is exactly the round-1 failure class.
+
+#: The pinned round-2 universe (R3-6.6).  FNGU is **excluded** with the reason
+#: recorded: it has no bars before 2025-02, so it starts mid-W2 and would change
+#: both the trip count and the 12-month stability guard.
+R2_UNIVERSE = ("SOXL", "TQQQ", "SPXL", "SPY")
+#: The pinned caps (R3-6.4): the 150-trip power floor must be reachable by
+#: finding an edge, never by loosening a cap and trading more.
+R2_CAPS = {"initial_equity": 100_000.0, "notional_usd": 50_000.0,
+           "max_positions": 2, "max_entries_per_session": 1,
+           "min_minutes_between_entries": 0}
+#: The pinned entry windows, one literal per family (R3-7 E3).
+#: ``_base_params`` sets 10:00, which would put **every** gap signal from 09:31
+#: to 10:00 into ``skipped["gate"]`` and make family E trade zero trips — then
+#: read as "killed: too few trips".  Asserted per cell, not trusted.
+R2_ENTRY_WINDOWS = {
+    "E1": (9 * 60 + 31, 10 * 60 + 30),     # E-continuation: 09:31 - 10:30
+    "E2": (9 * 60 + 31, 10 * 60 + 30),     # E-fade:        09:31 - 10:30
+    "G": (10 * 60, 14 * 60 + 30),          # G:             10:00 - 14:30
+    "H": (10 * 60, 14 * 60 + 30),          # H:             10:00 - 14:30
+}
+#: G's opening-range length — a **family literal**, and the reason G's window
+#: starts at 10:00: ``or30_hi``/``or30_lo`` are only final then.
+G_OR_MINUTES = 30
+#: H's mean-reversion exit (ATR units) and time stop — family literals.  Only
+#: the deviation threshold and the regime gate are axes.
+H_DEV_EXIT_ATR = 0.25
+H_TIME_STOP_MINUTES = 60
+
+
+def _window_mask(market: Market, start_min: int, end_min: int) -> np.ndarray:
+    return (market.minute >= int(start_min)) & (market.minute <= int(end_min))
+
+
+def _first_per_session(market: Market, mask: np.ndarray) -> np.ndarray:
+    """True on the **first** bar of each session where *mask* holds (round 2).
+
+    Every round-2 cell declares "the first bar ... that satisfies the
+    condition".  Leaving the mask on every qualifying bar would let the engine
+    re-signal after a skipped entry — a different rule than the one declared,
+    and one the census would then count differently from the trips.
+    """
+    n = market.n()
+    out = np.zeros(n, dtype=bool)
+    starts = np.flatnonzero(market.day_change)
+    if not len(starts):
+        return out
+    m = np.asarray(mask, dtype=bool)
+    for s, e in zip(starts, np.append(starts[1:], n)):
+        seg = m[s:e]
+        if seg.any():
+            out[s + int(np.argmax(seg))] = True
+    return out
+
+
+def _gap_atr(feats: Mapping[str, pd.DataFrame], sym: str,
+             axis: pd.DatetimeIndex) -> np.ndarray:
+    """``(sess_open / prev_close − 1) / atr_prev_pct`` — the gap, in ATR units.
+
+    The gap is measured close-to-open across the overnight boundary; the
+    **trade** is open→close and never captures the gap move itself (P1 says so
+    wherever family E's result is quoted).
+    """
+    so = _col(feats, sym, "sess_open", axis)
+    pc = _col(feats, sym, "prev_close", axis)
+    atrp = _col(feats, sym, "atr_prev_pct", axis)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gap = (so / pc - 1.0) / atrp
+    return np.asarray(gap, dtype=float)
+
+
+def _gap_family(family: str, spec: dict, market: Market,
+                feats: Mapping[str, pd.DataFrame], sign_mode: int
+                ) -> dict[str, Instrument]:
+    """E1 (``sign_mode=+1``, continuation) and E2 (``sign_mode=-1``, fade).
+
+    Entry: the first bar in ``[09:31, 10:30]`` of a session whose
+    ``|gap_atr| >= gap_threshold``, in the direction ``sign_mode·sign(gap_atr)``.
+    The engine fills it at the next bar's open and drops it, counted
+    ``stale_entry``, unless that bar is the immediately-next bar of the same
+    session.
+    """
+    p = spec["signal"]
+    axis = market.axis
+    g = float(p["gap_threshold"])
+    win = _window_mask(market, *R2_ENTRY_WINDOWS[family])
+    n = market.n()
+    out: dict[str, Instrument] = {}
+    for sym in spec["symbols"]:
+        gap = _gap_atr(feats, sym, axis)
+        eligible = win & np.isfinite(gap) & (np.abs(gap) >= g)
+        first = _first_per_session(market, eligible)
+        entry = np.zeros(n, dtype=np.int8)
+        idx = np.flatnonzero(first)
+        if len(idx):
+            entry[idx] = (np.sign(gap[idx]).astype(int) * int(sign_mode))
+        out[sym] = Instrument(key=sym, legs=(Leg(sym, 1, 1.0),), entry_dir=entry,
+                              exit_now=np.zeros(n, dtype=np.int8),
+                              valid=market.valid((Leg(sym, 1, 1.0),)))
+    return out
+
+
+def _family_e1(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
+               ) -> dict[str, Instrument]:
+    """Family E1 — **E-continuation** (gap continues in the gap's direction)."""
+    return _gap_family("E1", spec, market, feats, +1)
+
+
+def _family_e2(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
+               ) -> dict[str, Instrument]:
+    """Family E2 — **E-fade** (gap reverses; the sign-opposite hypothesis)."""
+    return _gap_family("E2", spec, market, feats, -1)
+
+
+def _family_g(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
+              ) -> dict[str, Instrument]:
+    """Family G — opening-range reversal: enter **counter** to the breach.
+
+    A breach up is ``high >= or30_hi + b·atr_prev_abs`` (down is symmetric), and
+    the entry is the opposite side of it.  G is the sign-opposite of family C on
+    the same bars, so it is **not independent evidence** from C's kill — say so
+    wherever G's result is quoted (D1).
+    """
+    p = spec["signal"]
+    axis = market.axis
+    b = float(p["breach_atr"])
+    win = _window_mask(market, *R2_ENTRY_WINDOWS["G"])
+    hi_name, lo_name = f"or{G_OR_MINUTES}_hi", f"or{G_OR_MINUTES}_lo"
+    n = market.n()
+    out: dict[str, Instrument] = {}
+    for sym in spec["symbols"]:
+        high = _col(feats, sym, "high", axis)
+        low = _col(feats, sym, "low", axis)
+        hi = _col(feats, sym, hi_name, axis)
+        lo = _col(feats, sym, lo_name, axis)
+        atr = _col(feats, sym, "atr_prev_abs", axis)
+        ready = _col(feats, sym, "sess_min", axis) >= G_OR_MINUTES
+        breach_up = high >= hi + b * atr
+        breach_dn = low <= lo - b * atr
+        first = _first_per_session(market, (breach_up | breach_dn) & ready & win)
+        entry = np.zeros(n, dtype=np.int8)
+        idx = np.flatnonzero(first)
+        if len(idx):
+            # counter to the breach: through the upper band -> short, lower -> long.
+            # A bar that breaches both bands (a bar whose range exceeds both) is
+            # not a tradeable distinction, so the short side is taken, by rule.
+            entry[idx] = np.where(breach_up[idx], -1, 1).astype(np.int8)
+        out[sym] = Instrument(key=sym, legs=(Leg(sym, 1, 1.0),), entry_dir=entry,
+                              exit_now=np.zeros(n, dtype=np.int8),
+                              valid=market.valid((Leg(sym, 1, 1.0),)))
+    return out
+
+
+def _family_h(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
+              ) -> dict[str, Instrument]:
+    """Family H — session-VWAP reversion behind a realised-volatility gate.
+
+    ``dev = (close − vwap) / (atr_prev_pct · close)``; enter **counter** to the
+    deviation when ``|dev| >= d`` **and** the causal ``rvol30 >= theta``.  Exit
+    when the deviation's sign has flipped or it is back inside
+    ``0.25·atr_prev`` of VWAP, else the 60-minute time stop, else the EOD
+    flatten.
+    """
+    p = spec["signal"]
+    axis = market.axis
+    d = float(p["dev_threshold"])
+    theta = float(p["rvol_min"])
+    win = _window_mask(market, *R2_ENTRY_WINDOWS["H"])
+    n = market.n()
+    out: dict[str, Instrument] = {}
+    for sym in spec["symbols"]:
+        c = _close(feats, sym, axis)
+        vwap = _col(feats, sym, "vwap", axis)
+        atrp = _col(feats, sym, "atr_prev_pct", axis)
+        rvol = _col(feats, sym, "rvol30", axis)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dev = (c - vwap) / (atrp * c)
+        regime = rvol >= theta
+        longs = (dev <= -d) & regime & win          # below VWAP -> long
+        shorts = (dev >= d) & regime & win          # above VWAP -> short
+        first = _first_per_session(market, longs | shorts)
+        entry = np.zeros(n, dtype=np.int8)
+        idx = np.flatnonzero(first)
+        if len(idx):
+            entry[idx] = np.where(longs[idx], 1, -1).astype(np.int8)
+        # A long exits when dev is back inside the band or has flipped:
+        # ``dev >= -H_DEV_EXIT_ATR`` covers both (the flip at dev >= 0 and the
+        # |dev| <= 0.25 band at dev >= -0.25).  A short is the mirror.
+        exit_long = dev >= -H_DEV_EXIT_ATR
+        exit_short = dev <= H_DEV_EXIT_ATR
+        out[sym] = Instrument(key=sym, legs=(Leg(sym, 1, 1.0),), entry_dir=entry,
+                              exit_now=_exit_array(exit_long, exit_short),
+                              valid=market.valid((Leg(sym, 1, 1.0),)))
+    return out
+
+
+BUILDERS = {"A": _family_a, "C": _family_c, "B": _family_b, "D": _family_d,
+            "E1": _family_e1, "E2": _family_e2, "G": _family_g, "H": _family_h}
 
 
 def _check_multileg_exits(family: str, cfg: SearchConfig,
@@ -485,6 +762,71 @@ def _check_multileg_exits(family: str, cfg: SearchConfig,
             f"would record a stop it never runs")
 
 
+def _check_zero_hold_guard(family: str, cfg: SearchConfig, resolved: Mapping) -> None:
+    """``entry_end_min <= eod_flat_min - 2``, asserted for every family (R3-6.5).
+
+    A signal at 15:29 fills and can be flattened on its own bar's close: a
+    two-toll trip that inflates the trip count without ever holding a position.
+    The guard is the mechanical form of "no zero-hold trips" and applies to the
+    whole search, not only the round-2 cells.
+    """
+    if int(cfg.entry_end_min) > int(cfg.eod_flat_min) - 2:
+        raise SpecError(
+            f"family {family} spec {resolved.get('symbols')!r}: entry_end_min="
+            f"{int(cfg.entry_end_min)} > eod_flat_min={int(cfg.eod_flat_min)} - 2: "
+            f"a signal in the last two minutes is a zero-hold, two-toll trip")
+
+
+def _check_round2_cell(family: str, cfg: SearchConfig, instruments: Mapping,
+                       resolved: Mapping) -> None:
+    """The pinned literals every round-2 cell must declare (R3-1 / R3-6).
+
+    A mis-set flag does not error anywhere in the engine — it silently deletes
+    half the family (``allow_short`` drops every short signal), trades the wrong
+    window (entry window), or puts the whole family in a gate skip.  So each
+    pinned value is asserted here, per cell, rather than trusted.
+    """
+    start, end = R2_ENTRY_WINDOWS[family]
+    if cfg.allow_short is not True:
+        raise SpecError(
+            f"family {family}: allow_short={cfg.allow_short!r} — every round-2 "
+            f"family declares True; the flag silently deletes the short half "
+            f"of the grid (E-signals on a gap down, G breaches up, H deviations "
+            f"above VWAP)")
+    if (int(cfg.entry_start_min), int(cfg.entry_end_min)) != (start, end):
+        raise SpecError(
+            f"family {family}: entry window "
+            f"({int(cfg.entry_start_min)}, {int(cfg.entry_end_min)}) is not the "
+            f"pinned literal ({start}, {end})")
+    if tuple(resolved.get("symbols", ())) != R2_UNIVERSE:
+        raise SpecError(
+            f"family {family}: universe {list(resolved.get('symbols', ()))!r} is "
+            f"not the pinned {list(R2_UNIVERSE)!r} (FNGU is excluded on purpose: "
+            f"no bars before 2025-02)")
+    if int(cfg.max_positions) != R2_CAPS["max_positions"]:
+        raise SpecError(f"family {family}: max_positions={cfg.max_positions} is "
+                        f"not the pinned {R2_CAPS['max_positions']}")
+    if int(cfg.max_entries_per_session) != R2_CAPS["max_entries_per_session"]:
+        raise SpecError(
+            f"family {family}: max_entries_per_session="
+            f"{cfg.max_entries_per_session} is not the pinned "
+            f"{R2_CAPS['max_entries_per_session']}")
+    if int(cfg.min_minutes_between_entries) != R2_CAPS["min_minutes_between_entries"]:
+        raise SpecError(f"family {family}: min_minutes_between_entries="
+                        f"{cfg.min_minutes_between_entries} is not pinned at "
+                        f"{R2_CAPS['min_minutes_between_entries']}")
+    if float(cfg.initial_equity) != R2_CAPS["initial_equity"]:
+        raise SpecError(f"family {family}: initial_equity={cfg.initial_equity} is "
+                        f"not the pinned {R2_CAPS['initial_equity']}")
+    if float(cfg.notional_usd) != R2_CAPS["notional_usd"]:
+        raise SpecError(f"family {family}: notional_usd={cfg.notional_usd} is not "
+                        f"the pinned {R2_CAPS['notional_usd']}")
+    if int(cfg.eod_flat_min) != EOD_PINNED_MIN:
+        raise SpecError(f"family {family}: eod_flat_min={cfg.eod_flat_min} is not "
+                        f"pinned at {EOD_PINNED_MIN} for every round-2 cell")
+    _check_multileg_exits(family, cfg, instruments)
+
+
 def build(family: str, spec: dict, market: Market,
           feats: Mapping[str, pd.DataFrame]
           ) -> tuple[SearchConfig, dict[str, Instrument], dict]:
@@ -504,9 +846,13 @@ def build(family: str, spec: dict, market: Market,
                        **resolved["params"])
     rspec = dict(resolved)
     rspec["symbols"] = list(spec.get("symbols", ()))
+    resolved["symbols"] = list(rspec["symbols"])
     instruments = BUILDERS[family](rspec, market, feats)
     _check_universe(family, instruments, market)
     _check_multileg_exits(family, cfg, instruments)
+    _check_zero_hold_guard(family, cfg, resolved)
+    if family in R2_ENTRY_WINDOWS:
+        _check_round2_cell(family, cfg, instruments, resolved)
     cfg = dataclasses.replace(cfg, name=resolved_name(family, resolved))
     return cfg, instruments, resolved
 
@@ -689,3 +1035,79 @@ GRID_B = [
 ]
 
 GRIDS = {"A": GRID_A, "C": GRID_C, "D": GRID_D, "B": GRID_B}
+
+
+# ── the round-2 grids: four 3x3 full factorials, 9 cells each (R3-1) ────
+#
+# Written before any run was seen.  Every cell declares two — and only two —
+# 3-level axes, so each cell has exactly two neighbours per axis whatever wins,
+# and the neighbour rule is mechanical rather than a judgement.  N = 36 cells
+# (4 groups x 9) counts every one of them, neighbours included; adding a cell
+# increments N and re-declares the Bonferroni bar before any verdict is read.
+#
+# Family ids E1 / E2 are **E-continuation** and **E-fade**: the brief declares
+# them as separate groups with the same two axes, and the sign of the hypothesis
+# is the family, not a knob (a knob would make the pair look like one axis).
+
+def _r2_params(family: str, **kw) -> dict:
+    """The pinned caps and the family's entry window, with nothing implicit."""
+    start, end = R2_ENTRY_WINDOWS[family]
+    p = dict(sizing="fixed_notional",
+             initial_equity=R2_CAPS["initial_equity"],
+             position_size_pct=0.50, bp_usage_pct=0.95,
+             notional_usd=R2_CAPS["notional_usd"],
+             max_positions=R2_CAPS["max_positions"],
+             entry_start_min=start, entry_end_min=end,
+             max_entries_per_session=R2_CAPS["max_entries_per_session"],
+             min_minutes_between_entries=R2_CAPS["min_minutes_between_entries"],
+             stop_pct=None, target_pct=None, trail_pct=None,
+             time_exit_minutes=None, allow_short=True,
+             eod_flat_min=EOD_PINNED_MIN)
+    p.update(kw)
+    return p
+
+
+def _r2_cell(family: str, name: str, signal: dict, **kw) -> dict:
+    return dict(name=name, symbols=list(R2_UNIVERSE),
+                params=_r2_params(family, **kw), extras={}, signal=signal)
+
+
+def _num(x: float) -> str:
+    """``0.5`` / ``1`` / ``1.5`` — a stable filename-friendly level label."""
+    return f"{float(x):g}"
+
+
+E_GAP_LEVELS = (0.5, 1.0, 1.5)
+#: Axis 2 of both E groups: EOD flatten, a 60-minute stop, a 120-minute stop.
+E_EXIT_LEVELS: tuple[tuple[str, Optional[int]], ...] = (
+    ("eod", None), ("t60", 60), ("t120", 120))
+
+
+def _gap_grid(family: str, tag: str) -> list[dict]:
+    return [_r2_cell(family, f"{tag}_g{_num(g)}_{label}",
+                     dict(gap_threshold=g), time_exit_minutes=tstop)
+            for g in E_GAP_LEVELS for label, tstop in E_EXIT_LEVELS]
+
+
+GRID_E1 = _gap_grid("E1", "e1_cont")
+GRID_E2 = _gap_grid("E2", "e2_fade")
+
+G_BREACH_LEVELS = (0.25, 0.5, 1.0)
+G_STOP_LEVELS = (15, 30, 60)
+GRID_G = [_r2_cell("G", f"g_orrev_b{_num(b)}_t{t}", dict(breach_atr=b),
+                   time_exit_minutes=t)
+          for b in G_BREACH_LEVELS for t in G_STOP_LEVELS]
+
+H_DEV_LEVELS = (0.5, 1.0, 1.5)
+H_RVOL_LEVELS = (0.0002, 0.0005, 0.0010)
+GRID_H = [_r2_cell("H", f"h_vwap_d{_num(d)}_th{int(round(th * 1e4))}",
+                   dict(dev_threshold=d, rvol_min=th),
+                   time_exit_minutes=H_TIME_STOP_MINUTES)
+          for d in H_DEV_LEVELS for th in H_RVOL_LEVELS]
+
+GRIDS.update({"E1": GRID_E1, "E2": GRID_E2, "G": GRID_G, "H": GRID_H})
+
+#: The round-2 families, in the order they are reported (E first: the two with
+#: the largest documented effects, per the brief).
+ROUND2_FAMILIES = ("E1", "E2", "G", "H")
+ROUND2_GRID_SIZES = {f: len(GRIDS[f]) for f in ROUND2_FAMILIES}

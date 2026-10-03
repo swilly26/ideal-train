@@ -33,8 +33,13 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 POWER_FLOOR = 150
 #: Reinstated power floor, plus the pinned per-month minimum: a calendar month
-#: with **zero** trips fails the config outright (P2).
-MIN_TRIPS_PER_MONTH = 1
+#: with fewer than :data:`MIN_TRIPS_PER_MONTH` trips fails the config outright
+#: (P2).  Pinned at **5**, not 1: the round-1 rule was a floor of one trip, which
+#: a config can clear on a single trade — a month is then "positive" on a coin
+#: flip, and the 7-of-12 stability guard becomes 7 coin flips.  The lead's
+#: revision-3 correction (R3-8 / open ambiguity answer 3) is this number; it is
+#: declared **once**, here, and every reader of the rule uses this constant.
+MIN_TRIPS_PER_MONTH = 5
 MIN_POSITIVE_FOLDS = 7
 MONTHS_PER_WINDOW = 12
 SIZING_MODES = ("fixed_notional", "equity_fraction")
@@ -53,7 +58,7 @@ def fold_stability(folds: Iterable[Mapping]) -> tuple[bool, str, int]:
     A fixed config's sub-period stability is the **mean bps/trip per calendar
     month**: it passes when the window has all
     :data:`MONTHS_PER_WINDOW` months, no month has fewer than
-    :data:`MIN_TRIPS_PER_MONTH` trips (a zero-trip month fails the config), and
+    :data:`MIN_TRIPS_PER_MONTH` trips (a thin month fails the config), and
     at least :data:`MIN_POSITIVE_FOLDS` of those months have a positive mean
     bps/trip.  This is a *concentration guard, not validation* — nothing is
     re-fitted, so it is never called walk-forward.
@@ -67,7 +72,7 @@ def fold_stability(folds: Iterable[Mapping]) -> tuple[bool, str, int]:
     pos = positive_months(rows)
     if zero_trip:
         return (False, f"{zero_trip} calendar month(s) with fewer than "
-                       f"{MIN_TRIPS_PER_MONTH} trip(s)", zero_trip)
+                       f"{MIN_TRIPS_PER_MONTH} trips", zero_trip)
     if total < MONTHS_PER_WINDOW:
         return (False, f"only {total} month(s) with trades "
                        f"(< {MONTHS_PER_WINDOW})", zero_trip)
@@ -245,7 +250,7 @@ def neighbour_cells(family: str, specs: Sequence[dict], survivor: str) -> dict:
         raise ValueError(f"survivor {survivor!r} is not exactly one cell")
     base = resolved[survivor]
     base_flat = {**base["params"], **base["signal"], **base["extras"]}
-    base_hash = _families.canonical_hash(base)
+    base_hash = _families.resolved_hash(family, base)
     out: dict[str, list[str]] = {}
     for axis in axes:
         neighbours: dict[str, str] = {}
@@ -254,11 +259,11 @@ def neighbour_cells(family: str, specs: Sequence[dict], survivor: str) -> dict:
                 continue
             res = resolved[spec["name"]]
             flat = {**res["params"], **res["signal"], **res["extras"]}
-            if _families.canonical_hash(res) == base_hash:
+            if _families.resolved_hash(family, res) == base_hash:
                 continue                       # a duplicate resolved config
             if all(flat.get(k) == base_flat.get(k) for k in flat
                    if k != axis) and flat.get(axis) != base_flat.get(axis):
-                neighbours.setdefault(_families.canonical_hash(res),
+                neighbours.setdefault(_families.resolved_hash(family, res),
                                       spec["name"])
         out[axis] = sorted(neighbours.values())
     return out
