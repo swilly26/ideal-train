@@ -1,0 +1,72 @@
+nohup: ignoring input
+### M1 or-form: whole-window max -> expanding cummax
+FAILS (test bites)
+E       assert np.float64(100.1) == 100.2
+1 failed in 0.48s
+
+### M2 G_OR_MINUTES 30 -> 60
+FAILS (test bites)
+E       assert 60 == 30
+E        +  where 60 = families.G_OR_MINUTES
+1 failed in 0.12s
+
+### M3 H_TIME_STOP_MINUTES 60 -> 600
+FAILS (test bites)
+E       assert 600 == 60
+E        +  where 600 = families.H_TIME_STOP_MINUTES
+1 failed in 0.11s
+
+### M4 H_DEV_EXIT_ATR 0.25 -> 0.50
+FAILS (test bites)
+E       assert 0.5 == 0.25
+E        +  where 0.5 = families.H_DEV_EXIT_ATR
+1 failed in 0.12s
+
+### M5 E exit level t60 -> t10
+FAILS (test bites)
+E       AssertionError: assert (('eod', None...('t120', 120)) == (('eod', None...('t120', 120))
+E         
+E         At index 1 diff: ('t10', 10) != ('t60', 60)
+E         Use -v to get more diff
+
+### M6 G stop levels {15,30,60} -> {10,30,60}
+FAILS (test bites)
+E       assert (10, 30, 60) == (15, 30, 60)
+E         
+E         At index 0 diff: 10 != 15
+E         Use -v to get more diff
+
+### M7 sizing fixed_notional -> equity_fraction
+FAILS (test bites)
+        switching every cell to another mode would have failed no test."""
+E               AssertionError: e1_cont_g0.5_eod
+E               assert 'equity_fraction' == 'fixed_notional'
+E                 
+
+### M8 position_size_pct 0.50 -> 0.40
+PASSES (test does NOT bite)
+1 passed in 0.63s
+
+### M9 H entry window opens 10:00 -> 09:31
+FAILS (test bites)
+E       AssertionError: rvol30's rolling window is 30 one-minute returns
+E       assert 1 == 30
+1 failed in 0.28s
+
+### M10 G tie-break both-band short -> long
+FAILS (test bites)
+E               AssertionError: g_orrev_b0.25_t15/SOXL: a both-band breach is a short, by rule
+E               assert np.int8(1) == -1
+1 failed in 0.41s
+
+======================================================================
+FAILS (test bites)               M1 or-form: whole-window max -> expanding cummax
+FAILS (test bites)               M2 G_OR_MINUTES 30 -> 60
+FAILS (test bites)               M3 H_TIME_STOP_MINUTES 60 -> 600
+FAILS (test bites)               M4 H_DEV_EXIT_ATR 0.25 -> 0.50
+FAILS (test bites)               M5 E exit level t60 -> t10
+FAILS (test bites)               M6 G stop levels {15,30,60} -> {10,30,60}
+FAILS (test bites)               M7 sizing fixed_notional -> equity_fraction
+PASSES (test does NOT bite)      M8 position_size_pct 0.50 -> 0.40
+FAILS (test bites)               M9 H entry window opens 10:00 -> 09:31
+FAILS (test bites)               M10 G tie-break both-band short -> long
