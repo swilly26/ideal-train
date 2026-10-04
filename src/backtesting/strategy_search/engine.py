@@ -46,6 +46,29 @@ Sizing: ``fixed_notional`` puts a fixed $ notional on each new trade (reported
 at $50k), ``equity_fraction`` reproduces the live engine's 50 %-of-equity,
 95 %-of-cash convention.  Both are reported for every config, so a config
 cannot look good merely by making fewer, bigger trades.
+
+**Cost columns, stated once (A2, round-2 gate audit).**  Every trade carries
+four cost columns, and they are not interchangeable:
+
+* ``slip_drag`` — slippage only: ``Σ qty·(entry_slip + exit_slip)``, where each
+  slip is ``CostModel.slip_per_share`` of the **price that fill was made at**
+  (the signal bar's open for an entry, and for an exit the bar open, the bar
+  close, or the stop/target level the exit actually filled at — A1);
+* ``fees`` — commissions only, charged on both fills;
+* ``cost_drag`` — ``slip_drag + fees``, the whole toll (kept because every
+  existing artefact prints it);
+* ``pnl_gross`` — P&L at the **fills actually charged**, i.e. after slippage and
+  before fees: ``pnl_after_costs = pnl_gross − fees``;
+* ``pnl_gross_precost`` — P&L at the **reference prices** of those same fills,
+  ``pnl_gross + slip_drag``.  This is the zero-cost net at the same fills, so it
+  is what ``pnl_zero_cost_same_fills`` sums, and
+  ``pnl_after_costs = pnl_gross_precost − slip_drag − fees``.
+
+The old zero-cost column was ``pnl_gross + cost_drag``, which added the
+commissions a *second* time — invisible at baseline (fees are 0) and
+optimistically wrong at every fee-charging level.  ``reconcile_zero_cost`` stays
+the independent guard: it compares this reconstruction against a real replay
+with every cost switched off.
 """
 
 from __future__ import annotations
@@ -313,7 +336,9 @@ class SearchReplay:
             fills[(i, leg.symbol)] = self.costs.fill_price(raw, is_buy=buy)
         return fills
 
-    def _exit_fills(self, pos: _OpenPos, k: int, price=None) -> dict[tuple[int, str], float]:
+    def _exit_fills(self, pos: _OpenPos, k: int, price=None
+                    ) -> tuple[dict[tuple[int, str], float],
+                               dict[tuple[int, str], float]]:
         """Fill prices that **close** *pos* at bar *k* — every exit path's only door.
 
         ``pos.legs`` carry the **actual** sides (the entry side is already
@@ -328,8 +353,20 @@ class SearchReplay:
         mapping of symbol → price (the per-leg **close**, used by the mandatory
         EOD flatten and the time exit).  The result is keyed by
         ``(leg_index, symbol)`` for the same reason as :meth:`_leg_fills`.
+
+        Returns ``(fills, refs)``: ``refs[(i, symbol)]`` is the **price that
+        leg's fill was made at** (the bar open, the shared level, or the close),
+        which is the price its slippage must be charged on.  Charging it on the
+        exit bar's *open* instead — whatever the fill was — books a cost the
+        fills never charged, and for a pair it does not cancel; that is the A1
+        defect in the round-2 gate audit, and it is why the engine's own
+        zero-cost reconstruction disagreed with a real zero-cost replay on any
+        non-flat tape priced above the 1¢ slippage floor.  A leg with no price
+        at *k* returns ``({}, {})``: the caller reads that as "cannot be priced
+        here", never as a fill.
         """
         fills: dict[tuple[int, str], float] = {}
+        refs: dict[tuple[int, str], float] = {}
         for i, leg in enumerate(pos.legs):
             if isinstance(price, MappingABC):
                 raw = float(price[leg.symbol])
@@ -338,9 +375,10 @@ class SearchReplay:
             else:
                 raw = float(self.m.o[leg.symbol][k])
             if math.isnan(raw):
-                return {}
+                return {}, {}
             fills[(i, leg.symbol)] = self.costs.fill_price(raw, is_buy=leg.side < 0)
-        return fills
+            refs[(i, leg.symbol)] = raw
+        return fills, refs
 
     def _leg_target_notional(self) -> float:
         cfg = self.config
@@ -455,28 +493,49 @@ class SearchReplay:
         self.entries_by_session[inst.key] = self.entries_by_session.get(inst.key, 0) + 1
         self.last_entry_minute[inst.key] = int(self.m.minute[k])
 
-    def _close(self, key: str, k: int, fills: dict, reason: str,
+    def _close(self, key: str, k: int, fills: dict, refs: dict, reason: str,
                at_time: Optional[pd.Timestamp] = None) -> None:
+        """Book the closing trade.  *refs* is **required** (A1).
+
+        ``refs[(i, symbol)]`` is the price that leg's exit fill was made at, as
+        returned by :meth:`_exit_fills`.  It is a positional argument with no
+        default on purpose: re-deriving it from bar *k*'s open is exactly the
+        defect that priced four of the five exit paths' slippage off a price the
+        fill was never made at.
+        """
         pos = self.positions.pop(key)
+        unpriced = sorted(i for i in fills if i not in refs)
+        if unpriced:
+            raise RuntimeError(
+                f"{key}: _close got fills for {unpriced} with no reference "
+                f"price — the price each exit fill was made at is not optional")
         gross = 0.0
+        slip_drag = 0.0
         fees = 0.0
-        drag = 0.0
         gross_notional = 0.0
         net_outlay = 0.0
         detail: list[str] = []
         for i, leg in enumerate(pos.legs):
             fill = float(fills[(i, leg.symbol)])
-            raw = float(self.m.o[leg.symbol][k])
+            raw = float(refs[(i, leg.symbol)])
             exit_slip = self.costs.slip_per_share(raw)
             exit_fee = self.costs.fees(leg.qty, fill)
             self.cash += leg.side * leg.qty * fill - exit_fee
             gross += leg.side * (fill - leg.entry_fill) * leg.qty
+            slip_drag += leg.qty * (leg.entry_slip + exit_slip)
             fees += leg.entry_fee + exit_fee
-            drag += leg.qty * (leg.entry_slip + exit_slip) + leg.entry_fee + exit_fee
             gross_notional += abs(leg.qty * leg.entry_fill)
             net_outlay += leg.side * (leg.qty * leg.entry_fill) + leg.entry_fee
-            detail.append(f"{i}|{leg.symbol}|{leg.side:+d}|{leg.qty:.6f}|"
-                          f"{leg.entry_fill:.6f}|{fill:.6f}")
+            detail.append(f"{i}|{leg.symbol}|{leg.side:+d}|{leg.qty:.12f}|"
+                          f"{leg.entry_fill:.12f}|{fill:.12f}")
+        # ``cost_drag`` stays the whole toll (slippage + fees); ``slip_drag`` is
+        # the slippage half on its own so a reader can reconstruct the zero-cost
+        # column without adding the commissions twice (A2).
+        drag = slip_drag + fees
+        #: P&L at the **reference prices** of the same fills: no slippage, no
+        #: fees, same entry and exit bars.  This is the zero-cost net at the same
+        #: fills, so it is what ``pnl_zero_cost_same_fills`` sums.
+        precost = gross + slip_drag
         net = gross - fees
         # Per-trip accounting identity, recomputed leg by leg from the recorded
         # fills: pnl_after_costs == Σ leg.side·(exit_fill − entry_fill)·qty − fees.
@@ -512,7 +571,8 @@ class SearchReplay:
             "exit_price": fills[(0, pos.legs[0].symbol)],
             "hold_minutes": hold,
             "exit_reason": reason,
-            "pnl_gross": gross, "fees": fees, "cost_drag": drag,
+            "pnl_gross": gross, "slip_drag": slip_drag, "fees": fees,
+            "cost_drag": drag, "pnl_gross_precost": precost,
             "pnl_after_costs": net,
             "identity_check": identity,
             "identity_residual": residual,
@@ -556,7 +616,7 @@ class SearchReplay:
                         # the mandatory flatten must happen even on a bar the
                         # instrument does not have; if it cannot be priced that
                         # is fatal for the run, never a position carried on.
-                        fills = self._exit_fills(
+                        fills, refs = self._exit_fills(
                             pos, k,
                             price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
                         if not fills:
@@ -564,7 +624,8 @@ class SearchReplay:
                                 f"{key}: mandatory EOD flatten at "
                                 f"{self.m.axis[k]} could not be priced (a leg has "
                                 f"no bar): refusing to carry the position")
-                        self._close(key, k, fills, "eod", at_time=self.m.axis[k])
+                        self._close(key, k, fills, refs, "eod",
+                                    at_time=self.m.axis[k])
                     continue
                 prev = k - 1
                 same_session = prev >= 0 and not new_session
@@ -572,9 +633,9 @@ class SearchReplay:
                 if key in pending_exit and key in self.positions:
                     reason = pending_exit.pop(key)
                     pos = self.positions[key]
-                    fills = self._exit_fills(pos, k)
+                    fills, refs = self._exit_fills(pos, k)
                     if fills:
-                        self._close(key, k, fills, reason)
+                        self._close(key, k, fills, refs, reason)
                     else:
                         pending_exit[key] = reason
                 # 2) fill an entry signalled on the previous bar — or discard it
@@ -599,14 +660,14 @@ class SearchReplay:
                 # 4) mandatory end-of-day flatten
                 if minute >= cfg.eod_flat_min and key in self.positions:
                     pos = self.positions[key]
-                    fills = self._exit_fills(
+                    fills, refs = self._exit_fills(
                         pos, k,
                         price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
                     if not fills:
                         raise RuntimeError(
                             f"{key}: mandatory EOD flatten at {self.m.axis[k]} "
                             f"could not be priced: refusing to carry the position")
-                    self._close(key, k, fills, "eod", at_time=self.m.axis[k])
+                    self._close(key, k, fills, refs, "eod", at_time=self.m.axis[k])
                 if minute >= cfg.eod_flat_min:
                     continue
                 # 5) signal pass on this bar's close -> fill on the next bar
@@ -623,8 +684,8 @@ class SearchReplay:
                             closes = {l.symbol: float(self.m.c[l.symbol][k])
                                       for l in pos.legs}
                             if all(not math.isnan(v) for v in closes.values()):
-                                fills = self._exit_fills(pos, k, price=closes)
-                                self._close(key, k, fills, "time")
+                                fills, refs = self._exit_fills(pos, k, price=closes)
+                                self._close(key, k, fills, refs, "time")
                     continue
                 if key in pending_entry:
                     continue
@@ -705,21 +766,22 @@ class SearchReplay:
                                              else low <= target)
         if hit_stop:
             price = min(o, stop) if pos.side > 0 else max(o, stop)
-            fills = self._exit_fills(pos, k, price=price)
-            self._close(inst.key, k, fills,
+            fills, refs = self._exit_fills(pos, k, price=price)
+            self._close(inst.key, k, fills, refs,
                         "trail" if pos.trail_pct is not None else "stop")
         elif hit_target:
             price = max(o, target) if pos.side > 0 else min(o, target)
-            fills = self._exit_fills(pos, k, price=price)
-            self._close(inst.key, k, fills, "target")
+            fills, refs = self._exit_fills(pos, k, price=price)
+            self._close(inst.key, k, fills, refs, "target")
 
     # ── result assembly ────────────────────────────────────────────────
     def _trades_df(self) -> pd.DataFrame:
         cols = ["instrument", "symbols", "legs", "notional", "gross_notional",
                 "net_outlay", "entry_time",
                 "exit_time", "entry_price", "exit_price", "hold_minutes",
-                "exit_reason", "pnl_gross", "fees",
-                "cost_drag", "pnl_after_costs", "identity_check",
+                "exit_reason", "pnl_gross", "slip_drag", "fees",
+                "cost_drag", "pnl_gross_precost", "pnl_after_costs",
+                "identity_check",
                 "identity_residual", "leg_detail", "ret_pct", "net_bps"]
         return pd.DataFrame(self.trades, columns=cols)
 
@@ -765,7 +827,15 @@ class SearchReplay:
             losses = net[net <= 0]
             s["pnl_after_costs"] = float(net.sum())
             s["pnl_gross_same_fills"] = float(gross.sum())
-            s["pnl_zero_cost_same_fills"] = float((gross + trades["cost_drag"]).sum())
+            #: The zero-cost column = P&L at the **reference prices** of the same
+            #: fills = ``pnl_gross + slip_drag`` (A2).  It used to be
+            #: ``pnl_gross + cost_drag``, which added the commissions a second
+            #: time: invisible at baseline (fees 0), optimistic at every
+            #: fee-charging cost level.  ``slip_drag`` is slippage only.
+            s["pnl_zero_cost_same_fills"] = float(
+                (gross + trades["slip_drag"]).sum())
+            s["slip_drag_total"] = float(trades["slip_drag"].sum())
+            s["slip_drag_per_trip"] = float(trades["slip_drag"].mean())
             s["cost_drag_total"] = float(trades["cost_drag"].sum())
             s["cost_drag_per_trip"] = float(trades["cost_drag"].mean())
             s["fees_paid"] = float(trades["fees"].sum())
@@ -785,7 +855,8 @@ class SearchReplay:
             s["median_hold_minutes"] = float(trades["hold_minutes"].median())
         else:
             for k in ("pnl_after_costs", "pnl_gross_same_fills",
-                      "pnl_zero_cost_same_fills", "cost_drag_total", "fees_paid"):
+                      "pnl_zero_cost_same_fills", "cost_drag_total", "fees_paid",
+                      "slip_drag_total", "slip_drag_per_trip"):
                 s[k] = 0.0
             s.update({"cost_drag_per_trip": 0.0, "win_rate": 0.0,
                       "break_even_win_rate": 0.0, "profit_factor": 0.0,
@@ -847,21 +918,64 @@ def run_search(market: Market, instruments: Mapping[str, Instrument],
     return SearchReplay(market, instruments, config, costs).run()
 
 
+def replay_legs(trades: pd.DataFrame) -> list[list[tuple[int, float, float, float]]]:
+    """``(side, qty, entry_fill, exit_fill)`` per leg per trip, from ``leg_detail``.
+
+    The one place a fill is re-readable from the record, used by the
+    reconciliation below.  A zero-cost replay's fills **are** its raw prices
+    (``fill_price(raw) == raw`` when every cost is 0), which is what makes an
+    independent cross-check of the baseline's own arithmetic possible.  The
+    numbers in ``leg_detail`` are printed to 12 decimals so this cross-check can
+    hold a 1e-6 tolerance over hundreds of legs; at 6 decimals the reading error
+    alone was of the same order as the tolerance.
+    """
+    out: list[list[tuple[int, float, float, float]]] = []
+    for detail in trades["leg_detail"]:
+        legs: list[tuple[int, float, float, float]] = []
+        for chunk in str(detail).split(";"):
+            _i, _sym, side, qty, ef, xf = chunk.split("|")
+            legs.append((int(side), float(qty), float(ef), float(xf)))
+        out.append(legs)
+    return out
+
+
 def reconcile_zero_cost(baseline: SearchResult, zero: SearchResult,
                         tol: float = 1e-6) -> dict:
-    """Reconcile ``pnl_gross + cost_drag − fees`` against a real zero-cost run.
+    """Reconcile the baseline's own zero-cost reconstruction against a real replay.
 
-    The same config is replayed with every cost switched off, so the fills are
-    the same *raw* prices: on the same trips and the same fill timestamps the
-    zero-cost net must equal the baseline's own reconstruction,
+    The same config is replayed with every cost switched off.  Its fills **are**
+    the raw prices, so the baseline's reconstruction can be checked against them
+    without trusting the baseline's own arithmetic:
 
-        pnl_gross + cost_drag − fees == Σ side·(raw_exit − raw_entry)·qty
+        Σ(pnl_gross + slip_drag) == Σ side·(raw_exit − raw_entry)·qty_baseline
 
-    because the reported gross is computed from *slipped* fills (which carries
-    ``−Σ qty·slip`` on entry and on exit) and ``cost_drag`` adds exactly those
-    slips back, plus the fees that the gross also already had removed.  A
-    mismatch means the reconstruction the screen's zero-cost column runs on is
-    not the P&L the engine actually books.
+    The left side is what the record publishes (and what
+    ``pnl_zero_cost_same_fills`` sums); the right side is the same quantity
+    rebuilt from **another replay's** raw prices at the baseline's **own**
+    quantities.  The two must agree exactly, because ``pnl_gross`` is computed
+    from *slipped* fills — it carries ``−Σ qty·slip`` — and ``slip_drag`` adds
+    exactly those slips back, so the slips cancel term by term.  They only
+    cancel if every slip was charged on the price its fill was actually made at:
+    that is the A1 property, and charging the exit slip on the exit bar's *open*
+    is what this guard caught on real data.
+
+    **The totals of the two runs are deliberately not compared directly.**  The
+    sizing modes are fill-dependent (``qty = notional / fill``), so the zero-cost
+    replay trades a slightly *different* quantity from the baseline and its net
+    legitimately differs by the whole gross edge times that difference.  That
+    difference is reported as ``sizing_term`` and explained here rather than
+    hidden: the guard's job is the arithmetic of the *recorded* column, and the
+    screen reads a real zero-cost run's own numbers in any case.
+
+    ``pnl_gross + cost_drag − fees`` is the same left-hand quantity
+    (``cost_drag`` is ``slip_drag + fees``), spelled that way on purpose: adding
+    the whole of ``cost_drag`` back — the old ``pnl_zero_cost_same_fills`` —
+    added the commissions a second time (A2).
+
+    Known edge (pre-existing, not introduced here): if a config declares a stop
+    or target, the trigger level is anchored on each run's own entry *fill*, so
+    the two replays can trade different trips.  ``same_trips`` reports that and
+    the runner refuses rather than reconciling incomparable runs.
     """
     b = baseline.trades
     z = zero.trades
@@ -869,7 +983,16 @@ def reconcile_zero_cost(baseline: SearchResult, zero: SearchResult,
         "trips_baseline": int(len(b)), "trips_zero_cost": int(len(z)),
         "same_trips": bool(len(b) == len(z)),
         "same_fill_timestamps": False,
-        "reconstructed": 0.0, "zero_cost_net": 0.0,
+        "reconstructed": 0.0,
+        "raw_pnl_baseline_qty": 0.0,
+        "zero_cost_net": 0.0,
+        "sizing_term": 0.0,
+        "sizing_term_note": ("zero_cost_net − raw_pnl_baseline_qty: the sizing "
+                             "mode sizes off the fill price, so the zero-cost "
+                             "replay trades a different quantity"),
+        "reconstruction_form": ("pnl_gross + slip_drag == "
+                                "Σ side·(raw_exit − raw_entry)·qty_baseline, "
+                                "raw prices read from the zero-cost replay"),
         "difference": 0.0, "within_tolerance": False, "mismatches": [],
     }
     if len(b) != len(z):
@@ -884,13 +1007,36 @@ def reconcile_zero_cost(baseline: SearchResult, zero: SearchResult,
                 out["mismatches"].append(
                     f"trip {i}: {col} differs ({b.iloc[i][col]} vs {z.iloc[i][col]})")
     out["same_fill_timestamps"] = bool(ts_ok)
-    recon = float((b["pnl_gross"] + b["cost_drag"] - b["fees"]).sum())
+    recon = float((b["pnl_gross"] + b["slip_drag"]).sum())
     out["reconstructed"] = recon
     out["zero_cost_net"] = float(z["pnl_after_costs"].sum())
-    out["difference"] = float(out["zero_cost_net"] - recon)
+    legs_b, legs_z = replay_legs(b), replay_legs(z)
+    raw_at_baseline_qty = 0.0
+    same_qty = True
+    for i, (lb, lz) in enumerate(zip(legs_b, legs_z)):
+        if len(lb) != len(lz):
+            out["mismatches"].append(
+                f"trip {i}: {len(lb)} leg(s) baseline vs {len(lz)} zero-cost")
+            same_qty = False
+            continue
+        for (side_b, qty_b, _ef_b, _xf_b), (side_z, qty_z, ef_z, xf_z) in zip(lb, lz):
+            if side_b != side_z:
+                out["mismatches"].append(
+                    f"trip {i}: leg sides differ ({side_b} vs {side_z})")
+                same_qty = False
+                continue
+            raw_at_baseline_qty += side_z * (xf_z - ef_z) * qty_b
+    out["raw_pnl_baseline_qty"] = float(raw_at_baseline_qty)
+    if not same_qty:
+        out["within_tolerance"] = False
+        return out
+    out["sizing_term"] = float(out["zero_cost_net"] - raw_at_baseline_qty)
+    out["difference"] = float(recon - raw_at_baseline_qty)
     out["within_tolerance"] = abs(out["difference"]) <= tol
     if not out["within_tolerance"]:
         out["mismatches"].append(
-            f"reconstruction {recon!r} != zero-cost net {out['zero_cost_net']!r} "
-            f"(difference {out['difference']!r})")
+            f"the baseline's own reconstruction {recon!r} != the raw-price P&L at "
+            f"the baseline's own quantities {raw_at_baseline_qty!r} rebuilt from "
+            f"the zero-cost replay's raw prices (difference "
+            f"{out['difference']!r})")
     return out

@@ -131,6 +131,7 @@ def screen_family(family: str,
         return {"family": family, "verdict": "KILLED_ON_W1",
                 "w1_survivors": [], "w2_survivors": [], "ranked": [],
                 "runs": runs, "best_w1": best,
+                "w1_pass_pairs": [], "w2_confirmed_pairs": [],
                 "kill_reason": _kill_mechanism(best)}
 
     confirmed: dict[str, list[str]] = {}
@@ -194,7 +195,14 @@ def screen_family(family: str,
         "NO_W2_SURVIVOR" if not confirmed else "FAILED_BREADTH")
     return {"family": family, "verdict": verdict,
             "w1_survivors": sorted(w1_pass), "w2_survivors": sorted(confirmed),
-            "ranked": ranked, "runs": runs}
+            "ranked": ranked, "runs": runs,
+            #: The (cell, sizing) pairs each stage actually ran, so the runner
+            #: can assert the recorded run set against what the protocol
+            #: declares *in this branch* (A3) — a survivor licenses W2 and both
+            #: zero-cost runs, a W1 loser licenses neither.
+            "w1_pass_pairs": sorted([n, s] for n, ss in w1_pass.items() for s in ss),
+            "w2_confirmed_pairs": sorted([n, s] for n, ss in confirmed.items()
+                                         for s in ss)}
 
 
 def rank_row(row: Mapping) -> tuple:

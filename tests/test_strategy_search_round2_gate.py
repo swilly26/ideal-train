@@ -100,8 +100,10 @@ def test_a_flat_pair_can_never_book_a_profit(label):
     assert len(res.trades) == 1, "the fixture signals exactly one trip"
     tr = res.trades.iloc[0]
     toll = 2.0 * SLIP * (tr["gross_notional"] / FLAT_PX)
-    assert tr["pnl_gross"] + tr["cost_drag"] == pytest.approx(0.0, abs=1e-6), \
+    assert tr["pnl_gross"] + tr["slip_drag"] == pytest.approx(0.0, abs=1e-6), \
         "identical price paths: the strategy's own spread P&L is exactly zero"
+    assert tr["pnl_gross"] + tr["cost_drag"] - tr["fees"] == pytest.approx(0.0, abs=1e-6), \
+        "the same statement in the split's other form: gross + slippage = 0"
     assert tr["pnl_after_costs"] == pytest.approx(-toll, rel=1e-3), \
         "a flat pair must lose exactly one adverse fill per leg per side"
     assert tr["pnl_after_costs"] < 0, "never a positive P&L on a flat tape"
@@ -109,12 +111,15 @@ def test_a_flat_pair_can_never_book_a_profit(label):
 
 @pytest.mark.parametrize("label", sorted(LEG_SETS))
 def test_the_flat_pair_toll_is_reported_honestly(label):
-    """``cost_drag`` must equal what the fills actually charged."""
+    """``cost_drag`` must equal what the fills actually charged — slippage plus
+    fees, each reported on its own line."""
     legs = LEG_SETS[label]
     tr = flat_trip(legs, key=f"pair-{label}").trades.iloc[0]
     assert tr["cost_drag"] == pytest.approx(
         2.0 * SLIP * (tr["gross_notional"] / FLAT_PX), rel=1e-3)
+    assert tr["cost_drag"] == pytest.approx(tr["slip_drag"] + tr["fees"], rel=1e-12)
     assert tr["fees"] == 0.0
+    assert tr["slip_drag"] == pytest.approx(tr["cost_drag"], rel=1e-12)
 
 
 @pytest.mark.parametrize("direction", [1, -1])
@@ -247,16 +252,29 @@ def test_the_resolved_spec_is_returned_and_names_the_config():
 
 
 def test_the_resolved_hash_is_window_independent():
-    """W2's hash must equal W1's: the same resolved config, two bar sets."""
-    frames = {s: bars_frame(n=60) for s in ("SOXL", "TQQQ", "FNGU", "SPXL", "SPY")}
+    """W1's hash must equal W2's: the same resolved config, two bar sets.
+
+    This replaces a **tautological** version that built the same frames twice
+    and compared two evaluations of a deterministic function — it could not
+    fail.  It now resolves the cell against two genuinely different windows
+    (different dates, bar counts and price levels).  The runner-level versions
+    of this — and the W1/W2 *mismatch* the guard must refuse — are in
+    ``tests/test_strategy_search_round2_fourfixes.py`` (A4).
+    """
+    w1 = {s: bars_frame(day="2025-09-15", n=60, px=100.0)
+          for s in ("SOXL", "TQQQ", "FNGU", "SPXL", "SPY")}
+    w2 = {s: bars_frame(day="2024-09-16", n=90, px=250.0)
+          for s in ("SOXL", "TQQQ", "FNGU", "SPXL", "SPY")}
     spec = dict(families.GRID_D[0])
-    hashes = []
-    for _ in range(2):
+    hashes, names = [], []
+    for frames in (w1, w2):
         m = Market(frames)
-        _cfg, _inst, resolved = families.build(
+        cfg, _inst, resolved = families.build(
             "D", spec, m, FeatureBook(frames).align(m.axis))
         hashes.append(families.canonical_hash(resolved))
-    assert hashes[0] == hashes[1]
+        names.append(cfg.name)
+    assert hashes[0] == hashes[1], "the hash is a function of the config, not the bars"
+    assert names[0] == names[1]
 
 
 def test_the_recorded_run_set_must_equal_the_declared_set():
