@@ -16,8 +16,9 @@ grid is frozen**.
 
 Because each round-2 family emits at most one signal per symbol per session,
 the count of gated signal bars is also the maximum number of trips that symbol
-can produce (the caps are ``max_entries_per_session = 1`` and
-``max_positions = 2``), which is why the census is a trip-count bound.
+can produce (``max_entries_per_session = 1`` per symbol; the re-pinned
+``max_positions = 4`` equals the universe size and so can never bind), which is
+why the census is a trip-count bound.
 
     .venv/bin/python scripts/round2_signal_census.py [--windows W1,W2]
 """

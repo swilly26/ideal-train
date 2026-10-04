@@ -146,7 +146,7 @@ def test_every_round2_cell_declares_the_pinned_literals():
             assert p["entry_end_min"] <= p["eod_flat_min"] - 2, "zero-hold guard"
             assert p["initial_equity"] == families.R2_CAPS["initial_equity"]
             assert p["notional_usd"] == families.R2_CAPS["notional_usd"]
-            assert p["max_positions"] == families.R2_CAPS["max_positions"] == 2
+            assert p["max_positions"] == families.R2_CAPS["max_positions"] == 4
             assert p["max_entries_per_session"] == 1
             assert p["min_minutes_between_entries"] == 0
             assert p["stop_pct"] is None and p["target_pct"] is None
@@ -166,7 +166,7 @@ def test_all_thirty_six_cells_build_and_resolve():
             assert resolved["signal"], "the resolved signal dict may not be empty"
             seen.add(cfg.name)
             assert cfg.name == families.resolved_name(family, resolved)
-            assert cfg.max_positions == 2
+            assert cfg.max_positions == 4
     assert len(seen) == 36, "every cell resolves to its own config name"
 
 
@@ -178,8 +178,8 @@ def test_all_thirty_six_cells_build_and_resolve():
     ("E1", dict(params_over={"entry_start_min": 10 * 60})),
     ("G", dict(params_over={"entry_end_min": 15 * 60})),
     ("H", dict(params_over={"eod_flat_min": 15 * 60 + 25})),
-    ("E1", dict(params_over={"max_positions": 4})),
-    ("G", dict(params_over={"notional_usd": 25_000.0})),
+    ("E1", dict(params_over={"max_positions": 2})),
+    ("G", dict(params_over={"notional_usd": 50_000.0})),
     ("H", dict(params_over={"max_entries_per_session": 2})),
 ])
 def test_a_cell_off_the_pinned_literals_is_refused(family, bad):
@@ -281,8 +281,8 @@ def test_the_gap_entry_fills_at_the_next_bar_open_and_flat_by_the_close():
     frames = frames_2day(flat_bars(100.0 * 1.0005))
     m, _a, cfg, insts, _r = build_family("E1", cell("E1", 0), frames)
     res = run_search(m, insts, cfg, CostModel.baseline())
-    assert len(res.trades) == cfg.max_positions == 2, \
-        "four symbols signal, the pinned cap opens two"
+    assert len(res.trades) == 4, \
+        "four symbols signal, and the re-pinned cap (R3-11.1) admits all four"
     for _, tr in res.trades.iterrows():
         assert tr["entry_time"] == pd.Timestamp(D2) + pd.Timedelta(minutes=OPEN + 2)
         assert tr["exit_time"] == pd.Timestamp(D2) + pd.Timedelta(minutes=15 * 60 + 30)
@@ -290,7 +290,7 @@ def test_the_gap_entry_fills_at_the_next_bar_open_and_flat_by_the_close():
         assert tr["hold_minutes"] >= 1.0
         assert tr["entry_price"] > 100.0, "a gap up enters long"
     assert res.stats["entries"] + res.stats["skipped_total"] == res.stats["signals"]
-    assert res.stats["skipped"]["max_positions"] == 2
+    assert res.stats["skipped"]["max_positions"] == 0
 
 
 def test_a_gap_down_is_traded_short_not_dropped():
@@ -299,7 +299,7 @@ def test_a_gap_down_is_traded_short_not_dropped():
     m, _a, cfg, insts, _r = build_family("E1", cell("E1", 0), frames)
     assert cfg.allow_short is True
     res = run_search(m, insts, cfg, CostModel.baseline())
-    assert len(res.trades) == 2
+    assert len(res.trades) == 4
     for _, tr in res.trades.iterrows():
         assert tr["entry_price"] < 100.0
         assert tr["exit_reason"] == "eod"

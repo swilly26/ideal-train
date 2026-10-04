@@ -1,0 +1,83 @@
+FFF                                                                      [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+____________ test_all_four_universe_symbols_open_at_the_pinned_caps ____________
+
+    def test_all_four_universe_symbols_open_at_the_pinned_caps():
+        """Four slots means SPXL and SPY are reachable; four symbols, gross 100k.
+    
+        Pre-fix this showed exactly two positions (SOXL, TQQQ) and SPXL/SPY absent:
+        ``skipped["max_positions"] == 2``.
+        """
+        _frames, m, _aligned, cfg, instruments, _resolved = pinned_caps_cell()
+        for sym in families.R2_UNIVERSE:
+            idx = entry_indices(instruments[sym])
+            assert len(idx) == 1, f"{sym}: {len(idx)} signals, expected one"
+            assert int(m.minute[idx[0]]) == SIGNAL_MIN, \
+                f"{sym}: the gap signal is on the session's first in-window bar"
+    
+        res = run_search(m, instruments, cfg, CostModel.baseline())
+        traded = list(res.trades["instrument"])
+>       assert traded == list(families.R2_UNIVERSE), (
+            "four symbols signal on the same bar, so the pinned cap must open all "
+            f"four, in the declared universe order — got {traded}")
+E       AssertionError: four symbols signal on the same bar, so the pinned cap must open all four, in the declared universe order — got ['SOXL', 'TQQQ']
+E       assert ['SOXL', 'TQQQ'] == ['SOXL', 'TQQ...'SPXL', 'SPY']
+E         
+E         Right contains 2 more items, first extra item: 'SPXL'
+E         
+E         Full diff:
+E           [
+E               'SOXL',
+E               'TQQQ',
+E         -     'SPXL',
+E         -     'SPY',
+E           ]
+
+tests/test_strategy_search_round2_caps.py:80: AssertionError
+__________________ test_the_pinned_caps_are_asserted_by_value __________________
+
+    def test_the_pinned_caps_are_asserted_by_value():
+        """A silent re-pin must fail a test, not silently change a whole family."""
+>       assert families.R2_CAPS["max_positions"] == 4
+E       assert 2 == 4
+
+tests/test_strategy_search_round2_caps.py:95: AssertionError
+__________ test_the_four_symbol_book_never_exceeds_the_equity_ceiling __________
+
+    def test_the_four_symbol_book_never_exceeds_the_equity_ceiling():
+        """Every symbol signals at once and the book sits **at** the ceiling, never
+        above it: 4 x 25k = 100k = ``initial_equity``, the declared 100 % limit.
+    
+        Pre-fix the book was also 100k gross, but as 2 x 50k — so this test fails on
+        the per-position notional (``gross_notional == 50_000``), which is the pinned
+        literal the re-pin changes.  The engine exposes no per-bar book-gross series:
+        the peak is the all-four-open bar, which is the entry bar of all four trips.
+        """
+        _frames, m, _aligned, cfg, instruments, _r = pinned_caps_cell()
+        res = run_search(m, instruments, cfg, CostModel.baseline())
+>       assert len(res.trades) == 4
+E       assert 2 == 4
+E        +  where 2 = len(  instrument symbols  ...  ret_pct  net_bps\n0       SOXL   SOXL+  ...  -0.0004  -3.9992\n1       TQQQ   TQQQ+  ...  -0.0004  -3.9992\n\n[2 rows x 23 columns])
+E        +    where   instrument symbols  ...  ret_pct  net_bps\n0       SOXL   SOXL+  ...  -0.0004  -3.9992\n1       TQQQ   TQQQ+  ...  -0.0004  -3.9992\n\n[2 rows x 23 columns] = SearchResult(trades=  instrument symbols  ...  ret_pct  net_bps\n0       SOXL   SOXL+  ...  -0.0004  -3.9992\n1       TQ...stop_pct=None, target_pct=None, trail_pct=None, time_exit_minutes=None, allow_short=True, eod_flat_min=930, extras={})).trades
+
+tests/test_strategy_search_round2_caps.py:130: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_caps.py::test_all_four_universe_symbols_open_at_the_pinned_caps - AssertionError: four symbols signal on the same bar, so the pinned cap must open all four, in the declared universe order — got ['SOXL', 'TQQQ']
+assert ['SOXL', 'TQQQ'] == ['SOXL', 'TQQ...'SPXL', 'SPY']
+  
+  Right contains 2 more items, first extra item: 'SPXL'
+  
+  Full diff:
+    [
+        'SOXL',
+        'TQQQ',
+  -     'SPXL',
+  -     'SPY',
+    ]
+FAILED tests/test_strategy_search_round2_caps.py::test_the_pinned_caps_are_asserted_by_value - assert 2 == 4
+FAILED tests/test_strategy_search_round2_caps.py::test_the_four_symbol_book_never_exceeds_the_equity_ceiling - assert 2 == 4
+ +  where 2 = len(  instrument symbols  ...  ret_pct  net_bps\n0       SOXL   SOXL+  ...  -0.0004  -3.9992\n1       TQQQ   TQQQ+  ...  -0.0004  -3.9992\n\n[2 rows x 23 columns])
+ +    where   instrument symbols  ...  ret_pct  net_bps\n0       SOXL   SOXL+  ...  -0.0004  -3.9992\n1       TQQQ   TQQQ+  ...  -0.0004  -3.9992\n\n[2 rows x 23 columns] = SearchResult(trades=  instrument symbols  ...  ret_pct  net_bps\n0       SOXL   SOXL+  ...  -0.0004  -3.9992\n1       TQ...stop_pct=None, target_pct=None, trail_pct=None, time_exit_minutes=None, allow_short=True, eod_flat_min=930, extras={})).trades
+3 failed in 0.50s
