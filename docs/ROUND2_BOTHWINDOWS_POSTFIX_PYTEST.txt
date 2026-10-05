@@ -1,0 +1,10 @@
+Same file, plus every other strategy-search test file, **after** the change
+(engine at 10fa779), WATCHDOG_SCRIPT/SUPERVISE_SCRIPT pointed at the tree under
+test:
+
+........................................................................ [ 46%]
+........................................................................ [ 93%]
+..........                                                               [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+154 passed in 73.89s (0:01:13)

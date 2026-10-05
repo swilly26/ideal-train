@@ -1,0 +1,173 @@
+Both-windows grid rule (R3-3(iii)/(iv)) — pytest, tests/test_strategy_search_round2_both_windows.py
+Run from wt-r2 at 2146ed4 with src/backtesting/strategy_search/screen.py and
+scripts/run_strategy_search.py stashed back to their pre-change state (the two
+files the WIP patch touches).  7 failed — every test in the file, each for the
+reason its own docstring names:
+
+FFFFFFF                                                                  [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+____ test_a_failing_cell_does_not_stop_the_grid_and_every_failure_is_named _____
+
+    def test_a_failing_cell_does_not_stop_the_grid_and_every_failure_is_named():
+        """The loop must not stop at the first casualty.
+    
+        Three cells x two windows = six runs.  Two of them fail, on *different*
+        cells and different windows.  ``GridCellFailure`` must name **both**, and
+        all six must have been attempted — a stop-at-first-casualty loop leaves the
+        report scoring a grid it never ran.
+        """
+        attempted: list[tuple[str, str]] = []
+        broken = {("b", "W1"), ("c", "W2")}
+    
+        def run(sp, window, cost, sizing):
+            attempted.append((sp["name"], window))
+            if (sp["name"], window) in broken:
+                raise RuntimeError(f"no bar for {sp['name']} on {window}")
+            return {"config": sp["name"], "window": window}
+    
+>       with pytest.raises(screen.GridCellFailure) as exc:
+                           ^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GridCellFailure'
+
+tests/test_strategy_search_round2_both_windows.py:66: AttributeError
+__ test_a_run_that_returns_nothing_is_a_failure_not_a_silently_recorded_cell ___
+
+    def test_a_run_that_returns_nothing_is_a_failure_not_a_silently_recorded_cell():
+        """An empty return is a cell that did not run, not a cell that ran and lost.
+    
+        ``screen_family``'s callable contract returns a record; if the runner hands
+        back ``None`` (or ``{}``) the honest reading is "this cell did not run",
+        which under R3-3(iii) is a hard failure — recording it as an empty dict
+        would let a report count it as a scored cell.
+        """
+        def run(sp, window, cost, sizing):
+            empty = {("a", "W2"): None, ("b", "W1"): {}}.get((sp["name"], window))
+            return empty if empty is not None or (sp["name"], window) == ("a", "W2") \
+                else {"config": sp["name"], "window": window}
+    
+>       with pytest.raises(screen.GridCellFailure) as exc:
+                           ^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GridCellFailure'
+
+tests/test_strategy_search_round2_both_windows.py:91: AttributeError
+____________ test_the_grid_is_not_scored_if_any_cell_window_failed _____________
+
+    def test_the_grid_is_not_scored_if_any_cell_window_failed():
+        """Fail closed: a partial grid returns **nothing**, not a smaller grid."""
+        rows: list[dict] = []
+    
+        def run(sp, window, cost, sizing):
+            if sp["name"] == "b":
+                raise ValueError("unresolvable cell")
+            return {"config": sp["name"], "window": window}
+    
+>       with pytest.raises(screen.GridCellFailure):
+                           ^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GridCellFailure'
+
+tests/test_strategy_search_round2_both_windows.py:112: AttributeError
+___ test_duplicate_cell_names_in_a_declared_grid_are_refused_before_any_run ____
+
+    def test_duplicate_cell_names_in_a_declared_grid_are_refused_before_any_run():
+        """Two cells under one name is a silent drop waiting to happen."""
+        calls: list[tuple[str, str]] = []
+    
+        def run(sp, window, cost, sizing):
+            calls.append((sp["name"], window))
+            return {"config": sp["name"]}
+    
+        with pytest.raises(ValueError, match="duplicate cell"):
+>           screen.screen_grid_both_windows("X", grid("a", "a"), run,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                           log=lambda *_: None)
+E           AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'screen_grid_both_windows'
+
+tests/test_strategy_search_round2_both_windows.py:127: AttributeError
+___________ test_every_cell_of_the_grid_is_recorded_on_both_windows ____________
+
+    def test_every_cell_of_the_grid_is_recorded_on_both_windows():
+        """36 cells declare 72 base records; here, 2 cells declare 4."""
+        seen: list[tuple[str, str, str, str]] = []
+    
+        def run(sp, window, cost, sizing):
+            seen.append((sp["name"], window, cost, sizing))
+            return {"config": sp["name"], "window": window, "trips": 200}
+    
+>       out = screen.screen_grid_both_windows("X", grid("a", "b"), run,
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                             log=lambda *_: None)
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'screen_grid_both_windows'
+
+tests/test_strategy_search_round2_both_windows.py:141: AttributeError
+____________ test_the_round2_run_set_is_every_cell_on_both_windows _____________
+
+    def test_the_round2_run_set_is_every_cell_on_both_windows():
+        """The runner-level mirror of the same rule (``scripts/run_strategy_search``).
+    
+        ``declared_round2_run_set`` must be the stage-1 set's *unconditional*
+        sibling: 3 cells declare 6 keys, not 3.
+        """
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import run_strategy_search as runner_mod
+    
+>       expected = runner_mod.declared_round2_run_set("H", grid("a", "b", "c"))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'run_strategy_search' has no attribute 'declared_round2_run_set'. Did you mean: 'declared_screen_run_set'?
+
+tests/test_strategy_search_round2_both_windows.py:165: AttributeError
+______________ test_the_stage1_early_kill_is_not_the_round2_rule _______________
+
+    def test_the_stage1_early_kill_is_not_the_round2_rule():
+        """Both readings, side by side, on one fixture.
+    
+        Stage 1 (round 1's kill rule) stops at W1: a grid with no W1 survivor gets
+        a verdict and **no W2 run at all**.  Round 2 (R3-3(iii)) is unconditional:
+        the same grid, where every cell returns a *losing* record, still gets its
+        full W1/W2 pair for every cell.
+    
+        The two must not collapse into one.  Re-pinning ``screen_family`` to the
+        round-2 rule breaks the first half; re-pinning
+        ``screen_grid_both_windows`` to the stage-1 rule breaks the second.
+        """
+        calls: list[tuple[str, str]] = []
+    
+        def losing(sp, window, cost, sizing):
+            """Never clears the power floor — every cell loses on W1 too."""
+            calls.append((sp["name"], window))
+            return {"family": "X", "config": sp["name"], "window": window,
+                    "sizing": sizing, "trips": 5, "net_pnl": -100.0,
+                    "net_pct": -0.01, "net_bps_per_trip": -9.0,
+                    "net_bps_t_stat": -1.0, "cost_drag_per_trip": 20.0,
+                    "notional_per_trip": 50_000.0, "win_rate": 0.4,
+                    "break_even_win_rate": 0.5, "folds_positive": 0,
+                    "folds_total": 12, "avg_hold_minutes": 30.0,
+                    "trips_per_session": 0.1, "folds": []}
+    
+        # stage 1's rule: killed on W1, W2 never touched
+        calls.clear()
+        verdict = screen.screen_family("X", grid("a", "b"), losing,
+                                       log=lambda *_: None)
+        assert verdict["verdict"] == "KILLED_ON_W1"
+        assert not [w for _, w in calls if w == "W2"], \
+            "stage 1's early kill must not touch W2 (round-1 rule, still live)"
+        assert not [k for k in verdict["runs"] if k.startswith("W2|")]
+    
+        # round 2's rule: same cells, same losing records, both windows anyway
+        calls.clear()
+>       out = screen.screen_grid_both_windows("X", grid("a", "b"), losing,
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                             log=lambda *_: None)
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'screen_grid_both_windows'
+
+tests/test_strategy_search_round2_both_windows.py:218: AttributeError
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_both_windows.py::test_a_failing_cell_does_not_stop_the_grid_and_every_failure_is_named - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GridCellFailure'
+FAILED tests/test_strategy_search_round2_both_windows.py::test_a_run_that_returns_nothing_is_a_failure_not_a_silently_recorded_cell - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GridCellFailure'
+FAILED tests/test_strategy_search_round2_both_windows.py::test_the_grid_is_not_scored_if_any_cell_window_failed - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GridCellFailure'
+FAILED tests/test_strategy_search_round2_both_windows.py::test_duplicate_cell_names_in_a_declared_grid_are_refused_before_any_run - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'screen_grid_both_windows'
+FAILED tests/test_strategy_search_round2_both_windows.py::test_every_cell_of_the_grid_is_recorded_on_both_windows - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'screen_grid_both_windows'
+FAILED tests/test_strategy_search_round2_both_windows.py::test_the_round2_run_set_is_every_cell_on_both_windows - AttributeError: module 'run_strategy_search' has no attribute 'declared_round2_run_set'. Did you mean: 'declared_screen_run_set'?
+FAILED tests/test_strategy_search_round2_both_windows.py::test_the_stage1_early_kill_is_not_the_round2_rule - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'screen_grid_both_windows'
+7 failed in 0.15s
