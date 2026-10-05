@@ -22,8 +22,15 @@ Fill conventions (no lookahead, stated once and pinned by a test):
   close alone,
 * time exits fill at the close of the bar that completes the hold,
 * every position is flattened at the first bar at or after ``eod_flat_min``
-  (15:30 ET by default, matching the live mandate) at that bar's close, and no
-  new entry may be signalled after it,
+  (15:30 ET by default, matching the live mandate) **at which every leg of
+  every open position has a bar**, at that bar's close, and no new entry may be
+  signalled after ``eod_flat_min``.  The flatten minute is therefore one minute
+  per session, shared by the whole book (L11.1); on a normal session the first
+  such bar *is* 15:30, so the rule is a no-op there.  A leg with no bar never
+  gets a fabricated price — a carried-forward close is not a fill (L11.2) — so
+  the flatten waits for a real bar and a session that ends with a position still
+  open is **fatal**, never a position carried overnight.  Each trip records
+  whether its flatten was delayed and by how many minutes (L11.6),
 * indicators are computed **per session** by the family modules (see
   ``features.py``); this engine never looks across the overnight boundary
   except through arrays a family deliberately builds from a completed prior
@@ -301,6 +308,23 @@ class SearchReplay:
             "identity_max_abs_residual": 0.0,
             "skipped": {k: 0 for k in SKIP_KEYS},
         }
+        #: L11.6 — the mandatory flatten may fire *later* than ``eod_flat_min``
+        #: when a leg of an open position has no bar on the flatten minute
+        #: (L11.1).  Both counters ride in every run record: a delayed flatten
+        #: that cannot be seen in the record is an undeclared degree of freedom.
+        self.stats["eod_flatten_delayed_trips"] = 0
+        self.stats["eod_flatten_max_delay_min"] = 0
+        #: Axis index of the first bar at/after ``eod_flat_min`` in the current
+        #: session at which the flatten could **not** be priced; ``None`` when
+        #: it was priced, or when no position was open.  It is what separates
+        #: "the flatten minute never arrived" (fail-closed, L11.1) from "the
+        #: flatten never ran" (a bug, the pre-existing guard).
+        self.eod_wait_k: Optional[int] = None
+        #: True once the current session has a bar at/after ``eod_flat_min`` at
+        #: all.  A session whose tape stops before the flatten minute can never
+        #: price the flatten either, so both this and ``eod_wait_k`` feed the
+        #: same fail-closed decision.
+        self.eod_saw_flat_bar = False
 
     def _equity(self) -> float:
         eq = self.cash
@@ -559,6 +583,16 @@ class SearchReplay:
                 f"{key} hold {hold:.1f} min >= {MAX_HOLD_MINUTES} min "
                 f"({pos.entry_time} -> {t})")
         self.stats["exits"][reason] = self.stats["exits"].get(reason, 0) + 1
+        if reason == "eod":
+            # L11.6 — the accounting for a flatten that fired later than the
+            # declared minute.  The delay is measured from the config's **own**
+            # ``eod_flat_min``; on the pinned cell that minute is 15:30, so
+            # "delayed" is exactly "delayed past 15:30" there.
+            delay = int(t.hour) * 60 + int(t.minute) - int(self.config.eod_flat_min)
+            if delay > 0:
+                self.stats["eod_flatten_delayed_trips"] += 1
+                self.stats["eod_flatten_max_delay_min"] = max(
+                    int(self.stats["eod_flatten_max_delay_min"]), delay)
         self.trades.append({
             "instrument": key,
             "symbols": ",".join(f"{l.symbol}{'+' if l.side > 0 else '-'}" for l in pos.legs),
@@ -582,6 +616,33 @@ class SearchReplay:
         })
 
     # ── the loop ───────────────────────────────────────────────────────
+    def _all_open_priceable(self, k: int) -> bool:
+        """True when every leg of **every open position** has a bar at bar *k*.
+
+        L11.1's flatten minute is a property of the whole book: it is the first
+        bar at or after ``eod_flat_min`` at which this holds, so the session has
+        one flatten minute shared by every position — the same shape the fixed
+        15:30 minute had.  ``Instrument.valid`` is the AND over the instrument's
+        legs (``Market.valid``), so a leg with no bar takes its whole position
+        out of the flatten minute, which is exactly the tape blocker's
+        condition.
+        """
+        return all(bool(self.instruments[key].valid[k]) for key in self.positions)
+
+    def _eod_unpriced(self, ts) -> RuntimeError:
+        """The fail-closed error for a flatten minute that never arrived (L11.1).
+
+        *ts* is the bar the flatten was last due at — the session's own last
+        bar, because that is the point at which "no priceable bar at or after
+        ``eod_flat_min``" became knowable.  The text is the tape blocker's own
+        message (``ROUND2_TAPE_BLOCKER_PIN.md`` §6): the positions that could
+        not be flattened, the bar, and the refusal to carry them.
+        """
+        keys = ", ".join(sorted(self.positions))
+        return RuntimeError(
+            f"{keys}: mandatory EOD flatten at {ts} could not be priced (a leg has "
+            f"no bar): refusing to carry the position")
+
     def run(self) -> SearchResult:
         cfg = self.config
         self._open_book()
@@ -598,8 +659,15 @@ class SearchReplay:
             if new_session:
                 if self.positions:
                     # A position that survived the boundary means the EOD
-                    # flatten never ran (a missing bar at the flatten time is
-                    # fatal, not something to carry overnight).
+                    # flatten never ran.  Either the flatten minute never
+                    # arrived (L11.1: no bar at/after ``eod_flat_min`` existed
+                    # at which every leg of every open position could be
+                    # priced, and the session has now ended) — which is the
+                    # fail-closed case and raises the tape blocker's own
+                    # message — or the flatten did not run at all, which is a
+                    # bug and keeps the older guard.
+                    if self.eod_wait_k is not None or not self.eod_saw_flat_bar:
+                        raise self._eod_unpriced(self.m.axis[k - 1])
                     self.stats["skipped"]["survived_session"] += len(self.positions)
                     raise RuntimeError(
                         f"{len(self.positions)} position(s) survived the session "
@@ -607,25 +675,32 @@ class SearchReplay:
                         f"flatten did not run")
                 self.entries_by_session.clear()
                 self.last_entry_minute.clear()
+                self.eod_wait_k = None
+                self.eod_saw_flat_bar = False
+            # L11.1 — the flatten's priceability is a property of the **whole
+            # book** at this bar, not of one instrument: the flatten fires on
+            # the first bar at/after ``eod_flat_min`` at which every leg of
+            # every *open* position has a bar, so the session has one flatten
+            # minute, exactly as it did when the minute was pinned at 15:30.
+            eod_ready = False
+            if minute >= cfg.eod_flat_min:
+                self.eod_saw_flat_bar = True
+                if self.positions:
+                    eod_ready = self._all_open_priceable(k)
+                    if not eod_ready and self.eod_wait_k is None:
+                        self.eod_wait_k = k
             for key in keys:
                 inst = self.instruments[key]
                 valid_here = bool(inst.valid[k])
                 if not valid_here:
-                    pos = self.positions.get(key)
-                    if minute >= cfg.eod_flat_min and pos is not None:
-                        # the mandatory flatten must happen even on a bar the
-                        # instrument does not have; if it cannot be priced that
-                        # is fatal for the run, never a position carried on.
-                        fills, refs = self._exit_fills(
-                            pos, k,
-                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
-                        if not fills:
-                            raise RuntimeError(
-                                f"{key}: mandatory EOD flatten at "
-                                f"{self.m.axis[k]} could not be priced (a leg has "
-                                f"no bar): refusing to carry the position")
-                        self._close(key, k, fills, refs, "eod",
-                                    at_time=self.m.axis[k])
+                    # L11.1 — a bar this instrument cannot be priced on is no
+                    # longer fatal by itself.  At/after ``eod_flat_min`` the
+                    # flatten (step 4) waits for the first bar the whole book
+                    # can be priced on and no fabricated price is ever used
+                    # (L11.2); the run is fatal only when that bar never
+                    # arrives, which is checked at the session boundary and
+                    # after the last bar.  Before ``eod_flat_min`` this is the
+                    # ordinary "no bar here, nothing to do" path it always was.
                     continue
                 prev = k - 1
                 same_session = prev >= 0 and not new_session
@@ -657,8 +732,13 @@ class SearchReplay:
                 # 3) intrabar management (stops / targets / trailing)
                 if key in self.positions:
                     self._manage(inst, k)
-                # 4) mandatory end-of-day flatten
-                if minute >= cfg.eod_flat_min and key in self.positions:
+                # 4) mandatory end-of-day flatten (L11.1): it fires at the first
+                # bar at or after ``eod_flat_min`` at which every leg of every
+                # open position has a bar — one flatten minute for the session,
+                # shared by the whole book.  A leg with no bar is never priced
+                # by a carried-forward close (L11.2); the position simply waits
+                # for the next bar that can price it.
+                if minute >= cfg.eod_flat_min and key in self.positions and eod_ready:
                     pos = self.positions[key]
                     fills, refs = self._exit_fills(
                         pos, k,
@@ -715,6 +795,11 @@ class SearchReplay:
                 pending_entry[key] = (k, direction)
             self.equity.append(self._equity())
         if self.positions:
+            if self.eod_wait_k is not None or not self.eod_saw_flat_bar:
+                # L11.1: the session ended without a bar at/after
+                # ``eod_flat_min`` at which every leg of every open position
+                # could be priced.  Fail closed, with the tape blocker's message.
+                raise self._eod_unpriced(self.m.axis[-1] if n else "none")
             raise RuntimeError(
                 f"run ended with {len(self.positions)} open position(s) "
                 f"(last bar {self.m.axis[-1] if n else 'none'}): the EOD flatten "

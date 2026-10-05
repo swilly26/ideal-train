@@ -381,6 +381,12 @@ class Runner:
             "folds": json.loads(folds.to_json(orient="records")),
             "per_symbol": json.loads(persym.to_json(orient="records")),
             "exits": stats["exits"],
+            #: L11.6 — the tape policy's own accounting, in every run record:
+            #: how many trips' mandatory flatten fired later than this config's
+            #: ``eod_flat_min`` (15:30 on the pinned cell) and the largest such
+            #: delay in minutes.  Both are 0 on a session the rule is a no-op on.
+            "eod_flatten_delayed_trips": stats["eod_flatten_delayed_trips"],
+            "eod_flatten_max_delay_min": stats["eod_flatten_max_delay_min"],
             "skipped": stats["skipped"],
             "skipped_total": stats["skipped_total"],
             "identity_max_abs_residual": stats["identity_max_abs_residual"],

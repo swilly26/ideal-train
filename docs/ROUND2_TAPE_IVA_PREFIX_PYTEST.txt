@@ -1,0 +1,588 @@
+FFFFFFFFFF                                                               [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+______ test_a_hole_at_the_flatten_minute_fills_at_the_next_priceable_bar _______
+
+    def test_a_hole_at_the_flatten_minute_fills_at_the_next_priceable_bar():
+        """15:34 is present, so the run completes and fills there — not at 15:30.
+    
+        The zero-cost replay asserts the **raw price of that bar**: with every cost
+        switched off a fill *is* the price it was made at, so ``exit_price == 137``
+        is a statement about the tape, not about the cost model.
+        """
+        market = holed_market()
+        insts = one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL")
+        cfg = simple_cfg(max_positions=1)
+    
+>       zero = trip_of(run_search(market, insts, cfg, CostModel.zero_cost()))
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_tape_iv_a.py:168: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/backtesting/strategy_search/engine.py:918: in run_search
+    return SearchReplay(market, instruments, config, costs).run()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <src.backtesting.strategy_search.engine.SearchReplay object at 0x7f4b461c8290>
+
+    def run(self) -> SearchResult:
+        cfg = self.config
+        self._open_book()
+        n = self.m.n()
+        pending_entry: dict[str, int] = {}
+        pending_exit: dict[str, str] = {}
+        keys = list(self.instruments)
+        for k in range(n):
+            minute = int(self.m.minute[k])
+            new_session = bool(self.m.day_change[k])
+            for sym, px in ((s, self.m.c[s][k]) for s in self.m.symbols):
+                if not math.isnan(px):
+                    self.last_close[sym] = px
+            if new_session:
+                if self.positions:
+                    # A position that survived the boundary means the EOD
+                    # flatten never ran (a missing bar at the flatten time is
+                    # fatal, not something to carry overnight).
+                    self.stats["skipped"]["survived_session"] += len(self.positions)
+                    raise RuntimeError(
+                        f"{len(self.positions)} position(s) survived the session "
+                        f"boundary into {self.m.axis[k]}: the mandatory EOD "
+                        f"flatten did not run")
+                self.entries_by_session.clear()
+                self.last_entry_minute.clear()
+            for key in keys:
+                inst = self.instruments[key]
+                valid_here = bool(inst.valid[k])
+                if not valid_here:
+                    pos = self.positions.get(key)
+                    if minute >= cfg.eod_flat_min and pos is not None:
+                        # the mandatory flatten must happen even on a bar the
+                        # instrument does not have; if it cannot be priced that
+                        # is fatal for the run, never a position carried on.
+                        fills, refs = self._exit_fills(
+                            pos, k,
+                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                        if not fills:
+>                           raise RuntimeError(
+                                f"{key}: mandatory EOD flatten at "
+                                f"{self.m.axis[k]} could not be priced (a leg has "
+                                f"no bar): refusing to carry the position")
+E                           RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+
+src/backtesting/strategy_search/engine.py:623: RuntimeError
+_________ test_a_delayed_flatten_is_counted_with_its_delay_in_minutes __________
+
+    def test_a_delayed_flatten_is_counted_with_its_delay_in_minutes():
+        """L11.6: the delay is in the record, by value (4 minutes, one trip)."""
+        market = holed_market()
+        insts = one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL")
+>       res = run_search(market, insts, simple_cfg(max_positions=1),
+                         CostModel.baseline())
+
+tests/test_strategy_search_round2_tape_iv_a.py:186: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/backtesting/strategy_search/engine.py:918: in run_search
+    return SearchReplay(market, instruments, config, costs).run()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <src.backtesting.strategy_search.engine.SearchReplay object at 0x7f4b45786750>
+
+    def run(self) -> SearchResult:
+        cfg = self.config
+        self._open_book()
+        n = self.m.n()
+        pending_entry: dict[str, int] = {}
+        pending_exit: dict[str, str] = {}
+        keys = list(self.instruments)
+        for k in range(n):
+            minute = int(self.m.minute[k])
+            new_session = bool(self.m.day_change[k])
+            for sym, px in ((s, self.m.c[s][k]) for s in self.m.symbols):
+                if not math.isnan(px):
+                    self.last_close[sym] = px
+            if new_session:
+                if self.positions:
+                    # A position that survived the boundary means the EOD
+                    # flatten never ran (a missing bar at the flatten time is
+                    # fatal, not something to carry overnight).
+                    self.stats["skipped"]["survived_session"] += len(self.positions)
+                    raise RuntimeError(
+                        f"{len(self.positions)} position(s) survived the session "
+                        f"boundary into {self.m.axis[k]}: the mandatory EOD "
+                        f"flatten did not run")
+                self.entries_by_session.clear()
+                self.last_entry_minute.clear()
+            for key in keys:
+                inst = self.instruments[key]
+                valid_here = bool(inst.valid[k])
+                if not valid_here:
+                    pos = self.positions.get(key)
+                    if minute >= cfg.eod_flat_min and pos is not None:
+                        # the mandatory flatten must happen even on a bar the
+                        # instrument does not have; if it cannot be priced that
+                        # is fatal for the run, never a position carried on.
+                        fills, refs = self._exit_fills(
+                            pos, k,
+                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                        if not fills:
+>                           raise RuntimeError(
+                                f"{key}: mandatory EOD flatten at "
+                                f"{self.m.axis[k]} could not be priced (a leg has "
+                                f"no bar): refusing to carry the position")
+E                           RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+
+src/backtesting/strategy_search/engine.py:623: RuntimeError
+_______ test_the_delay_is_measured_from_the_config_s_own_flatten_minute ________
+
+    def test_the_delay_is_measured_from_the_config_s_own_flatten_minute():
+        """The 15:25 neighbour cell's flatten is due at 15:25, not 15:30 (P2).
+    
+        Its own hole sits on its own flatten minute (15:25 .. 15:28), and the flatten
+        then fires at 15:29: a four-minute delay, counted against the declared
+        minute.  L11.6's "delayed past 15:30" is therefore recorded as "delayed past
+        the config's ``eod_flat_min``", which is the same statement on the pinned
+        cell and the honest one on the neighbour.
+        """
+        market = holed_market(hole=(355, 358))
+        insts = one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL")
+        cfg = simple_cfg(max_positions=1, eod_flat_min=15 * 60 + 25)
+>       res = run_search(market, insts, cfg, CostModel.baseline())
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_tape_iv_a.py:205: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/backtesting/strategy_search/engine.py:918: in run_search
+    return SearchReplay(market, instruments, config, costs).run()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <src.backtesting.strategy_search.engine.SearchReplay object at 0x7f4b45787cb0>
+
+    def run(self) -> SearchResult:
+        cfg = self.config
+        self._open_book()
+        n = self.m.n()
+        pending_entry: dict[str, int] = {}
+        pending_exit: dict[str, str] = {}
+        keys = list(self.instruments)
+        for k in range(n):
+            minute = int(self.m.minute[k])
+            new_session = bool(self.m.day_change[k])
+            for sym, px in ((s, self.m.c[s][k]) for s in self.m.symbols):
+                if not math.isnan(px):
+                    self.last_close[sym] = px
+            if new_session:
+                if self.positions:
+                    # A position that survived the boundary means the EOD
+                    # flatten never ran (a missing bar at the flatten time is
+                    # fatal, not something to carry overnight).
+                    self.stats["skipped"]["survived_session"] += len(self.positions)
+                    raise RuntimeError(
+                        f"{len(self.positions)} position(s) survived the session "
+                        f"boundary into {self.m.axis[k]}: the mandatory EOD "
+                        f"flatten did not run")
+                self.entries_by_session.clear()
+                self.last_entry_minute.clear()
+            for key in keys:
+                inst = self.instruments[key]
+                valid_here = bool(inst.valid[k])
+                if not valid_here:
+                    pos = self.positions.get(key)
+                    if minute >= cfg.eod_flat_min and pos is not None:
+                        # the mandatory flatten must happen even on a bar the
+                        # instrument does not have; if it cannot be priced that
+                        # is fatal for the run, never a position carried on.
+                        fills, refs = self._exit_fills(
+                            pos, k,
+                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                        if not fills:
+>                           raise RuntimeError(
+                                f"{key}: mandatory EOD flatten at "
+                                f"{self.m.axis[k]} could not be priced (a leg has "
+                                f"no bar): refusing to carry the position")
+E                           RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:25:00 could not be priced (a leg has no bar): refusing to carry the position
+
+src/backtesting/strategy_search/engine.py:623: RuntimeError
+_________ test_a_session_that_never_prices_the_flatten_is_still_fatal __________
+
+    def test_a_session_that_never_prices_the_flatten_is_still_fatal():
+        """The failure the tape blocker found keeps its fail-closed message.
+    
+        This is the pre-change failure mode itself: the holed symbol never prints at
+        or after 15:30, so no flatten minute exists inside the session.  The run must
+        raise, must name the instrument, and must keep the message the pin recorded —
+        only the bar it names moves (the session's own last bar, which is the point
+        at which the absence became knowable).
+        """
+        market = Market({"SOXL": holed_tape(live=PX, hole=(FLAT_INDEX, SESSION_BARS),
+                                            last_bar=FLAT_INDEX - 1)})
+        insts = one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL")
+>       with pytest.raises(RuntimeError, match=FAIL_CLOSED) as exc:
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'mandatory EOD flatten at .* could not be priced \\(a leg has no bar\\): refusing to carry the position'
+E         Actual message: 'run ended with 1 open position(s) (last bar 2025-01-02 15:29:00): the EOD flatten did not run'
+
+tests/test_strategy_search_round2_tape_iv_a.py:227: AssertionError
+________ test_a_surviving_position_is_fatal_at_the_session_boundary_too ________
+
+    def test_a_surviving_position_is_fatal_at_the_session_boundary_too():
+        """The same shape one session earlier in the tape: the boundary check fires.
+    
+        A position must never be carried into the next session — and the message it
+        dies with must be the fail-closed one, not the generic "flatten did not run"
+        bug guard.
+        """
+        empty_then_full = {"SOXL": pd.concat([
+            holed_tape(live=PX, hole=(FLAT_INDEX, SESSION_BARS),
+                       last_bar=FLAT_INDEX - 1),
+            full_tape(day="2025-01-03"),
+        ])}
+        market = Market(empty_then_full)
+        insts = one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL")
+>       with pytest.raises(RuntimeError, match=FAIL_CLOSED) as exc:
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'mandatory EOD flatten at .* could not be priced \\(a leg has no bar\\): refusing to carry the position'
+E         Actual message: '1 position(s) survived the session boundary into 2025-01-03 09:30:00: the mandatory EOD flatten did not run'
+
+tests/test_strategy_search_round2_tape_iv_a.py:249: AssertionError
+_____ test_a_positions_own_hole_is_not_fatal_when_the_tape_repairs_itself ______
+
+    def test_a_positions_own_hole_is_not_fatal_when_the_tape_repairs_itself():
+        """The pair case of (a): both legs priced, both on their own bars."""
+        market = Market({"SOXL": holed_tape(), "SPY": full_tape()})
+        legs = (Leg("SOXL", 1, 1.0), Leg("SPY", -1, 1.0))
+        insts = one_trip(market, legs, "SOXL/SPY")
+        cfg = simple_cfg(max_positions=4, notional_usd=25_000.0, allow_short=True)
+>       res = run_search(market, insts, cfg, CostModel.zero_cost())
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_tape_iv_a.py:265: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/backtesting/strategy_search/engine.py:918: in run_search
+    return SearchReplay(market, instruments, config, costs).run()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <src.backtesting.strategy_search.engine.SearchReplay object at 0x7f4b45787440>
+
+    def run(self) -> SearchResult:
+        cfg = self.config
+        self._open_book()
+        n = self.m.n()
+        pending_entry: dict[str, int] = {}
+        pending_exit: dict[str, str] = {}
+        keys = list(self.instruments)
+        for k in range(n):
+            minute = int(self.m.minute[k])
+            new_session = bool(self.m.day_change[k])
+            for sym, px in ((s, self.m.c[s][k]) for s in self.m.symbols):
+                if not math.isnan(px):
+                    self.last_close[sym] = px
+            if new_session:
+                if self.positions:
+                    # A position that survived the boundary means the EOD
+                    # flatten never ran (a missing bar at the flatten time is
+                    # fatal, not something to carry overnight).
+                    self.stats["skipped"]["survived_session"] += len(self.positions)
+                    raise RuntimeError(
+                        f"{len(self.positions)} position(s) survived the session "
+                        f"boundary into {self.m.axis[k]}: the mandatory EOD "
+                        f"flatten did not run")
+                self.entries_by_session.clear()
+                self.last_entry_minute.clear()
+            for key in keys:
+                inst = self.instruments[key]
+                valid_here = bool(inst.valid[k])
+                if not valid_here:
+                    pos = self.positions.get(key)
+                    if minute >= cfg.eod_flat_min and pos is not None:
+                        # the mandatory flatten must happen even on a bar the
+                        # instrument does not have; if it cannot be priced that
+                        # is fatal for the run, never a position carried on.
+                        fills, refs = self._exit_fills(
+                            pos, k,
+                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                        if not fills:
+>                           raise RuntimeError(
+                                f"{key}: mandatory EOD flatten at "
+                                f"{self.m.axis[k]} could not be priced (a leg has "
+                                f"no bar): refusing to carry the position")
+E                           RuntimeError: SOXL/SPY: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+
+src/backtesting/strategy_search/engine.py:623: RuntimeError
+______________ test_a_session_with_no_hole_still_flattens_at_1530 ______________
+
+    def test_a_session_with_no_hole_still_flattens_at_1530():
+        """The 494 unaffected sessions must behave exactly as they did before."""
+        market = Market({"SOXL": full_tape()})
+        insts = one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL")
+        cfg = simple_cfg(max_positions=1)
+        zero = trip_of(run_search(market, insts, cfg, CostModel.zero_cost()))
+        assert zero["exit_reason"] == "eod"
+        assert zero["exit_time"] == FLAT_TS, "the flatten minute is still 15:30"
+        assert zero["exit_price"] == pytest.approx(PX)
+        res = run_search(market, insts, cfg, CostModel.baseline())
+>       assert res.stats["eod_flatten_delayed_trips"] == 0
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'eod_flatten_delayed_trips'
+
+tests/test_strategy_search_round2_tape_iv_a.py:289: KeyError
+__________ test_the_delayed_fill_is_not_a_stale_carried_forward_close __________
+
+    def test_the_delayed_fill_is_not_a_stale_carried_forward_close():
+        """Replace the last close before the hole; the flatten price must not move.
+    
+        This is the (iv-b) failure mode made visible: if the engine carried the last
+        known close across the hole, the flatten would fill near ``STALE_PX`` and the
+        two runs below would disagree.  They must agree, and both must be the 15:34
+        bar's own price.
+        """
+        legs = (Leg("SOXL", 1, 1.0),)
+        market_100 = holed_market(price=PX)
+        market_999 = holed_market(price=STALE_PX)
+        cfg = simple_cfg(max_positions=1)
+        costs = CostModel.baseline()
+>       a = trip_of(run_search(market_100, one_trip(market_100, legs, "SOXL"), cfg,
+                               costs))
+
+tests/test_strategy_search_round2_tape_iv_a.py:310: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/backtesting/strategy_search/engine.py:918: in run_search
+    return SearchReplay(market, instruments, config, costs).run()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <src.backtesting.strategy_search.engine.SearchReplay object at 0x7f4b4580c890>
+
+    def run(self) -> SearchResult:
+        cfg = self.config
+        self._open_book()
+        n = self.m.n()
+        pending_entry: dict[str, int] = {}
+        pending_exit: dict[str, str] = {}
+        keys = list(self.instruments)
+        for k in range(n):
+            minute = int(self.m.minute[k])
+            new_session = bool(self.m.day_change[k])
+            for sym, px in ((s, self.m.c[s][k]) for s in self.m.symbols):
+                if not math.isnan(px):
+                    self.last_close[sym] = px
+            if new_session:
+                if self.positions:
+                    # A position that survived the boundary means the EOD
+                    # flatten never ran (a missing bar at the flatten time is
+                    # fatal, not something to carry overnight).
+                    self.stats["skipped"]["survived_session"] += len(self.positions)
+                    raise RuntimeError(
+                        f"{len(self.positions)} position(s) survived the session "
+                        f"boundary into {self.m.axis[k]}: the mandatory EOD "
+                        f"flatten did not run")
+                self.entries_by_session.clear()
+                self.last_entry_minute.clear()
+            for key in keys:
+                inst = self.instruments[key]
+                valid_here = bool(inst.valid[k])
+                if not valid_here:
+                    pos = self.positions.get(key)
+                    if minute >= cfg.eod_flat_min and pos is not None:
+                        # the mandatory flatten must happen even on a bar the
+                        # instrument does not have; if it cannot be priced that
+                        # is fatal for the run, never a position carried on.
+                        fills, refs = self._exit_fills(
+                            pos, k,
+                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                        if not fills:
+>                           raise RuntimeError(
+                                f"{key}: mandatory EOD flatten at "
+                                f"{self.m.axis[k]} could not be priced (a leg has "
+                                f"no bar): refusing to carry the position")
+E                           RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+
+src/backtesting/strategy_search/engine.py:623: RuntimeError
+__________ test_the_run_record_carries_the_delayed_flatten_accounting __________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-13/test_the_run_record_carries_th0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f4b4580ca40>
+
+    def test_the_run_record_carries_the_delayed_flatten_accounting(tmp_path,
+                                                                  monkeypatch):
+        """L11.6 at the record level: the counters must reach the artefact.
+    
+        ``Runner.run`` is the only writer of a round-2 run record, so the check runs
+        the real record path against this file's holed tape — the family build is
+        replaced with the fixture's config, everything downstream (the replay, the
+        folds, the record, the filename, the write) is the runner's own code.
+        """
+        import dataclasses
+    
+        if str(ROOT / "scripts") not in sys.path:
+            sys.path.insert(0, str(ROOT / "scripts"))
+        import run_strategy_search as mod
+    
+        market = holed_market()
+        insts = one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL")
+        resolved = {"params": {"sizing": "fixed_notional",
+                               "eod_flat_min": 15 * 60 + 30},
+                    "signal": {"fixture": True}, "extras": {}}
+        cfg = dataclasses.replace(simple_cfg(max_positions=1),
+                                  name=families.resolved_name("A", resolved))
+        monkeypatch.setattr(mod.families, "build",
+                            lambda *a, **k: (cfg, insts, resolved))
+        runner = mod.Runner(cache_dir=Path("/nonexistent-cache"),
+                            out_dir=Path(tmp_path), verbose=False, reconcile=False)
+        runner._window = lambda window: {"frames": {}, "market": market,
+                                         "aligned": None, "cov": {},
+                                         "dates": ["2025-01-02", "2025-01-31"]}
+        spec = {"name": "iva_cell", "params": {}, "signal": {}, "extras": {},
+                "symbols": ["SOXL"]}
+>       record = runner.run("A", spec, "W1", "baseline", "fixed_notional")
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_tape_iv_a.py:357: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+scripts/run_strategy_search.py:287: in run
+    res = run_search(market, instruments, cfg, costs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/backtesting/strategy_search/engine.py:918: in run_search
+    return SearchReplay(market, instruments, config, costs).run()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <src.backtesting.strategy_search.engine.SearchReplay object at 0x7f4b45f2ac30>
+
+    def run(self) -> SearchResult:
+        cfg = self.config
+        self._open_book()
+        n = self.m.n()
+        pending_entry: dict[str, int] = {}
+        pending_exit: dict[str, str] = {}
+        keys = list(self.instruments)
+        for k in range(n):
+            minute = int(self.m.minute[k])
+            new_session = bool(self.m.day_change[k])
+            for sym, px in ((s, self.m.c[s][k]) for s in self.m.symbols):
+                if not math.isnan(px):
+                    self.last_close[sym] = px
+            if new_session:
+                if self.positions:
+                    # A position that survived the boundary means the EOD
+                    # flatten never ran (a missing bar at the flatten time is
+                    # fatal, not something to carry overnight).
+                    self.stats["skipped"]["survived_session"] += len(self.positions)
+                    raise RuntimeError(
+                        f"{len(self.positions)} position(s) survived the session "
+                        f"boundary into {self.m.axis[k]}: the mandatory EOD "
+                        f"flatten did not run")
+                self.entries_by_session.clear()
+                self.last_entry_minute.clear()
+            for key in keys:
+                inst = self.instruments[key]
+                valid_here = bool(inst.valid[k])
+                if not valid_here:
+                    pos = self.positions.get(key)
+                    if minute >= cfg.eod_flat_min and pos is not None:
+                        # the mandatory flatten must happen even on a bar the
+                        # instrument does not have; if it cannot be priced that
+                        # is fatal for the run, never a position carried on.
+                        fills, refs = self._exit_fills(
+                            pos, k,
+                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                        if not fills:
+>                           raise RuntimeError(
+                                f"{key}: mandatory EOD flatten at "
+                                f"{self.m.axis[k]} could not be priced (a leg has "
+                                f"no bar): refusing to carry the position")
+E                           RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+
+src/backtesting/strategy_search/engine.py:623: RuntimeError
+___________ test_the_flatten_minute_is_shared_by_every_open_position ___________
+
+    def test_the_flatten_minute_is_shared_by_every_open_position():
+        """A priceable position waits for the position that is not (L11.1).
+    
+        "Every leg of **every open position**" is the ruling's wording, so the
+        session keeps one flatten minute: SPXL-style hole in one symbol delays the
+        whole book, exactly as the fixed 15:30 minute flattened the whole book
+        before.  Both trips are therefore delayed, by the same four minutes.
+        """
+        market = Market({"SOXL": holed_tape(), "SPY": full_tape()})
+        insts = {}
+        insts.update(one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL"))
+        insts.update(one_trip(market, (Leg("SPY", 1, 1.0),), "SPY"))
+        cfg = simple_cfg(max_positions=4, notional_usd=25_000.0)
+>       res = run_search(market, insts, cfg, CostModel.zero_cost())
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_tape_iv_a.py:385: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/backtesting/strategy_search/engine.py:918: in run_search
+    return SearchReplay(market, instruments, config, costs).run()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <src.backtesting.strategy_search.engine.SearchReplay object at 0x7f4b457bf0e0>
+
+    def run(self) -> SearchResult:
+        cfg = self.config
+        self._open_book()
+        n = self.m.n()
+        pending_entry: dict[str, int] = {}
+        pending_exit: dict[str, str] = {}
+        keys = list(self.instruments)
+        for k in range(n):
+            minute = int(self.m.minute[k])
+            new_session = bool(self.m.day_change[k])
+            for sym, px in ((s, self.m.c[s][k]) for s in self.m.symbols):
+                if not math.isnan(px):
+                    self.last_close[sym] = px
+            if new_session:
+                if self.positions:
+                    # A position that survived the boundary means the EOD
+                    # flatten never ran (a missing bar at the flatten time is
+                    # fatal, not something to carry overnight).
+                    self.stats["skipped"]["survived_session"] += len(self.positions)
+                    raise RuntimeError(
+                        f"{len(self.positions)} position(s) survived the session "
+                        f"boundary into {self.m.axis[k]}: the mandatory EOD "
+                        f"flatten did not run")
+                self.entries_by_session.clear()
+                self.last_entry_minute.clear()
+            for key in keys:
+                inst = self.instruments[key]
+                valid_here = bool(inst.valid[k])
+                if not valid_here:
+                    pos = self.positions.get(key)
+                    if minute >= cfg.eod_flat_min and pos is not None:
+                        # the mandatory flatten must happen even on a bar the
+                        # instrument does not have; if it cannot be priced that
+                        # is fatal for the run, never a position carried on.
+                        fills, refs = self._exit_fills(
+                            pos, k,
+                            price={l.symbol: self.m.c[l.symbol][k] for l in pos.legs})
+                        if not fills:
+>                           raise RuntimeError(
+                                f"{key}: mandatory EOD flatten at "
+                                f"{self.m.axis[k]} could not be priced (a leg has "
+                                f"no bar): refusing to carry the position")
+E                           RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+
+src/backtesting/strategy_search/engine.py:623: RuntimeError
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_a_hole_at_the_flatten_minute_fills_at_the_next_priceable_bar - RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_a_delayed_flatten_is_counted_with_its_delay_in_minutes - RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_the_delay_is_measured_from_the_config_s_own_flatten_minute - RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:25:00 could not be priced (a leg has no bar): refusing to carry the position
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_a_session_that_never_prices_the_flatten_is_still_fatal - AssertionError: Regex pattern did not match.
+  Expected regex: 'mandatory EOD flatten at .* could not be priced \\(a leg has no bar\\): refusing to carry the position'
+  Actual message: 'run ended with 1 open position(s) (last bar 2025-01-02 15:29:00): the EOD flatten did not run'
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_a_surviving_position_is_fatal_at_the_session_boundary_too - AssertionError: Regex pattern did not match.
+  Expected regex: 'mandatory EOD flatten at .* could not be priced \\(a leg has no bar\\): refusing to carry the position'
+  Actual message: '1 position(s) survived the session boundary into 2025-01-03 09:30:00: the mandatory EOD flatten did not run'
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_a_positions_own_hole_is_not_fatal_when_the_tape_repairs_itself - RuntimeError: SOXL/SPY: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_a_session_with_no_hole_still_flattens_at_1530 - KeyError: 'eod_flatten_delayed_trips'
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_the_delayed_fill_is_not_a_stale_carried_forward_close - RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_the_run_record_carries_the_delayed_flatten_accounting - RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+FAILED tests/test_strategy_search_round2_tape_iv_a.py::test_the_flatten_minute_is_shared_by_every_open_position - RuntimeError: SOXL: mandatory EOD flatten at 2025-01-02 15:30:00 could not be priced (a leg has no bar): refusing to carry the position
+10 failed in 0.49s

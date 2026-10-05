@@ -1,0 +1,4 @@
+..........                                                               [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+10 passed in 0.29s
