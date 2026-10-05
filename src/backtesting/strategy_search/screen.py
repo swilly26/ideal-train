@@ -308,6 +308,86 @@ def neighbour_verdict(neighbours: Mapping[str, Sequence[str]],
     return True, f"per-axis neighbours hold ({len(neighbours)} axes)"
 
 
+# ── R3-3(iii)/(iv): the *round-2* grid rule ────────────────────────────
+#: R3-3(iii): every declared cell runs on **both** windows.  This is **not**
+#: stage 1's rule: ``screen_family`` stops a family at W1 (the round-1 kill
+#: rule, still pinned by
+#: ``tests/test_strategy_search_engine.py::test_a_family_with_no_w1_survivor_is_killed_without_touching_w2``),
+#: so a cell that loses W1 never gets a W2 row and the 36 x 2 = 72 base records
+#: R3-3 declares cannot exist.  The two rules are kept apart on purpose —
+#: ``test_the_stage1_early_kill_is_not_the_round2_rule`` pins the difference —
+#: because a round-2 cell that is missing from one window is not a killed cell,
+#: it is a cell the report cannot score.
+ROUND2_WINDOWS: tuple[str, ...] = ("W1", "W2")
+#: R3-3(ii): the one sizing mode that gates (the other is a reported column).
+ROUND2_SIZING = "fixed_notional"
+#: R3-3(iii): base cost for the declared 36 x 2 = 72 records.
+ROUND2_BASE_COST = "baseline"
+
+
+class GridCellFailure(RuntimeError):
+    """A cell of the frozen grid could not be resolved or run (R3-3(iii)).
+
+    Raised *after* every cell has been attempted, so the message lists **all**
+    of them: a grid that quietly shrinks to the cells that happen to work is
+    the one failure mode this rule exists to make impossible, because the
+    report would still say N = 36.
+    """
+
+
+def screen_grid_both_windows(family: str, specs: Sequence[dict],
+                             run: Callable[[dict, str, str, str], Mapping],
+                             log: Callable[[str], None] = print,
+                             windows: Sequence[str] = ROUND2_WINDOWS,
+                             cost: str = ROUND2_BASE_COST,
+                             sizing: str = ROUND2_SIZING) -> dict:
+    """Run **every** declared cell on **both** windows (R3-3(iii)–(iv)).
+
+    ``run(spec, window, cost, sizing)`` is the same callable ``screen_family``
+    takes.  Two declared properties, neither of which stage 1 has:
+
+    * **no early kill** — a cell's W2 run does not depend on its W1 number, so
+      the W1/W2 pair of rows exists for every cell;
+    * **no silent drop** — a cell that cannot be resolved or run (the callable
+      raises, or returns nothing) is collected and raised as a
+      :class:`GridCellFailure` naming the family, the cell, the window and the
+      underlying error.  Every remaining cell is still attempted, so the
+      failure text is the whole picture and not just the first casualty.
+
+    Nothing here reads a P&L: it returns the records it was handed, keyed by
+    ``(cell, window)``.
+    """
+    expected = [(spec["name"], window) for spec in specs for window in windows]
+    if len({name for name, _ in expected}) != len(specs):
+        raise ValueError(f"family {family}: the declared grid has duplicate cell "
+                         f"names ({[s['name'] for s in specs]}) — two cells under "
+                         f"one name is a silent drop waiting to happen")
+    runs: dict[tuple[str, str], dict] = {}
+    failures: list[tuple[str, str, str]] = []
+    for name, window in expected:
+        spec = next(s for s in specs if s["name"] == name)
+        try:
+            rec = run(spec, window, cost, sizing)
+            if not rec:
+                raise ValueError("the run returned no record")
+            runs[(name, window)] = dict(rec)
+        except Exception as exc:                                # noqa: BLE001
+            failures.append((name, window, f"{type(exc).__name__}: {exc}"))
+            log(f"  ! {family} {name} [{window}/{cost}/{sizing}]: "
+                f"{type(exc).__name__}: {exc}")
+            continue
+        log(f"  {family} {name} [{window}/{cost}/{sizing}]: recorded")
+    if failures:
+        detail = "; ".join(f"{n}[{w}]: {why}" for n, w, why in failures)
+        raise GridCellFailure(
+            f"family {family}: {len(failures)} of {len(expected)} declared "
+            f"cell-window runs could not be resolved — the grid is a hard "
+            f"failure, not a smaller grid ({detail})")
+    return {"family": family, "windows": list(windows), "cost": cost,
+            "sizing": sizing, "cells": [s["name"] for s in specs],
+            "runs": runs}
+
+
 def _best_w1(runs: Mapping[str, Mapping], window: str, cost: str) -> dict:
     """The family's best W1 config, by the screen's own ordering (bps, then net)."""
     cands = [r for k, r in runs.items() if k.startswith(f"{window}|{cost}|")]

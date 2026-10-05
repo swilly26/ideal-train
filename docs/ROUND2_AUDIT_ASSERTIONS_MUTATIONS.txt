@@ -1,14 +1,21 @@
-nohup: ignoring input
+Mutation battery re-run — 2026-10-04, against 2146ed4 (the commit these
+assertions landed on).  M8 re-pointed at _r2_params (see the battery's own
+docstring in /home/team/shared/mutate_battery.py): the patch string now carries
+the following line, because the bare 'position_size_pct=0.50, bp_usage_pct=0.95,'
+occurs twice in families.py and the driver replaces the first occurrence only —
+the original M8 mutated round-1 _base_params and left every round-2 cell at 0.50.
+All 10 mutations now bite.  Raw output below.
+
 ### M1 or-form: whole-window max -> expanding cummax
 FAILS (test bites)
 E       assert np.float64(100.1) == 100.2
-1 failed in 0.48s
+1 failed in 0.44s
 
 ### M2 G_OR_MINUTES 30 -> 60
 FAILS (test bites)
 E       assert 60 == 30
 E        +  where 60 = families.G_OR_MINUTES
-1 failed in 0.12s
+1 failed in 0.11s
 
 ### M3 H_TIME_STOP_MINUTES 60 -> 600
 FAILS (test bites)
@@ -20,7 +27,7 @@ E        +  where 600 = families.H_TIME_STOP_MINUTES
 FAILS (test bites)
 E       assert 0.5 == 0.25
 E        +  where 0.5 = families.H_DEV_EXIT_ATR
-1 failed in 0.12s
+1 failed in 0.11s
 
 ### M5 E exit level t60 -> t10
 FAILS (test bites)
@@ -43,21 +50,24 @@ E               AssertionError: e1_cont_g0.5_eod
 E               assert 'equity_fraction' == 'fixed_notional'
 E                 
 
-### M8 position_size_pct 0.50 -> 0.40
-PASSES (test does NOT bite)
-1 passed in 0.63s
+### M8 position_size_pct 0.50 -> 0.40 (_r2_params, not _base_params)
+FAILS (test bites)
+        switching every cell to another mode would have failed no test."""
+E               AssertionError: e1_cont_g0.5_eod
+E               assert 0.4 == 0.5
+1 failed in 0.18s
 
 ### M9 H entry window opens 10:00 -> 09:31
 FAILS (test bites)
 E       AssertionError: rvol30's rolling window is 30 one-minute returns
 E       assert 1 == 30
-1 failed in 0.28s
+1 failed in 0.29s
 
 ### M10 G tie-break both-band short -> long
 FAILS (test bites)
 E               AssertionError: g_orrev_b0.25_t15/SOXL: a both-band breach is a short, by rule
 E               assert np.int8(1) == -1
-1 failed in 0.41s
+1 failed in 0.40s
 
 ======================================================================
 FAILS (test bites)               M1 or-form: whole-window max -> expanding cummax
@@ -67,6 +77,6 @@ FAILS (test bites)               M4 H_DEV_EXIT_ATR 0.25 -> 0.50
 FAILS (test bites)               M5 E exit level t60 -> t10
 FAILS (test bites)               M6 G stop levels {15,30,60} -> {10,30,60}
 FAILS (test bites)               M7 sizing fixed_notional -> equity_fraction
-PASSES (test does NOT bite)      M8 position_size_pct 0.50 -> 0.40
+FAILS (test bites)               M8 position_size_pct 0.50 -> 0.40 (_r2_params, not _base_params)
 FAILS (test bites)               M9 H entry window opens 10:00 -> 09:31
 FAILS (test bites)               M10 G tie-break both-band short -> long

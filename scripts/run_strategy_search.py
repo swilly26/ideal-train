@@ -171,6 +171,21 @@ def declared_screen_run_set(family: str, specs: Sequence[dict],
     return expected
 
 
+def declared_round2_run_set(family: str, specs: Sequence[dict],
+                            sizing: str = screen.ROUND2_SIZING,
+                            cost: str = screen.ROUND2_BASE_COST) -> set[str]:
+    """R3-3(iii): **every** declared cell, on **both** windows (audit §B4).
+
+    The stage-1 set (:func:`declared_screen_run_set`) is conditional past W1 — a
+    cell that loses W1 licenses no W2 record — which is the round-1 kill rule.
+    Round 2 is unconditional: two run keys per declared cell, so a 36-cell grid
+    declares 36 x 2 = **72** base records and a run that produced 71 is a hard
+    failure rather than a slightly smaller grid whose report still says N = 36.
+    """
+    return {run_key(family, s["name"], window, cost, sizing)
+            for s in specs for window in WINDOWS}
+
+
 class Runner:
     """Loads a window's bars + features once, then replays configs against it."""
 
@@ -409,6 +424,18 @@ class Runner:
         expected = declared_screen_run_set(
             family, specs, verdict.get("w1_pass_pairs", []),
             verdict.get("w2_confirmed_pairs", []))
+        mine = {k for k in self.recorded if k.startswith(f"{family}|")}
+        assert_exact_run_set(mine, expected, where)
+
+    def assert_round2_grid_recorded(self, family: str, specs: Sequence[dict],
+                                    where: str) -> None:
+        """The recorded round-2 set must be every cell × both windows (R3-3(iii)).
+
+        Called before any round-2 number is read.  A missing key is a **hard
+        failure**, so a cell that could not be resolved or run cannot survive as
+        an absence: the grid either ran whole or it did not run.
+        """
+        expected = declared_round2_run_set(family, specs)
         mine = {k for k in self.recorded if k.startswith(f"{family}|")}
         assert_exact_run_set(mine, expected, where)
 
