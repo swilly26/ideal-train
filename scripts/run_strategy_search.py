@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""Stage-1 strategy search: run the declared grids through the screen.
+"""Strategy search: run the declared grids through the declared screen.
 
     # one config, one window (a single replay)
     .venv/bin/python scripts/run_strategy_search.py --family A \
         --config a_trend_trail50_reg --window W1 --sizing fixed_notional
 
-    # the full pre-registered screen for one or more families (order A, C, D, B)
+    # the full pre-registered screen for one or more families
     .venv/bin/python scripts/run_strategy_search.py --screen --family A
+    .venv/bin/python scripts/run_strategy_search.py --screen --family E1,E2,G,H
 
-Every run writes one machine-readable record to ``--out-dir``; the screen writes
-a family verdict JSON next to them.  Nothing is adopted here: stage 1 only
-decides which configs deserve stage 2.
+Every run writes one machine-readable record to ``--out-dir``; a screen writes a
+family payload next to them.  Nothing is adopted here.
+
+**Two screens, chosen by family (L1, audit item 1).**  ``--screen`` on a round-1
+family (A, C, D, B) runs stage 1's conditional screen —
+:func:`screen.screen_family`, which kills a family at W1, admits a cell if either
+sizing mode clears, and reads fold breadth at zero cost.  ``--screen`` on a
+round-2 family (E1, E2, G, H) runs :func:`screen_round2`: the declared 36-cell
+grid on **both** windows at base cost, ``fixed_notional`` the sole gating sizing,
+a cell dead only if it fails either window, and fold breadth read at base cost.
+The two rules are never mixed in one call — a grid run under the wrong one is not
+the grid the pre-registration declares, and its numbers cannot be reported.
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import re
 import subprocess
@@ -29,7 +38,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.backtesting.replay_costs import CostModel  # noqa: E402
-from src.backtesting.strategy_search import engine, families, screen  # noqa: E402
+from src.backtesting.strategy_search import (  # noqa: E402
+    costs as cost_levels,
+    engine,
+    families,
+    screen,
+)
 from src.backtesting.strategy_search.engine import (  # noqa: E402
     Market,
     per_symbol,
@@ -53,9 +67,20 @@ FAMILY_ORDER = ("A", "C", "D", "B")
 #: The one decision sizing mode (P2); the other is a reported robustness column
 #: and does not count as a hypothesis.
 DECISION_SIZING = "fixed_notional"
-#: Every cost level a screened cell may run at (R3-5/R3-7).  ``baseline`` is the
+#: Every cost level a **round-1** screened cell may run at.  ``baseline`` is the
 #: realistic model the gates read; ``zero_cost`` is the gross-edge diagnostic.
+#: Round 2's gating set is :data:`ROUND2_GATE_COSTS` — a different pair, because
+#: round 2 gates on base and slippage ×1.5 (R3-5/L3).
 SCREEN_COSTS = ("baseline", "zero_cost")
+#: Round 2's gating cost levels, from the one canonical label set (L3).
+ROUND2_GATE_COSTS: tuple[str, ...] = tuple(cost_levels.GATE_COST_LABELS)
+#: Every cost level the CLI can emit, canonical spellings only — so a run record
+#: can no longer carry a label the code has no definition for (audit item 4).
+COST_CHOICES: tuple[str, ...] = tuple(cost_levels.CANONICAL_LABELS)
+#: The families whose ``--screen`` path is round 2's (both windows, base cost,
+#: ``fixed_notional`` only, no early kill).  Everything else is round 1's
+#: ``screen_family`` rule (L1).
+ROUND2_SCREEN_FAMILIES: tuple[str, ...] = tuple(families.ROUND2_FAMILIES)
 
 
 def engine_sha() -> str:
@@ -186,6 +211,19 @@ def declared_round2_run_set(family: str, specs: Sequence[dict],
             for s in specs for window in WINDOWS}
 
 
+def declared_round2_report_set(family: str, specs: Sequence[dict],
+                               sizings: Sequence[str],
+                               cost: str = screen.ROUND2_BASE_COST) -> set[str]:
+    """Run keys for a **reported-only** sizing, declared explicitly (R3-3(ii)/L1).
+
+    These are not gating records: they exist so the second sizing mode can still
+    be run and recorded, and they are declared here so the run-set assertion can
+    tell a reported column apart from an undeclared run.
+    """
+    return {run_key(family, s["name"], window, cost, sizing)
+            for s in specs for window in WINDOWS for sizing in sizings}
+
+
 class Runner:
     """Loads a window's bars + features once, then replays configs against it."""
 
@@ -281,8 +319,12 @@ class Runner:
                 f"{family} {spec['name']}: the resolved config declares "
                 f"sizing={resolved['params'].get('sizing')!r} but this run is "
                 f"{sizing!r} — the recorded hash would not describe the run")
-        costs = CostModel.baseline() if cost_label == "baseline" else CostModel.zero_cost()
-        costs = dataclasses.replace(costs, label=cost_label)
+        # One declared construction per canonical label (L3 / audit item 4).
+        # The two-way conditional this replaces could only ever emit
+        # ``baseline`` and ``zero_cost``, so the gating stress level
+        # ``slip_x1_5`` had no code path that could produce it — and any other
+        # label silently ran as zero-cost.
+        costs = cost_levels.cost_model(cost_label)
         t0 = time.time()
         res = run_search(market, instruments, cfg, costs)
         elapsed = time.time() - t0
@@ -434,28 +476,120 @@ class Runner:
         assert_exact_run_set(mine, expected, where)
 
     def assert_round2_grid_recorded(self, family: str, specs: Sequence[dict],
-                                    where: str) -> None:
+                                    where: str,
+                                    report_sizings: Sequence[str] = ()) -> None:
         """The recorded round-2 set must be every cell × both windows (R3-3(iii)).
 
         Called before any round-2 number is read.  A missing key is a **hard
         failure**, so a cell that could not be resolved or run cannot survive as
         an absence: the grid either ran whole or it did not run.
+
+        This is the **run-set** half of L16 and nothing more: it says the keys
+        match, never that a gate block was written — that is
+        :func:`screen.assert_gate_blocks_present`, a name of its own.  A
+        non-gating sizing may be recorded for reporting without breaking the
+        equality check, but only by being declared here (R3-3(ii)/L1).
         """
         expected = declared_round2_run_set(family, specs)
+        for extra in report_sizings:
+            expected |= declared_round2_report_set(family, specs, (extra,))
         mine = {k for k in self.recorded if k.startswith(f"{family}|")}
         assert_exact_run_set(mine, expected, where)
+
+
+def screen_round2(runner: Runner, fams: Sequence[str], out_dir: Path | str,
+                  log=print) -> list[dict]:
+    """**The round-2 screen path** — the declared grid, not ``screen_family``.
+
+    Wired by L1 (audit item 1): for a round-2 family this, not
+    :func:`screen.screen_family`, is what ``--screen`` runs.  It differs from
+    stage 1 in the three ways the audit found:
+
+    * the record set is ``declared_round2_run_set`` — every declared cell on
+      **both** windows at base cost, ``fixed_notional`` the **sole** gating
+      sizing, so the grid's N is the declared 36 and not 72;
+    * there is **no early kill** — a cell that loses W1 is still run on W2, and
+      it dies only if it fails either window (:func:`screen.round2_cell_fates`);
+    * fold breadth is read at **base** cost (:func:`screen.round2_fold_breadth`,
+      L6), not the round-1 zero-cost column.
+
+    What this deliberately does **not** do: it writes no verdict.  The four
+    gates and the ranking of ``ROUND2_GATE_ORDER_SPEC.md`` §1 are the next
+    delegation's work; ``status`` says so in the artefact, so a reader cannot
+    mistake a collected record set for a screened one.  When those gates land,
+    the round-2 path must call :func:`screen.assert_gate_blocks_present` on
+    every base record (L16) before any verdict is written — it is not called
+    here because the blocks do not exist yet, and an assertion that always
+    raises is not a check.
+    """
+    decl = screen.assert_round2_declaration()
+    log(f"=== round 2: {decl['n_configs']} declared cells "
+        f"({', '.join(decl['families'])}), z_bar={decl['z_bar']}, "
+        f"cost={screen.ROUND2_BASE_COST}, gating sizing={screen.ROUND2_SIZING} ===")
+    out_dir = None if out_dir is None else Path(out_dir)
+    payloads: list[dict] = []
+    for fam in fams:
+        specs = families.GRIDS[fam]
+        log(f"=== family {fam}: {len(specs)} cells x "
+            f"{len(screen.ROUND2_WINDOWS)} windows (no early kill) ===")
+        collected = screen.screen_grid_both_windows(
+            fam, specs,
+            lambda spec, window, cost, sizing, fam=fam:
+                runner.run(fam, spec, window, cost, sizing),
+            log=log)
+        runner.assert_round2_grid_recorded(fam, specs,
+                                           f"family {fam} round-2 screen")
+        fates = screen.round2_cell_fates(collected["runs"])
+        breadth = screen.round2_fold_breadth(collected["runs"])
+        log(f"=== family {fam}: {len(fates['dead'])} dead, "
+            f"{len(fates['alive'])} alive on both windows; "
+            f"{len(breadth['pass'])} clear base-cost breadth ===")
+        payload = {
+            "family": fam,
+            #: Not a verdict: the gates (ROUND2_GATE_ORDER_SPEC.md §1) are not
+            #: implemented here, and a collected record set is not a screened
+            #: one.
+            "status": "COLLECTED_NOT_JUDGED",
+            "judge_note": ("the four gates and the ranking of "
+                           "ROUND2_GATE_ORDER_SPEC.md §1 are not implemented "
+                           "here; these are the declared records plus the two "
+                           "rules that need no gate block"),
+            "windows": collected["windows"],
+            "cost": collected["cost"],
+            "cost_label_canonical": collected["cost"],
+            "gating_sizing": collected["sizing"],
+            "n_configs": len(collected["cells"]),
+            "z_bar": screen.ROUND2_Z_BAR,
+            "n_declared_configs": decl["n_configs"],
+            "cells": collected["cells"],
+            "both_windows_kill": fates,
+            "fold_breadth_at_base": breadth,
+            "runs": {f"{c}|{w}": _trim(r)
+                     for (c, w), r in collected["runs"].items()},
+        }
+        if out_dir is not None:
+            (out_dir / f"round2_screen_{fam}.json").write_text(
+                json.dumps(payload, indent=2, default=str))
+        payloads.append(payload)
+    return payloads
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", default="A", help="A, C, D, B or a comma list")
+    ap.add_argument("--family", default="A",
+                    help="A, C, D, B or a comma list; round-2 groups are "
+                         f"{', '.join(ROUND2_SCREEN_FAMILIES)}")
     ap.add_argument("--config", default=None, help="single config name (single run)")
     ap.add_argument("--window", default="W1", choices=sorted(WINDOWS))
     ap.add_argument("--sizing", default="fixed_notional", choices=screen.SIZING_MODES)
-    ap.add_argument("--cost", default="baseline", choices=("baseline", "zero_cost"))
+    ap.add_argument("--cost", default=cost_levels.BASE_COST, choices=COST_CHOICES,
+                    help="canonical cost label; round 2 gates on "
+                         f"{ROUND2_GATE_COSTS[0]} and {ROUND2_GATE_COSTS[1]}")
     ap.add_argument("--screen", action="store_true",
-                    help="run the pre-registered screen for the whole family")
+                    help="run the pre-registered screen for the whole family — "
+                         "round 1's screen_family for A/C/D/B, round 2's "
+                         "both-windows grid for E1/E2/G/H (L1)")
     ap.add_argument("--out-dir", default=str(DEFAULT_OUT))
     ap.add_argument("--cache-dir", default=str(DEFAULT_CACHE))
     ap.add_argument("--quiet", action="store_true")
@@ -481,25 +615,42 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     verdicts = []
+    log = print if not args.quiet else (lambda *_: None)
+    # L1 (audit item 1): which rule ``--screen`` runs is decided by the family,
+    # not by a flag.  Round 1's families run stage 1's conditional screen (kill
+    # on W1); round 2's run the declared both-windows grid at base cost with
+    # ``fixed_notional`` as the sole gating sizing.  They cannot be mixed,
+    # because a mixed call would have to state which rule produced which row.
+    round2 = [f for f in fams if f in ROUND2_SCREEN_FAMILIES]
+    stage1 = [f for f in fams if f not in ROUND2_SCREEN_FAMILIES]
+    if round2 and stage1:
+        raise SystemExit(
+            f"--screen cannot mix round-1 and round-2 families in one call "
+            f"(round 1: {stage1} under screen_family; round 2: {round2} under "
+            f"the both-windows grid): they are different declared rules (L1)")
+    if round2:
+        screen_round2(runner, round2, Path(args.out_dir), log=log)
+        return 0
+
     for fam in fams:
         specs = families.GRIDS[fam]
-        print(f"=== family {fam}: screening {len(specs)} configs on W1 ===", flush=True)
+        log(f"=== family {fam}: screening {len(specs)} configs on W1 ===")
         verdict = screen.screen_family(
             fam, specs,
             lambda spec, window, cost, sizing, fam=fam:
                 runner.run(fam, spec, window, cost, sizing),
-            log=print if not args.quiet else (lambda *_: None))
+            log=log)
         # A3: before any verdict is written, the recorded set must equal the set
         # the screen's own stage decisions declare — the W1/baseline matrix for
         # every cell plus the W2 / zero-cost keys each survivor's outcome
-        # licenses.  Nothing missing, nothing extra.
+        # licenses.  Nothing missing, nothing extra.  (Run-set only: the gate
+        # blocks are L16's other assertion, screen.assert_gate_blocks_present.)
         runner.assert_screen_recorded(fam, specs, verdict, f"family {fam} screen")
         verdict["runs"] = {k: _trim(v) for k, v in verdict["runs"].items()}
         (Path(args.out_dir) / f"screen_{fam}.json").write_text(
             json.dumps(verdict, indent=2, default=str))
-        print(f"=== family {fam}: {verdict['verdict']} "
-              f"(w1: {verdict['w1_survivors']}, w2: {verdict['w2_survivors']}) ===",
-              flush=True)
+        log(f"=== family {fam}: {verdict['verdict']} "
+            f"(w1: {verdict['w1_survivors']}, w2: {verdict['w2_survivors']}) ===")
         verdicts.append(verdict)
     summary = [{k: v for k, v in ver.items() if k != "runs"} for ver in verdicts]
     (Path(args.out_dir) / "screen_summary.json").write_text(

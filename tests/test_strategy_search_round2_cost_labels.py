@@ -94,16 +94,20 @@ def test_the_runner_can_emit_the_gating_cost_level():
     """``--cost slip_x1_5`` is a real choice, and the round-2 gate set is declared."""
     assert set(cost_levels.GATE_COST_LABELS) <= set(runner_mod.COST_CHOICES)
     assert runner_mod.ROUND2_GATE_COSTS == tuple(cost_levels.GATE_COST_LABELS)
-    # the stage-2 runner's stress set is the same object, from the same module
-    assert set(cost_levels.stress_costs()) >= set(cost_levels.GATE_COST_LABELS)
+    # the stage-2 stress set is the same declaration, under the one spelling
+    assert set(cost_levels.stress_costs()) == set(cost_levels.STRESS_COST_LABELS)
+    assert cost_levels.SLIP_X1_5 in cost_levels.stress_costs()
 
 
 def test_no_stress_costs_are_defined_twice():
     """One definition: the stage-2 script delegates, it does not re-declare."""
     src = SCRIPT.read_text()
-    assert "dataclasses.replace(" not in src, \
+    body = src.split("def stress_costs():", 1)[1].split("\ndef ", 1)[0]
+    assert "dataclasses.replace(" not in body, \
         "stress_costs() must live in src/backtesting/strategy_search/costs.py " \
-        "alone; a second definition is how the label clash survived"
+        "alone; a second construction is how the label clash survived"
+    assert "stress_levels()" in body, \
+        "the stage-2 runner must read the one canonical stress set"
 
 
 def test_the_dotted_spelling_appears_nowhere_as_a_label():

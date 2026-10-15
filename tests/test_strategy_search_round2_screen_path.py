@@ -212,25 +212,26 @@ def test_the_stage1_kill_is_round_one_only_and_round_two_kills_on_either():
 def test_fold_breadth_is_read_at_base_cost_not_zero_cost():
     """L6: the brief's kill criteria are stated at base cost.
 
-    ``a``'s base record fails the 12-month rule while its zero-cost record
-    passes; the round-2 breadth conjunct must read the base record, so ``a``
-    fails.  Reading the other record is the defect (audit item 10).
+    The record handed to the breadth rule carries its own cost level; the
+    round-2 conjunct reads the base-cost one, and says so in its output.  (The
+    defect was ``screen.breadth`` reading a zero-cost record — audit item 10 —
+    which is round 1's rule.)
     """
     thin = [{"month": f"2025-{m:02d}", "round_trips": 1,
              "net_bps_per_trip": 1.0} for m in range(1, 13)]
-    runs = {
-        ("a", "W1"): rec("a", "W1", folds=thin),
-        ("a", "W2"): rec("a", "W2", folds=thin),
-        ("z", "W1"): rec("z", "W1", cost="zero_cost"),
-        ("z", "W2"): rec("z", "W2", cost="zero_cost"),
-    }
+    runs = {("a", "W1"): rec("a", "W1", folds=thin),
+            ("a", "W2"): rec("a", "W2", folds=thin)}
     out = screen.round2_fold_breadth(runs)
+    assert out["cost"] == "baseline"
     assert out["pass"] == [], "a thin base-cost month fails the config"
     assert "base" in out["cells"]["a"]["why"], out["cells"]["a"]
 
+    good = {("b", "W1"): rec("b", "W1"), ("b", "W2"): rec("b", "W2")}
+    assert screen.round2_fold_breadth(good)["pass"] == ["b"]
+
 
 def test_a_zero_cost_record_is_refused_as_the_breadth_input():
-    """The cost level is checked, not assumed: passing a zero-cost record is an error."""
+    """The cost level is checked, not assumed: a zero-cost record is an error."""
     with pytest.raises(ValueError, match="base"):
         screen.breadth_at_base(rec("a", "W1", cost="zero_cost"),
                                cost_label="zero_cost")

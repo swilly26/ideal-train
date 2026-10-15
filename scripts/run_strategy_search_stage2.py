@@ -24,6 +24,8 @@ sys.path.insert(0, str(ROOT))
 
 from src.backtesting.replay_costs import CostModel            # noqa: E402
 from src.backtesting.strategy_search import families, screen   # noqa: E402
+from src.backtesting.strategy_search.costs import (            # noqa: E402
+    stress_costs as stress_levels)
 from src.backtesting.strategy_search.engine import (          # noqa: E402
     Market, SearchConfig, run_search)
 from src.backtesting.strategy_search.features import (        # noqa: E402
@@ -236,19 +238,21 @@ def concentration(trades: pd.DataFrame) -> dict:
 
 
 def stress_costs():
-    base = CostModel.baseline()
-    out = {}
-    out["pessimistic"] = CostModel.pessimistic()
-    out["slip_x1.5"] = dataclasses.replace(
-        base, slippage_pct=base.slippage_pct * 1.5,
-        slippage_abs=base.slippage_abs * 1.5, label="slip_x1.5")
-    out["slip_x2"] = dataclasses.replace(
-        base, slippage_pct=base.slippage_pct * 2.0,
-        slippage_abs=base.slippage_abs * 2.0, label="slip_x2")
-    out["pessimistic_x2"] = dataclasses.replace(
-        CostModel.pessimistic(), slippage_pct=0.0004, slippage_abs=0.02,
-        label="pessimistic_x2")
-    return out
+    """The declared stress levels — delegated, not re-declared (L3).
+
+    These used to be built here with hand-written ``dataclasses.replace`` calls
+    and a label that spells the ×1.5 level with a dot, while the funding probe's
+    records spelled the same level with an underscore: two spellings for one
+    level, in artefacts a reader has to compare.  The construction now lives in
+    ``src/backtesting/strategy_search/costs.py``, which declares one canonical
+    label per level and is what the screen runner reads too.
+
+    Note for anyone comparing with the committed stage-2 artefacts: records
+    written before this change carry the dotted spelling.  They are evidence and
+    are not rewritten; the level is the same one, and the only canonical
+    spelling from here on is the underscore one (``costs.SLIP_X1_5``).
+    """
+    return stress_levels()
 
 
 def borrow_cost(trades: pd.DataFrame, rate: float) -> float:

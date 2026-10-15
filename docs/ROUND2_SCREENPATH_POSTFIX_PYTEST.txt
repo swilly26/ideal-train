@@ -1,0 +1,32 @@
+Round-2 screen PATH (audit items 1, 2, 4, 5; lead rulings L1 / L6 / L16) — POST-change pytest,
+same three targets as docs/ROUND2_SCREENPATH_PREFIX_PYTEST.txt
+
+Run from wt-r2 after the implementation: 47 passed in 0.63s.
+
+* 13 new tests in tests/test_strategy_search_round2_screen_path.py — the wired
+  path (72 declared runs, all base/fixed_notional, screen_family never entered),
+  N = 36 / z_bar = 3.196 read off the declared grids, the either-window kill,
+  the hard error on a missing window record, fold breadth at base cost, and the
+  L16 split (run-set assertion vs gate-block assertion).
+* 8 new tests in tests/test_strategy_search_round2_cost_labels.py — the gating
+  set {baseline, slip_x1_5}, x1.5 on both slippage knobs, commission-free
+  gating levels, the dotted spelling refused rather than aliased and absent from
+  src/ and scripts/, one stress-cost definition.
+* The re-scoped tests/test_strategy_search_engine.py::test_a_family_with_no_w1_
+  survivor_is_killed_without_touching_w2 now asserts the round-1 scope by name
+  and that round-2 families are not routed through screen_family; the other 24
+  engine tests are unchanged.
+
+Command (run from the tree under test, live stack verified down by pgrep):
+
+  env -u ALPACA_API_KEY -u ALPACA_SECRET_KEY nice -n 19 \
+    /home/team/shared/engine/.venv/bin/python -m pytest \
+    tests/test_strategy_search_round2_screen_path.py \
+    tests/test_strategy_search_round2_cost_labels.py \
+    tests/test_strategy_search_engine.py -q
+
+...............................................                          [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+47 passed in 0.63s
+rc=0
