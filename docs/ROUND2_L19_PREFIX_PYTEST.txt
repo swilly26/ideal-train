@@ -1,0 +1,45 @@
+L19.1–L19.5 (lead ruling L19: the judge's inputs and two code defects) — pytest,
+tests/test_strategy_search_round2_l19.py.
+Run from wt-r2 at c0a306d with the new tests present and NO implementation:
+14 failed, 20 passed (--tb=line below).
+* L19.2 — the duplicate-name scan fails on src/backtesting/strategy_search/screen.py
+  and names all six shadowed pairs with both line numbers:
+  GateBlocksMissing [461, 666], assert_gate_blocks_present [471, 676],
+  assert_round2_declaration [493, 704], round2_cell_fates [522, 737],
+  breadth_at_base [568, 783], round2_fold_breadth [587, 801].  Every other
+  module in the sweep (the whole search package + every scripts/*.py, 19 files —
+  the two modules c0a306d touched included) is clean.
+* L19.3 — an empty-dict record DOES NOT RAISE today ("DID NOT RAISE
+  GateBlocksMissing"), and ROUND2_GATE_BLOCK_KEYS does not exist, so the
+  failure cannot name the keys a block requires.
+* L19.1 — the spec still carries the dotted literal `slip_x1.5` (lines 15, 40,
+  154-155) and still says the runner "cannot emit that label today".
+* L19.4 — declared_round2_run_set returns 6 keys for a 3-cell grid (should be 12)
+  and the screen path makes 72 calls (should be 144): the ×1.5 gating level is
+  not in the declared run set, and the run-set assertion would raise on its keys.
+* L19.5 — _trim drops cost_label, folds and per_symbol.
+Command (run from the tree under test, live stack verified down by pgrep before
+and after; containment reported 0 refusals / 0 strays / 0 live-stack processes):
+cd /home/team/shared/wt-r2 && WATCHDOG_SCRIPT="$PWD/watchdog.sh" \
+  SUPERVISE_SCRIPT="$PWD/scripts/supervise_traders.sh" nice -n 19 \
+  /home/team/shared/engine/.venv/bin/python -m pytest \
+  tests/test_strategy_search_round2_l19.py -q --no-header --tb=line
+--- output ---
+.....F..............FFFF.FFFFFFFFF                                       [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+FAILED tests/test_strategy_search_round2_l19.py::test_no_module_defines_a_module_level_name_twice[screen.py] - AssertionError: src/backtesting/strategy_search/screen.py defines ['GateBlocksMissing', 'assert_gate_blocks_present', 'assert_round2_declaration', 'breadth_at_base', 'round2_cell_fates', 'round2_fold_breadth'] more than once (line numbers per name): {'GateBlocksMissing': [461, 666], 'asse
+FAILED tests/test_strategy_search_round2_l19.py::test_an_empty_gate_block_is_not_a_gate_block - Failed: DID NOT RAISE GateBlocksMissing
+FAILED tests/test_strategy_search_round2_l19.py::test_a_block_that_is_none_or_absent_fails_and_names_its_required_keys[benchmark] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'ROUND2_GATE_BLOCK_KEYS'. Did you mean: 'ROUND2_GATE_BLOCKS'?
+FAILED tests/test_strategy_search_round2_l19.py::test_a_block_that_is_none_or_absent_fails_and_names_its_required_keys[fat_tail] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'ROUND2_GATE_BLOCK_KEYS'. Did you mean: 'ROUND2_GATE_BLOCKS'?
+FAILED tests/test_strategy_search_round2_l19.py::test_a_block_that_is_none_or_absent_fails_and_names_its_required_keys[concentration] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'ROUND2_GATE_BLOCK_KEYS'. Did you mean: 'ROUND2_GATE_BLOCKS'?
+FAILED tests/test_strategy_search_round2_l19.py::test_the_declared_gate_block_keys_cover_every_declared_block - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'ROUND2_GATE_BLOCK_KEYS'. Did you mean: 'ROUND2_GATE_BLOCKS'?
+FAILED tests/test_strategy_search_round2_l19.py::test_the_gate_order_spec_spells_the_gating_label_canonically - AssertionError: the spec still carries the stale dotted literal 'slip_x1.5' (L19.1); the canonical spelling is costs.SLIP_X1_5 == 'slip_x1_5', and the dotted form is refused by costs.canonical_label rather than aliased
+FAILED tests/test_strategy_search_round2_l19.py::test_the_spec_no_longer_claims_the_runner_cannot_emit_the_x1_5_label - AssertionError: the spec still says the runner cannot emit the ×1.5 label; costs.py declares it and the round-2 path now emits it as a gating level (L19.1, L19.4)
+FAILED tests/test_strategy_search_round2_l19.py::test_the_declared_round2_run_set_is_36_cells_by_2_windows_by_2_levels - AssertionError: assert 6 == ((3 * 2) * 2)
+FAILED tests/test_strategy_search_round2_l19.py::test_the_round2_screen_path_emits_both_gating_levels - AssertionError: every declared cell must run on both windows at both gating levels
+FAILED tests/test_strategy_search_round2_l19.py::test_the_run_set_assertion_still_fails_loudly_on_a_missing_or_extra_key - AssertionError: assert 4 == 8
+FAILED tests/test_strategy_search_round2_l19.py::test_trim_keeps_every_field_the_judge_reads[cost_label] - AssertionError: _trim drops 'cost_label': the judge's step-5/6/8 inputs must survive into the persisted screen artefact (L19.5)
+FAILED tests/test_strategy_search_round2_l19.py::test_trim_keeps_every_field_the_judge_reads[folds] - AssertionError: _trim drops 'folds': the judge's step-5/6/8 inputs must survive into the persisted screen artefact (L19.5)
+FAILED tests/test_strategy_search_round2_l19.py::test_trim_keeps_every_field_the_judge_reads[per_symbol] - AssertionError: _trim drops 'per_symbol': the judge's step-5/6/8 inputs must survive into the persisted screen artefact (L19.5)
+14 failed, 20 passed in 0.19s
+rc=1
