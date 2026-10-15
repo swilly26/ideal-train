@@ -1,0 +1,308 @@
+Round-2 screen PATH (audit items 1, 2, 4, 5; lead rulings L1 / L6 / L16) — pytest,
+tests/test_strategy_search_round2_screen_path.py,
+tests/test_strategy_search_round2_cost_labels.py, plus the re-scoped
+tests/test_strategy_search_engine.py::test_a_family_with_no_w1_survivor_is_killed_without_touching_w2
+
+Run from wt-r2 at 9d31dad with the new tests present and NO implementation:
+14 failed, 24 passed, 1 collection error in 0.69s.
+
+* Every test in tests/test_strategy_search_round2_screen_path.py fails for the
+  reason its own docstring names — the names it pins do not exist yet:
+  screen.assert_round2_declaration, screen.round2_cell_fates,
+  screen.round2_fold_breadth, screen.breadth_at_base,
+  screen.assert_gate_blocks_present, screen.STAGE1_KILL_WINDOWS,
+  screen.STAGE1_KILL_SCOPE, screen.ROUND2_KILL_WINDOWS,
+  screen.GateBlocksMissing, screen.ROUND2_N_CONFIGS / ROUND2_Z_BAR /
+  ROUND2_BREADTH_COST / ROUND2_GATE_BLOCKS, screen.screen_grid_both_windows
+  (report_sizings=), runner.screen_round2, runner.ROUND2_SCREEN_FAMILIES,
+  runner.ROUND2_GATE_COSTS, runner.COST_CHOICES, and
+  src/backtesting/strategy_search/costs.py (module absent).
+* tests/test_strategy_search_round2_cost_labels.py cannot even be collected:
+  the module that would hold the single canonical cost-label set does not
+  exist, which is the artefact of the label clash itself (audit item 4).
+* The one pre-existing test edited by this change
+  (test_a_family_with_no_w1_survivor_is_killed_without_touching_w2) fails on
+  screen.STAGE1_KILL_WINDOWS: round 1's kill rule was not a declared name, so
+  nothing stopped it from being read as round 2's rule.
+* The other 24 tests in tests/test_strategy_search_engine.py pass unchanged —
+  no engine behaviour is touched by this change.
+
+Command (run from the tree under test, live stack verified down by pgrep):
+
+  env -u ALPACA_API_KEY -u ALPACA_SECRET_KEY nice -n 19 \
+    /home/team/shared/engine/.venv/bin/python -m pytest \
+    tests/test_strategy_search_round2_screen_path.py \
+    tests/test_strategy_search_round2_cost_labels.py \
+    tests/test_strategy_search_engine.py -q --continue-on-collection-errors
+
+FFF.FFFFFFFFFF.....................F..                                   [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+==================================== ERRORS ====================================
+______ ERROR collecting tests/test_strategy_search_round2_cost_labels.py _______
+ImportError while importing test module '/home/team/shared/wt-r2/tests/test_strategy_search_round2_cost_labels.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_strategy_search_round2_cost_labels.py:39: in <module>
+    from src.backtesting.strategy_search import costs as cost_levels  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   ImportError: cannot import name 'costs' from 'src.backtesting.strategy_search' (/home/team/shared/wt-r2/src/backtesting/strategy_search/__init__.py)
+=================================== FAILURES ===================================
+____ test_the_round2_screen_path_is_the_both_windows_grid_not_screen_family ____
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-2/test_the_round2_screen_path_is0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f8d30f567b0>
+
+    def test_the_round2_screen_path_is_the_both_windows_grid_not_screen_family(
+            tmp_path, monkeypatch):
+        """``--screen`` on a round-2 family runs ``screen_grid_both_windows``.
+    
+        The replay is stubbed, so this asserts the *declaration* the runner
+        executes: 36 cells x 2 windows = 72 runs, all at base cost and
+        ``fixed_notional`` — and not one of them through ``screen_family``, whose
+        either-sizing admission would make N = 72.
+        """
+        def forbidden(*_a, **_k):
+            raise AssertionError(
+                "screen_family is ROUND 1's rule (L1): the round-2 --screen path "
+                "must run screen_grid_both_windows over declared_round2_run_set")
+    
+        monkeypatch.setattr(screen, "screen_family", forbidden)
+    
+        runner = runner_mod.Runner(cache_dir=Path("/nonexistent-cache"),
+                                   out_dir=tmp_path / "out", verbose=False)
+        calls: list[tuple[str, str, str, str, str]] = []
+    
+        def fake_run(family, sp, window, cost, sizing):
+            calls.append((family, sp["name"], window, cost, sizing))
+            record = rec(sp["name"], window, cost, sizing, family=family, trips=5,
+                         net_bps_per_trip=-9.0, net_pnl=-100.0, folds=[])
+            runner.recorded[runner_mod.run_key(family, sp["name"], window, cost,
+                                               sizing)] = record
+            return record
+    
+        runner.run = fake_run
+>       payloads = runner_mod.screen_round2(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^
+            runner, list(families.ROUND2_FAMILIES), out_dir=tmp_path / "out",
+            log=lambda *_: None)
+E       AttributeError: module 'run_strategy_search' has no attribute 'screen_round2'
+
+tests/test_strategy_search_round2_screen_path.py:97: AttributeError
+__________ test_the_declared_round2_grid_is_36_cells_with_z_bar_3_196 __________
+
+    def test_the_declared_round2_grid_is_36_cells_with_z_bar_3_196():
+        """N = 36 (4 groups x 9) and z_bar = 3.196 are declarations, not prose."""
+>       decl = screen.assert_round2_declaration()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'assert_round2_declaration'
+
+tests/test_strategy_search_round2_screen_path.py:119: AttributeError
+____ test_the_second_sizing_mode_can_be_recorded_but_can_never_admit_a_cell ____
+
+    def test_the_second_sizing_mode_can_be_recorded_but_can_never_admit_a_cell():
+        """R3-3(ii): ``equity_fraction`` is a reported column, not a hypothesis.
+    
+        It may still be run — but it must land outside the gating record set
+        (``runs``), so no admission test can ever read it.  Here the same grid is
+        collected with ``equity_fraction`` requested for reporting and the gating
+        set still holds exactly two windows per cell.
+        """
+        def run(sp, window, cost, sizing):
+            return rec(sp["name"], window, cost, sizing)
+    
+>       out = screen.screen_grid_both_windows(
+            "X", grid("a", "b"), run, log=lambda *_: None,
+            report_sizings=("equity_fraction",))
+E       TypeError: screen_grid_both_windows() got an unexpected keyword argument 'report_sizings'
+
+tests/test_strategy_search_round2_screen_path.py:139: TypeError
+________________ test_a_cell_is_dead_if_it_fails_either_window _________________
+
+    def test_a_cell_is_dead_if_it_fails_either_window():
+        """The round-2 kill is conjunctive across windows (R3-3(iii)/(iv)).
+    
+        ``a`` clears W1 and loses W2; ``b`` clears both.  Failing W2 alone must be
+        enough to kill ``a`` — the stage-1 rule ("kill on the development window")
+        would have kept it.
+        """
+        runs = {
+            ("a", "W1"): rec("a", "W1"),
+            ("a", "W2"): rec("a", "W2", trips=5, net_bps_per_trip=-1.0),
+            ("b", "W1"): rec("b", "W1"),
+            ("b", "W2"): rec("b", "W2"),
+        }
+>       fates = screen.round2_cell_fates(runs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_cell_fates'
+
+tests/test_strategy_search_round2_screen_path.py:172: AttributeError
+_____________ test_a_cell_that_fails_w1_is_dead_even_if_w2_clears ______________
+
+    def test_a_cell_that_fails_w1_is_dead_even_if_w2_clears():
+        """The other direction of the same conjunction."""
+        runs = {
+            ("a", "W1"): rec("a", "W1", trips=0, net_bps_per_trip=0.0),
+            ("a", "W2"): rec("a", "W2"),
+        }
+>       fates = screen.round2_cell_fates(runs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_cell_fates'
+
+tests/test_strategy_search_round2_screen_path.py:184: AttributeError
+________ test_a_missing_window_record_is_a_hard_error_not_a_silent_drop ________
+
+    def test_a_missing_window_record_is_a_hard_error_not_a_silent_drop():
+        """A cell-window that produced no record cannot be scored as a loser."""
+        runs = {("a", "W1"): rec("a", "W1")}
+        with pytest.raises(screen.GridCellFailure, match="W2"):
+>           screen.round2_cell_fates(runs)
+            ^^^^^^^^^^^^^^^^^^^^^^^^
+E           AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_cell_fates'
+
+tests/test_strategy_search_round2_screen_path.py:193: AttributeError
+_____ test_the_stage1_kill_is_round_one_only_and_round_two_kills_on_either _____
+
+    def test_the_stage1_kill_is_round_one_only_and_round_two_kills_on_either():
+        """The two kill rules are declared separately, by name (L1).
+    
+        ``screen_family``'s kill runs on W1 and is **round 1's** rule; round 2's
+        kill runs on both windows and is a different function.  The routing is
+        asserted too: a round-2 family never reaches ``screen_family``.
+        """
+>       assert screen.STAGE1_KILL_WINDOWS == ("W1",)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'STAGE1_KILL_WINDOWS'
+
+tests/test_strategy_search_round2_screen_path.py:203: AttributeError
+_____________ test_fold_breadth_is_read_at_base_cost_not_zero_cost _____________
+
+    def test_fold_breadth_is_read_at_base_cost_not_zero_cost():
+        """L6: the brief's kill criteria are stated at base cost.
+    
+        ``a``'s base record fails the 12-month rule while its zero-cost record
+        passes; the round-2 breadth conjunct must read the base record, so ``a``
+        fails.  Reading the other record is the defect (audit item 10).
+        """
+        thin = [{"month": f"2025-{m:02d}", "round_trips": 1,
+                 "net_bps_per_trip": 1.0} for m in range(1, 13)]
+        runs = {
+            ("a", "W1"): rec("a", "W1", folds=thin),
+            ("a", "W2"): rec("a", "W2", folds=thin),
+            ("z", "W1"): rec("z", "W1", cost="zero_cost"),
+            ("z", "W2"): rec("z", "W2", cost="zero_cost"),
+        }
+>       out = screen.round2_fold_breadth(runs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_fold_breadth'
+
+tests/test_strategy_search_round2_screen_path.py:227: AttributeError
+___________ test_a_zero_cost_record_is_refused_as_the_breadth_input ____________
+
+    def test_a_zero_cost_record_is_refused_as_the_breadth_input():
+        """The cost level is checked, not assumed: passing a zero-cost record is an error."""
+        with pytest.raises(ValueError, match="base"):
+>           screen.breadth_at_base(rec("a", "W1", cost="zero_cost"),
+            ^^^^^^^^^^^^^^^^^^^^^^
+                                   cost_label="zero_cost")
+E           AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'breadth_at_base'
+
+tests/test_strategy_search_round2_screen_path.py:235: AttributeError
+___________ test_the_round2_breadth_cost_is_the_declared_base_level ____________
+
+    def test_the_round2_breadth_cost_is_the_declared_base_level():
+>       assert screen.ROUND2_BREADTH_COST == screen.ROUND2_BASE_COST == "baseline"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'ROUND2_BREADTH_COST'. Did you mean: 'ROUND2_BASE_COST'?
+
+tests/test_strategy_search_round2_screen_path.py:244: AttributeError
+__________ test_assert_gate_blocks_present_names_every_missing_block ___________
+
+    def test_assert_gate_blocks_present_names_every_missing_block():
+        """The gate-block assertion fails closed and names what is missing."""
+        empty = rec("a", "W1")
+>       with pytest.raises(screen.GateBlocksMissing) as exc:
+                           ^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GateBlocksMissing'
+
+tests/test_strategy_search_round2_screen_path.py:251: AttributeError
+_ test_the_run_set_assertion_and_the_gate_block_assertion_are_different_checks _
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-2/test_the_run_set_assertion_and0')
+
+    def test_the_run_set_assertion_and_the_gate_block_assertion_are_different_checks(
+            tmp_path):
+        """``assert_screen_recorded`` = run-set equality; L16's new name = blocks.
+    
+        A record with the right key and no gate block at all passes the run-set
+        assertion — the split is the point: the run-set assertion cannot be cited
+        as evidence that the gates were written.
+        """
+        runner = runner_mod.Runner(cache_dir=Path("/nonexistent-cache"),
+                                   out_dir=tmp_path / "out", verbose=False)
+        specs = grid("a")
+        expected = runner_mod.declared_screen_run_set("X", specs)
+        for key in expected:
+            cell, window, cost, sizing = key.split("|")[1:]
+            runner.recorded[key] = rec(cell, window, cost, sizing)
+        runner.assert_screen_recorded("X", specs, {}, "split")   # run-set only
+        for key in expected:
+>           with pytest.raises(screen.GateBlocksMissing):
+                               ^^^^^^^^^^^^^^^^^^^^^^^^
+E           AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GateBlocksMissing'
+
+tests/test_strategy_search_round2_screen_path.py:282: AttributeError
+_________ test_the_declared_gate_blocks_are_the_three_gate_docs_blocks _________
+
+    def test_the_declared_gate_blocks_are_the_three_gate_docs_blocks():
+>       assert tuple(screen.ROUND2_GATE_BLOCKS) == ("benchmark", "fat_tail",
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+                                                    "concentration")
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'ROUND2_GATE_BLOCKS'
+
+tests/test_strategy_search_round2_screen_path.py:292: AttributeError
+_______ test_a_family_with_no_w1_survivor_is_killed_without_touching_w2 ________
+
+    def test_a_family_with_no_w1_survivor_is_killed_without_touching_w2():
+        """The stage-1 early kill — **ROUND 1's rule only** (L1, audit item 9).
+    
+        ``screen_family`` stops a family at W1.  That rule is re-scoped, not
+        deleted: it is what round 1 ran under, and it is no longer round 2's.  A
+        round-2 family is routed to ``screen.screen_grid_both_windows`` by
+        ``scripts/run_strategy_search.py`` (``ROUND2_SCREEN_FAMILIES``), whose kill
+        is conjunctive across both windows and whose grid is the declared 36 cells
+        x 2 windows — see ``tests/test_strategy_search_round2_screen_path.py``.
+        Both readings stay live, in two named places; neither may be quietly
+        "fixed" into the other.
+        """
+        root = Path(__file__).resolve().parents[1]
+        sys.path.insert(0, str(root / "scripts"))
+        import run_strategy_search as runner_mod
+    
+>       assert screen.STAGE1_KILL_WINDOWS == ("W1",), \
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+            "stage 1's kill is a W1 rule"
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'STAGE1_KILL_WINDOWS'
+
+tests/test_strategy_search_engine.py:446: AttributeError
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_screen_path.py::test_the_round2_screen_path_is_the_both_windows_grid_not_screen_family - AttributeError: module 'run_strategy_search' has no attribute 'screen_round2'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_the_declared_round2_grid_is_36_cells_with_z_bar_3_196 - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'assert_round2_declaration'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_the_second_sizing_mode_can_be_recorded_but_can_never_admit_a_cell - TypeError: screen_grid_both_windows() got an unexpected keyword argument 'report_sizings'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_a_cell_is_dead_if_it_fails_either_window - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_cell_fates'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_a_cell_that_fails_w1_is_dead_even_if_w2_clears - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_cell_fates'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_a_missing_window_record_is_a_hard_error_not_a_silent_drop - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_cell_fates'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_the_stage1_kill_is_round_one_only_and_round_two_kills_on_either - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'STAGE1_KILL_WINDOWS'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_fold_breadth_is_read_at_base_cost_not_zero_cost - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_fold_breadth'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_a_zero_cost_record_is_refused_as_the_breadth_input - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'breadth_at_base'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_the_round2_breadth_cost_is_the_declared_base_level - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'ROUND2_BREADTH_COST'. Did you mean: 'ROUND2_BASE_COST'?
+FAILED tests/test_strategy_search_round2_screen_path.py::test_assert_gate_blocks_present_names_every_missing_block - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GateBlocksMissing'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_the_run_set_assertion_and_the_gate_block_assertion_are_different_checks - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'GateBlocksMissing'
+FAILED tests/test_strategy_search_round2_screen_path.py::test_the_declared_gate_blocks_are_the_three_gate_docs_blocks - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'ROUND2_GATE_BLOCKS'
+FAILED tests/test_strategy_search_engine.py::test_a_family_with_no_w1_survivor_is_killed_without_touching_w2 - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'STAGE1_KILL_WINDOWS'
+ERROR tests/test_strategy_search_round2_cost_labels.py
+14 failed, 24 passed, 1 error in 0.69s
+rc=1

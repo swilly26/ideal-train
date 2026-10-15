@@ -428,6 +428,30 @@ def test_family_c_only_trades_breakouts_after_the_opening_range():
 
 
 def test_a_family_with_no_w1_survivor_is_killed_without_touching_w2():
+    """The stage-1 early kill — **ROUND 1's rule only** (L1, audit item 9).
+
+    ``screen_family`` stops a family at W1.  That rule is re-scoped, not
+    deleted: it is what round 1 ran under, and it is no longer round 2's.  A
+    round-2 family is routed to ``screen.screen_grid_both_windows`` by
+    ``scripts/run_strategy_search.py`` (``ROUND2_SCREEN_FAMILIES``), whose kill
+    is conjunctive across both windows and whose grid is the declared 36 cells
+    x 2 windows — see ``tests/test_strategy_search_round2_screen_path.py``.
+    Both readings stay live, in two named places; neither may be quietly
+    "fixed" into the other.
+    """
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root / "scripts"))
+    import run_strategy_search as runner_mod
+
+    assert screen.STAGE1_KILL_WINDOWS == ("W1",), \
+        "stage 1's kill is a W1 rule"
+    assert screen.STAGE1_KILL_SCOPE == "round_1_only", \
+        "and it is round 1's, by name (L1)"
+    assert screen.ROUND2_KILL_WINDOWS == ("W1", "W2"), \
+        "round 2's kill is either window (R3-3(iii))"
+    assert set(families.ROUND2_FAMILIES) <= set(runner_mod.ROUND2_SCREEN_FAMILIES), \
+        "the round-2 families must not be screened by screen_family"
+
     calls = []
 
     def fake_run(spec, window, cost, sizing):
