@@ -314,6 +314,16 @@ class SearchReplay:
         #: that cannot be seen in the record is an undeclared degree of freedom.
         self.stats["eod_flatten_delayed_trips"] = 0
         self.stats["eod_flatten_max_delay_min"] = 0
+        #: L17 — **the cash at each funding refusal**, so "the mechanical
+        #: full-cash refusal is gone" is a measurement and not an assertion.
+        #: ``skipped["cash"]`` alone cannot separate "the book is at full cash
+        #: and only the fourth fill's own fee does not fit" (a mechanical
+        #: cost-boundary refusal, an artefact of the cap) from "the book has
+        #: lost money and cannot fund the position" (drawdown-driven, correct
+        #: portfolio behaviour).  ``cash_covered_notional`` is that split: True
+        #: means cash still covered the position's **notional** and only the
+        #: fee/round-off pushed the outlay over.
+        self.cash_refusal_log: list[dict] = []
         #: Axis index of the first bar at/after ``eod_flat_min`` in the current
         #: session at which the flatten could **not** be priced; ``None`` when
         #: it was priced, or when no position was open.  It is what separates
@@ -411,6 +421,35 @@ class SearchReplay:
         return min(self._equity() * cfg.position_size_pct,
                    max(self.cash, 0.0) * cfg.bp_usage_pct)
 
+    def _note_cash_refusal(self, k: int, outlay: float, notional: float) -> None:
+        """Record the cash state at a funding refusal (L17).
+
+        A count in ``skipped["cash"]`` cannot say whether the refusal was
+        **mechanical** (the book is at full cash and only the fill's own fee —
+        or the last-bit round-off of ``notional/fill * fill`` — pushed the
+        outlay over the residual) or **drawdown-driven** (cash no longer covers
+        even the position's notional).  ``cash_covered_notional`` is that split,
+        and it is what the L17 re-pin is tested against: after re-pinning
+        ``notional_usd`` to 24 000, no refusal may carry it True.
+        """
+        deployed = sum(abs(leg.qty * leg.entry_fill)
+                       for pos in self.positions.values() for leg in pos.legs)
+        self.cash_refusal_log.append({
+            "time": str(self.m.axis[k]),
+            "cash": float(self.cash),
+            "outlay": float(outlay),
+            "notional": float(notional),
+            "shortfall": float(outlay - self.cash),
+            "open_positions": int(len(self.positions)),
+            "deployed_notional": float(deployed),
+            #: The literal reading of L17's question: did cash still cover the
+            #: position's **notional** (only the fill's own cost pushed the
+            #: outlay over) — a mechanical cost-boundary refusal — or had the
+            #: book lost enough that cash no longer covers even the notional,
+            #: which is drawdown-driven and correct portfolio behaviour?
+            "cash_covered_notional": bool(notional > 0 and self.cash >= notional),
+        })
+
     def _effective_pcts(self, inst: Instrument, sig_k: int) -> tuple:
         """Stop / target / trail percentages for an entry signalled at *sig_k*.
 
@@ -462,6 +501,7 @@ class SearchReplay:
         notional = self._leg_target_notional()
         if notional <= 0:
             self.stats["skipped"]["cash"] += 1
+            self._note_cash_refusal(k, outlay=0.0, notional=float(notional))
             return
         open_legs: list[_OpenLeg] = []
         outlay = 0.0
@@ -491,6 +531,7 @@ class SearchReplay:
             return
         if outlay > self.cash:
             self.stats["skipped"]["cash"] += 1
+            self._note_cash_refusal(k, outlay=outlay, notional=notional)
             return
         for ol in open_legs:
             self.cash -= ol.side * ol.qty * ol.entry_fill + ol.entry_fee
@@ -881,6 +922,16 @@ class SearchReplay:
         s["round_trips"] = int(len(trades))
         s["initial_equity"] = float(cfg.initial_equity)
         s["skipped_total"] = int(sum(s["skipped"].values()))
+        #: L17 — every run record carries **the cash at each funding refusal**
+        #: and **the entries per instrument**, so a crowded-out symbol is
+        #: visible in the record rather than silently `N/A`.  For the round-2
+        #: families (single-leg, instrument key == symbol) the two are the same
+        #: keying; for a pair the key is the instrument.
+        s["cash_refusals_detail"] = [dict(d) for d in self.cash_refusal_log]
+        s["cash_refusals_cost_only"] = int(
+            sum(1 for d in self.cash_refusal_log if d["cash_covered_notional"]))
+        s["entries_by_instrument"] = {
+            key: int((trades["instrument"] == key).sum()) for key in self.instruments}
         #: ``max_drawdown`` marks stale closes: the equity series carries the
         #: last known close of a symbol that has no bar at a timestamp, so a
         #: drawdown that happens entirely while a symbol is not printing is

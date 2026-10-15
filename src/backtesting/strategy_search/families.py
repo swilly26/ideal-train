@@ -542,16 +542,30 @@ def _family_d(spec: dict, market: Market, feats: Mapping[str, pd.DataFrame]
 #: recorded: it has no bars before 2025-02, so it starts mid-W2 and would change
 #: both the trip count and the 12-month stability guard.
 R2_UNIVERSE = ("SOXL", "TQQQ", "SPXL", "SPY")
-#: The pinned caps (R3-6.4, **re-pinned by R3-11.1**): the 150-trip power floor
-#: must be reachable by finding an edge, never by loosening a cap and trading
-#: more.  ``max_positions`` is the size of the universe and ``notional_usd`` is
-#: equity/4, so the cap can never bind, no symbol is crowded out, and total gross
-#: exposure is unchanged at 100 % of the 100k equity (4 x 25_000).  The re-pin
-#: exists because ``R2_UNIVERSE`` is also the instrument insertion order and
-#: ``gap`` is session-constant: at ``max_positions = 2`` family E's SOXL and TQQQ
-#: always took both slots and SPXL/SPY could never trade, which made every E
-#: number a two-symbol, two-correlated-3x-leveraged-ETF number.
-R2_CAPS = {"initial_equity": 100_000.0, "notional_usd": 25_000.0,
+#: The pinned caps (R3-6.4, **re-pinned by R3-11.1**, **re-pinned again by
+#: L17**): the 150-trip power floor must be reachable by finding an edge, never
+#: by loosening a cap and trading more.  ``max_positions`` is the size of the
+#: universe, so the **slot** cap can never bind and no symbol is crowded out by
+#: the cap.  ``notional_usd`` is equity/4 **less headroom for the fourth fill's
+#: own costs** — 4 x 24_000 = 96_000 of the 100k equity, leaving 4_000.
+#:
+#: The first re-pin exists because ``R2_UNIVERSE`` is also the instrument
+#: insertion order and ``gap`` is session-constant: at ``max_positions = 2``
+#: family E's SOXL and TQQQ always took both slots and SPXL/SPY could never
+#: trade, which made every E number a two-symbol, two-correlated-3x-leveraged-ETF
+#: number.
+#:
+#: The **L17** re-pin (25_000 -> 24_000) exists because 4 x 25_000 = 100_000 is
+#: exactly the equity, so the fourth fill's own costs (fees, and the last-bit
+#: round-off of ``notional/fill * fill``) do not fit the residual cash and the
+#: engine refuses it at every full-cash moment — a **mechanical funding refusal**
+#: that fired 196-199 times (W1) / 52-53 times (W2) at the gating levels with
+#: **zero** commission charged, crowding out the last symbol in the declared
+#: order (measured: W1 entries SOXL 244 / TQQQ 239 / SPXL 161 / SPY 129).  That
+#: made each pooled number a function of the instrument order rather than of the
+#: signals.  The 4_000 headroom removes the mechanical refusal; a refusal after
+#: the book has lost money is correct portfolio behaviour and stays.
+R2_CAPS = {"initial_equity": 100_000.0, "notional_usd": 24_000.0,
            "max_positions": 4, "max_entries_per_session": 1,
            "min_minutes_between_entries": 0}
 #: The pinned entry windows, one literal per family (R3-7 E3).

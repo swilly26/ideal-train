@@ -261,7 +261,8 @@ def test_a_positions_own_hole_is_not_fatal_when_the_tape_repairs_itself():
     market = Market({"SOXL": holed_tape(), "SPY": full_tape()})
     legs = (Leg("SOXL", 1, 1.0), Leg("SPY", -1, 1.0))
     insts = one_trip(market, legs, "SOXL/SPY")
-    cfg = simple_cfg(max_positions=4, notional_usd=25_000.0, allow_short=True)
+    cfg = simple_cfg(max_positions=4, notional_usd=families.R2_CAPS["notional_usd"],
+                     allow_short=True)
     res = run_search(market, insts, cfg, CostModel.zero_cost())
     tr = trip_of(res)
     assert tr["exit_time"] == DELAY_TS
@@ -381,7 +382,7 @@ def test_the_flatten_minute_is_shared_by_every_open_position():
     insts = {}
     insts.update(one_trip(market, (Leg("SOXL", 1, 1.0),), "SOXL"))
     insts.update(one_trip(market, (Leg("SPY", 1, 1.0),), "SPY"))
-    cfg = simple_cfg(max_positions=4, notional_usd=25_000.0)
+    cfg = simple_cfg(max_positions=4, notional_usd=families.R2_CAPS["notional_usd"])
     res = run_search(market, insts, cfg, CostModel.zero_cost())
     assert len(res.trades) == 2, "both positions must be open through 15:30"
     assert set(res.trades["exit_time"]) == {DELAY_TS}, \
