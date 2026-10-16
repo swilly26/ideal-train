@@ -157,16 +157,22 @@ def test_the_round2_run_set_is_every_cell_on_both_windows():
     """The runner-level mirror of the same rule (``scripts/run_strategy_search``).
 
     ``declared_round2_run_set`` must be the stage-1 set's *unconditional*
-    sibling: 3 cells declare 6 keys, not 3.
+    sibling **and** (L19.4) declared over both gating cost levels: 3 cells
+    declare 12 keys — not 3, and not the 6 the base-only declaration produced.
+    The ×1.5 level is a declared gate (spec step 4), so a set that omitted it
+    would make the ×1.5 records look *unexpected* to this very assertion.
     """
     sys.path.insert(0, str(ROOT / "scripts"))
     import run_strategy_search as runner_mod
 
+    costs = ("baseline", "slip_x1_5")
+    assert tuple(runner_mod.ROUND2_GATE_COSTS) == costs
     expected = runner_mod.declared_round2_run_set("H", grid("a", "b", "c"))
-    assert expected == {
-        "H|a|W1|baseline|fixed_notional", "H|a|W2|baseline|fixed_notional",
-        "H|b|W1|baseline|fixed_notional", "H|b|W2|baseline|fixed_notional",
-        "H|c|W1|baseline|fixed_notional", "H|c|W2|baseline|fixed_notional"}
+    assert expected == {f"H|{c}|{w}|{cost}|fixed_notional"
+                        for c in ("a", "b", "c")
+                        for w in ("W1", "W2")
+                        for cost in costs}
+    assert len(expected) == 3 * 2 * 2 == 12
     runner = runner_mod.Runner(cache_dir=Path("/nonexistent-cache"),
                                out_dir=Path("/tmp") / "r2_bothwindows_out",
                                verbose=False)
@@ -174,6 +180,12 @@ def test_the_round2_run_set_is_every_cell_on_both_windows():
     runner.assert_round2_grid_recorded("H", grid("a", "b", "c"), "test")
     del runner.recorded["H|b|W2|baseline|fixed_notional"]
     with pytest.raises(RuntimeError, match="missing"):
+        runner.assert_round2_grid_recorded("H", grid("a", "b", "c"), "test")
+    # a level the protocol does not declare is a hard failure too: the set is
+    # exact in both directions, never "at least these"
+    runner.recorded["H|b|W2|baseline|fixed_notional"] = {}
+    runner.recorded["H|b|W2|zero_cost|fixed_notional"] = {}
+    with pytest.raises(RuntimeError, match="unexpected"):
         runner.assert_round2_grid_recorded("H", grid("a", "b", "c"), "test")
 
 
