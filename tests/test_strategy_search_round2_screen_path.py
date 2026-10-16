@@ -29,9 +29,15 @@ What is pinned here, and why it is not cosmetic:
 Every test here fails on the pre-change tree (``9d31dad``): the new names it
 calls do not exist yet.  The recorded pre-change run is the committed artefact
 ``docs/ROUND2_SCREENPATH_PREFIX_PYTEST.txt``.
+
+The tests added by the vacuity-audit fix (``ROUND2_VACUITY_AUDIT_FINDINGS.md``
+items M1, M2, M3, M4, S1, S4, S5) are **not** failing-first: the code they test is
+correct today, so their evidence is a mutation check — each one is shown to fail
+against a deliberately broken variant — in ``docs/ROUND2_VACUITY_MUTATIONS.txt``.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -43,6 +49,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from src.backtesting.strategy_search import families, screen  # noqa: E402
 import run_strategy_search as runner_mod  # noqa: E402
+from tests.test_strategy_search_round2_l19 import (  # noqa: E402
+    GATE_BLOCK_CRITICAL_KEYS,
+    GATE_BLOCK_KEY_COUNTS,
+)
 
 
 def spec(name: str, **kw) -> dict:
@@ -138,8 +148,25 @@ def test_the_round2_screen_path_is_the_both_windows_grid_not_screen_family(
             f"×1.5 grid starts (L19.4)"
     assert {sz for *_x, sz in calls} == {screen.ROUND2_SIZING} \
         == {"fixed_notional"}, "fixed_notional is the sole gating sizing (L1)"
-    assert set(runner.recorded) == {runner_mod.run_key(f, c, w, cost, sz)
-                                    for f, c, w, cost, sz in calls}, \
+    # M3: the expected set is built from the **declaration** — the object
+    # ``assert_round2_grid_recorded`` itself uses, over ``families.GRIDS`` — and from
+    # a by-value literal spelling of the same keys.  It is never built from ``calls``,
+    # which the stub above writes with the same ``run_key`` it records with:
+    # comparing the recorded set against the stub's own log is one function of one
+    # list, which can only fail if the stub contradicts itself and can never notice
+    # a key builder that has drifted away from the declared format.
+    declared_keys = set().union(*(
+        runner_mod.declared_round2_run_set(fam, families.GRIDS[fam])
+        for fam in families.ROUND2_FAMILIES))
+    assert declared_keys == {
+        f"{fam}|{s['name']}|{w}|{cost}|fixed_notional"
+        for fam in families.ROUND2_FAMILIES
+        for s in families.GRIDS[fam]
+        for w in ("W1", "W2")
+        for cost in ("baseline", "slip_x1_5")}, \
+        "the declared run-key format is pinned by value, not read back off the stub"
+    assert len(declared_keys) == 144
+    assert set(runner.recorded) == declared_keys, \
         "the run set the runner kept is exactly the declared one"
     assert {p["status"] for p in payloads} == {"COLLECTED_NOT_JUDGED"}, \
         "the round-2 path collects the declared records; the gates are the " \
@@ -157,12 +184,92 @@ def test_the_round2_screen_path_is_the_both_windows_grid_not_screen_family(
             == set(screen.ROUND2_WINDOWS)
 
 
+# ── item 1b (M2): main()'s round-2 branch ──────────────────────────────
+def test_main_sends_a_round2_family_down_the_round2_branch(monkeypatch, tmp_path):
+    """``--screen --family E1`` enters ``screen_round2`` and never ``screen_family``.
+
+    M2: the routing lives in ``run_strategy_search.main`` (the
+    ``round2``/``stage1`` split and the ``SystemExit`` refusing a mixed call) and
+    had **no test at all**.  The only ``main()``-driving test in this area passes
+    ``--family A``, which takes the stage-1 branch, and ``screen_round2`` is
+    otherwise always called directly — so a regression that sent E1/E2/G/H down
+    ``screen.screen_family`` (the precise failure L1 / audit item 1 exists to
+    prevent) left the suite green.
+
+    The replay is stubbed the way ``fourfixes.py`` does it (a stub ``Runner.run``
+    that registers each record under the real ``run_key``), so this asserts the
+    *declaration the runner executes*: every declared cell on both windows at both
+    gating levels, the persisted payload's status and gating costs, and the
+    refusal to mix the two declared rules in one call.
+    """
+    def forbidden(*_a, **_k):
+        raise AssertionError(
+            "screen_family is ROUND 1's rule (L1): --screen on a round-2 family "
+            "must go down main()'s round-2 branch into screen_round2, and its "
+            "either-sizing / W1-only / zero-cost-breadth rules must never touch a "
+            "round-2 grid")
+
+    monkeypatch.setattr(screen, "screen_family", forbidden)
+
+    built: list = []
+
+    def stub_run(self, family, spec, window, cost, sizing):
+        built.append(self)
+        record = rec(spec["name"], window, cost, sizing, family=family, trips=5,
+                     net_bps_per_trip=-9.0, net_pnl=-100.0, folds=[])
+        self.recorded[runner_mod.run_key(family, spec["name"], window, cost,
+                                         sizing)] = record
+        return record
+
+    monkeypatch.setattr(runner_mod.Runner, "run", stub_run)
+
+    out = tmp_path / "out"
+    rc = runner_mod.main(["--screen", "--family", "E1", "--out-dir", str(out),
+                          "--quiet"])
+    assert rc == 0, "main() must return success, not fall through to the CLI's exit"
+    assert len({id(r) for r in built}) == 1, "one runner drives the whole screen"
+    runner = built[0]
+
+    # (i) the recorded run set is the declared one — one family's 9 cells x 2
+    # windows x 2 gating levels = 36 records (the whole four-family grid, 36 cells,
+    # is 144), built from the declaration rather than from the stub's own log
+    declared = runner_mod.declared_round2_run_set("E1", families.GRIDS["E1"])
+    assert len(declared) == 9 * 2 * 2 == 36
+    assert sum(len(runner_mod.declared_round2_run_set(f, families.GRIDS[f]))
+               for f in families.ROUND2_FAMILIES) == 144
+    assert set(runner.recorded) == declared
+    assert {k.split("|")[1] for k in runner.recorded} == \
+        {s["name"] for s in families.GRIDS["E1"]}, "the whole declared E1 grid"
+
+    # (ii) the payload is written, and it is a *collection*, not a verdict
+    payload = json.loads((out / "round2_screen_E1.json").read_text())
+    assert payload["status"] == "COLLECTED_NOT_JUDGED"
+    assert payload["gating_costs"] == ["baseline", "slip_x1_5"]
+    assert payload["family"] == "E1" and payload["n_configs"] == 9
+    assert "verdict" not in payload
+    assert set(payload["runs"]) == {
+        f"{s['name']}|{w}|{cost}"
+        for s in families.GRIDS["E1"]
+        for w in ("W1", "W2")
+        for cost in ("baseline", "slip_x1_5")}
+
+    # (iii) the two declared rules are never mixed in one call: a mixed family list
+    # would have to say which rule produced which row
+    with pytest.raises(SystemExit, match="cannot mix"):
+        runner_mod.main(["--screen", "--family", "A,E1", "--out-dir",
+                         str(tmp_path / "mixed"), "--quiet"])
+
+
 def test_the_declared_round2_grid_is_36_cells_with_z_bar_3_196():
     """N = 36 (4 groups x 9) and z_bar = 3.196 are declarations, not prose."""
     decl = screen.assert_round2_declaration()
     assert decl["n_configs"] == screen.ROUND2_N_CONFIGS == 36
     assert decl["z_bar"] == screen.ROUND2_Z_BAR == 3.196
-    assert tuple(decl["families"]) == tuple(families.ROUND2_FAMILIES), \
+    # S4: this compared the declaration's family list with
+    # ``families.ROUND2_FAMILIES``, but ``assert_round2_declaration`` *builds* that
+    # list from that same constant — a constant against itself.  The literal is the
+    # pin; it is what catches a fifth group being added to the search package.
+    assert tuple(decl["families"]) == ("E1", "E2", "G", "H"), \
         "the declaration covers exactly the four round-2 groups"
     assert len(set(decl["cells"])) == 36, \
         "two cells under one name is a silent drop (R3-3)"
@@ -265,8 +372,19 @@ def test_the_stage1_kill_is_round_one_only_and_round_two_kills_on_either():
     assert screen.STAGE1_KILL_WINDOWS == ("W1",)
     assert screen.STAGE1_KILL_SCOPE == "round_1_only"
     assert screen.ROUND2_KILL_WINDOWS == ("W1", "W2")
-    assert set(families.ROUND2_FAMILIES) <= set(runner_mod.ROUND2_SCREEN_FAMILIES), \
-        "round-2 families must be routed to the round-2 path, not screen_family"
+    # M1: this used to be `set(families.ROUND2_FAMILIES) <= set(ROUND2_SCREEN_FAMILIES)`,
+    # which is `set(A) <= set(A)`: ``ROUND2_SCREEN_FAMILIES`` IS
+    # ``tuple(families.ROUND2_FAMILIES)`` (run_strategy_search.py:83), so it held for
+    # **any** content, including an empty alias.  The routing table is pinned by
+    # literal instead.  The alias stays the single source of truth for the code (it
+    # is what ``main``'s round-2 branch reads); this literal is what makes a drift in
+    # it — or in ``ROUND2_FAMILIES`` — loud.
+    assert tuple(runner_mod.ROUND2_SCREEN_FAMILIES) == ("E1", "E2", "G", "H"), \
+        "the round-2 routing table is exactly the four declared groups: a family " \
+        "missing from it is screened under round 1's screen_family rule, and its " \
+        "numbers are not the grid the pre-registration declares"
+    assert families.ROUND2_FAMILIES == ("E1", "E2", "G", "H"), \
+        "the declared round-2 family tuple (what the alias is built from)"
     assert not set(families.ROUND2_FAMILIES) & {"A", "B", "C", "D"}
 
 
@@ -293,14 +411,27 @@ def test_fold_breadth_is_read_at_base_cost_not_zero_cost():
 
 
 def test_a_zero_cost_record_is_refused_as_the_breadth_input():
-    """The cost level is checked, not assumed: a zero-cost record is an error."""
-    with pytest.raises(ValueError, match="base"):
+    """The cost level is checked, not assumed: a zero-cost record is an error.
+
+    S5: the message *is* the contract here, so ``match="base"`` was too weak to be
+    a check — every one of these messages necessarily contains "base".  Both the
+    offending label and the required one are asserted by value.
+    """
+    with pytest.raises(ValueError) as exc:
         screen.breadth_at_base(rec("a", "W1", cost="zero_cost"),
                                cost_label="zero_cost")
+    msg = str(exc.value)
+    assert "zero_cost" in msg and "baseline" in msg, (
+        f"the refusal must name the level it was handed and the level it requires: "
+        f"{msg!r}")
     runs = {("a", "W1"): rec("a", "W1", cost="zero_cost"),
             ("a", "W2"): rec("a", "W2", cost="zero_cost")}
-    with pytest.raises(ValueError, match="base"):
+    with pytest.raises(ValueError) as exc:
         screen.round2_fold_breadth(runs)
+    msg = str(exc.value)
+    assert "zero_cost" in msg and "baseline" in msg, (
+        f"the refusal must name the level it was handed and the level it requires: "
+        f"{msg!r}")
 
 
 def test_the_round2_breadth_cost_is_the_declared_base_level():
@@ -319,7 +450,25 @@ def test_assert_gate_blocks_present_names_every_missing_block():
     """
     required = screen.ROUND2_GATE_BLOCK_KEYS
 
-    absent = rec("a", "W1")
+    # M4: the expectation may not be composed from the dict the implementation
+    # reads.  ``ROUND2_GATE_BLOCK_KEYS`` **is** that dict (screen.py:576), so a
+    # renamed, dropped or misspelt key moved both sides together and could not fail
+    # this test.  The gating-critical keys and each block's full key count are pinned
+    # by literal, from the gate docs the blocks were written from.
+    for block in screen.ROUND2_GATE_BLOCKS:
+        assert len(required[block]) == GATE_BLOCK_KEY_COUNTS[block], (
+            f"{block!r} requires {len(required[block])} keys, the gate doc declares "
+            f"{GATE_BLOCK_KEY_COUNTS[block]} (M4)")
+        for key in GATE_BLOCK_CRITICAL_KEYS[block]:
+            assert key in required[block], (
+                f"{block!r} no longer requires {key!r} — a gate decision is read "
+                f"off that key (M4)")
+
+    # S1: the record carries an ``identity_key``, and the failure names it.  Without
+    # one, ``assert "a" in msg`` cannot fail: "a" occurs in "absent", "carry" and
+    # "a gate" whatever the record is.
+    identity = "X|a|a|W1|baseline|fixed_notional"
+    absent = rec("a", "W1", identity_key=identity)
     with pytest.raises(screen.GateBlocksMissing) as exc:
         screen.assert_gate_blocks_present(absent)
     msg = str(exc.value)
@@ -328,7 +477,8 @@ def test_assert_gate_blocks_present_names_every_missing_block():
         for key in required[block]:
             assert key in msg, (f"the failure must say which keys the {block!r} "
                                 f"block requires — {key!r} is missing")
-    assert "a" in msg and "W1" in msg, "the failure must name the record"
+    assert identity in msg, \
+        f"the failure must name the record it is about, by its identity key ({S1})"
 
     # ``None`` and ``{}`` fail exactly as absence does (L19.3) ...
     for value in (None, {}):

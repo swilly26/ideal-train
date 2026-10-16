@@ -36,6 +36,11 @@ What is pinned here, and why each one is a defect rather than a style question:
 Every test here fails on the pre-change tree (``c0a306d``); the recorded
 pre-change run is the committed artefact
 ``docs/ROUND2_L19_PREFIX_PYTEST.txt``.
+
+The tests added by the vacuity-audit fix pass (``ROUND2_VACUITY_AUDIT_FINDINGS.md``
+items M4, S1, S2, S3 and the tidy note) are **not** failing-first: they pin an
+assertion that exists and is correct today, so their evidence is a mutation check,
+not a pre-change run — ``docs/ROUND2_VACUITY_MUTATIONS.txt``.
 """
 from __future__ import annotations
 
@@ -112,11 +117,82 @@ def test_the_sweep_covers_the_modules_c0a306d_touched():
     assert {"run_strategy_search.py", "run_strategy_search_stage2.py"} <= swept
 
 
+def test_the_duplicate_scan_reports_a_duplicate_and_ignores_an_import(tmp_path):
+    """S2: the scan's only evidence used to be the committed pre-change artefact.
+
+    A diagnostics tool with no in-tree positive control is a tool nobody can tell
+    from a no-op: the sweep passing on the current tree is also what it would do
+    if it looked at nothing.  This parses a module that **is** broken, and one
+    name that is imported *and* defined — the documented exclusion.
+    """
+    path = tmp_path / "dup.py"
+    path.write_text(
+        "import os\n"
+        "from math import sqrt\n"
+        "\n"
+        "\n"
+        "def os():\n"          # imported AND defined: one implementation, not two
+        "    return None\n"
+        "\n"
+        "\n"
+        "def same():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def same():\n"        # the shadowed second implementation (L19.2)
+        "    return 2\n"
+        "\n"
+        "\n"
+        "other = 1\n"
+        "other = 2\n")
+    dups = module_level_duplicates(path)
+    assert set(dups) == {"same", "other"}, (
+        f"the scan must report both duplicate *bindings* and nothing else: {dups}")
+    assert len(dups["same"]) == 2 and len(dups["other"]) == 2
+    assert "os" not in dups, (
+        "a name that is imported and then defined is one implementation: the "
+        "import is the documented exclusion, and a scan that cries wolf is a "
+        "scan nobody reads")
+    assert "sqrt" not in dups
+
+
 # ── L19.3: presence is not content ─────────────────────────────────────
+#: M4 (``ROUND2_VACUITY_AUDIT_FINDINGS.md``): the **gating-critical** keys of each
+#: declared block, pinned **by literal**.  ``screen.ROUND2_GATE_BLOCK_KEYS`` is the
+#: dict ``screen.py`` itself reads, so a test that composes its expectation from it
+#: compares that dict with itself and cannot fail when a key is renamed, dropped or
+#: misspelt.  These literals come from the gate docs the blocks were written from —
+#: ``ROUND2_BENCHMARK_GATE_R3-6.1.md``, ``ROUND2_FAT_TAIL_GATE_R3-6.2.md``,
+#: ``ROUND2_CONCENTRATION_GATE_R3-6.3.md`` — and each one is a key a *decision* is
+#: read off: losing it removes a gate step silently instead of trimming a row.
+GATE_BLOCK_CRITICAL_KEYS: dict[str, tuple[str, ...]] = {
+    "benchmark": ("paired_trips", "benchmark_unpriced",
+                  "delta_lower_bound_p0.0694", "per_symbol"),
+    "concentration": ("max_symbol_share", "n_symbols_traded",
+                      "min_traded_symbol_trips", "caps", "rules"),
+    "fat_tail": ("remainder_after_best_k_bps", "best_session_share", "rules"),
+}
+
+#: The full key count of each block, hand-verified against the same doc lines
+#: (``R3-6.1.md:73`` 24, ``R3-6.2.md:92`` 34, ``R3-6.3.md:92`` 27 — the audit's own
+#: count).  A *dropped non-critical* key is invisible to the critical-key pin above
+#: and invisible to the implementation-vs-itself comparison, so the count is pinned
+#: too: the key lists are the gate contract and may only change with their docs.
+GATE_BLOCK_KEY_COUNTS: dict[str, int] = {
+    "benchmark": 24, "fat_tail": 34, "concentration": 27}
+
+
 def gate_record(**blocks) -> dict:
-    """A minimal base record with the given gate blocks."""
+    """A minimal base record with the given gate blocks.
+
+    It carries an ``identity_key`` (S1): the failure message names the record, so
+    asserting a bare ``"a" in msg`` is unfailable — that character occurs in
+    "absent", "carry" and "a gate" whatever the record is.  With the key present
+    the message is the record's own identity, and the test can assert it exactly.
+    """
     out = {"family": "X", "cell_id": "a", "config": "a", "window": "W1",
-           "cost_label": "baseline", "sizing": "fixed_notional"}
+           "cost_label": "baseline", "sizing": "fixed_notional",
+           "identity_key": "X|a|a|W1|baseline|fixed_notional"}
     out.update(blocks)
     return out
 
@@ -134,14 +210,34 @@ def test_an_empty_gate_block_is_not_a_gate_block():
     msg = str(exc.value)
     for block in screen.ROUND2_GATE_BLOCKS:
         assert block in msg, f"the failure must name the offending block {block!r}"
-    assert "a" in msg and "W1" in msg, "the failure must name the record"
+    assert "X|a|a|W1|baseline|fixed_notional" in msg, \
+        "the failure must name the record it is about (S1: 'a' in msg cannot fail — " \
+        "the character occurs in 'absent', 'carry' and 'a gate' whatever the record is)"
 
 
 @pytest.mark.parametrize("block", screen.ROUND2_GATE_BLOCKS)
 def test_a_block_that_is_none_or_absent_fails_and_names_its_required_keys(block):
-    """Missing / ``None`` fail, and the error names the keys the block requires."""
+    """Missing / ``None`` fail, and the error names the keys the block requires.
+
+    M4: the expectation must not be a function of the dict the implementation
+    reads.  ``screen.ROUND2_GATE_BLOCK_KEYS`` **is** that dict, so composing the
+    expected message from it made this test unfailable for the failure it exists
+    to catch: rename a key in ``screen.py`` and both sides move together.  The
+    gating-critical keys are pinned by literal
+    (:data:`GATE_BLOCK_CRITICAL_KEYS`) and the block's full key count with them,
+    so a wrong, renamed or incomplete key list fails here.
+    """
     required = screen.ROUND2_GATE_BLOCK_KEYS[block]
     assert required, f"{block!r} must declare the keys it requires"
+    assert len(required) == GATE_BLOCK_KEY_COUNTS[block], (
+        f"{block!r} requires {len(required)} keys, the gate doc declares "
+        f"{GATE_BLOCK_KEY_COUNTS[block]} — the key list is the gate contract and "
+        f"may only change with its doc (M4)")
+    for key in GATE_BLOCK_CRITICAL_KEYS[block]:
+        assert key in required, (
+            f"{block!r} no longer requires {key!r}: a gate decision is read off "
+            f"that key, so dropping it removes a gate step rather than a report "
+            f"row (M4)")
     for record in (gate_record(), gate_record(**{block: None})):
         with pytest.raises(screen.GateBlocksMissing) as exc:
             screen.assert_gate_blocks_present(record)
@@ -165,7 +261,17 @@ def test_the_declared_gate_block_keys_cover_every_declared_block():
 
 
 # ── L19.1: the canonical label in the spec ─────────────────────────────
-@pytest.mark.skipif(not SPEC.exists(), reason="the gate-order spec is a shared doc")
+#: The spec is a live contract document outside the repo (in the shared tree).
+#: S3: ``skipif(not SPEC.exists())`` made these tests silently vacuous in any
+#: checkout where the shared tree is mounted but the file is not there — the
+#: mounted tree is the normal case, so a vanished or renamed spec must fail, not
+#: skip.  The skip is kept only for the genuinely absent tree (no shared mount at
+#: all), and the assertions rest on by-value literals.
+SHARED_TREE = Path("/home/team/shared")
+
+
+@pytest.mark.skipif(not SHARED_TREE.exists(),
+                    reason="the shared tree is not mounted in this checkout")
 def test_the_gate_order_spec_spells_the_gating_label_canonically():
     """The spec's literal matches ``costs.py``; the dotted spelling is refused (L19.1).
 
@@ -173,13 +279,15 @@ def test_the_gate_order_spec_spells_the_gating_label_canonically():
     is historical evidence and is not rewritten, so the correction is confined to
     the spec, which is a live contract document.
     """
+    assert SPEC.exists(), (
+        f"{SPEC} is missing although {SHARED_TREE} is mounted: this test asserts "
+        f"the live spec's literals by value, so a vanished or renamed spec is a "
+        f"failure about the contract, not a reason to skip (S3)")
     text = SPEC.read_text()
     assert costs.SLIP_X1_5 == "slip_x1_5"
-    assert "slip_x1.5" not in text, (
-        "the spec still carries the stale dotted literal 'slip_x1.5' (L19.1); the "
-        "canonical spelling is costs.SLIP_X1_5 == 'slip_x1_5', and the dotted "
-        "form is refused by costs.canonical_label rather than aliased")
-    assert "slip_x1_5" in text
+    # The by-value pins come first: they are what the spec must *say*, so the
+    # failure for a rewritten spec is about its content rather than about one
+    # sentence the audit happened to quote (S3).
     assert '("baseline", "slip_x1_5")' in text, (
         "the spec's GATE_COST_LABELS literal must match the code's **tuple** "
         "(the old line was wrong twice: spelling, and a set literal compared "
@@ -187,12 +295,25 @@ def test_the_gate_order_spec_spells_the_gating_label_canonically():
     assert "costs.py" in text, (
         "the stale L3 citation must be corrected to the code home of the label "
         "set (L19.1), so the literal and its source agree")
+    assert "slip_x1_5" in text
+    assert "slip_x1.5" not in text, (
+        "the spec still carries the stale dotted literal 'slip_x1.5' (L19.1); the "
+        "canonical spelling is costs.SLIP_X1_5 == 'slip_x1_5', and the dotted "
+        "form is refused by costs.canonical_label rather than aliased")
 
 
-@pytest.mark.skipif(not SPEC.exists(), reason="the gate-order spec is a shared doc")
+@pytest.mark.skipif(not SHARED_TREE.exists(),
+                    reason="the shared tree is not mounted in this checkout")
 def test_the_spec_no_longer_claims_the_runner_cannot_emit_the_x1_5_label():
     """The stale sentence: ``costs.py`` landed, so the label has a producer (L19.1)."""
+    assert SPEC.exists(), (
+        f"{SPEC} is missing although {SHARED_TREE} is mounted — the spec's "
+        f"gating-label lines cannot be read, which is a failure (S3)")
     text = SPEC.read_text()
+    assert costs.GATE_COST_LABELS == ("baseline", "slip_x1_5")
+    assert "slip_x1_5" in text, (
+        "the spec must spell the gating label canonically in its own text, not "
+        "only in the tuple literal (L19.1)")
     assert "cannot emit that label today" not in text, (
         "the spec still says the runner cannot emit the ×1.5 label; costs.py "
         "declares it and the round-2 path now emits it as a gating level (L19.1, "
@@ -263,8 +384,12 @@ def test_the_round2_screen_path_emits_both_gating_levels(tmp_path):
                 for f in families.ROUND2_FAMILIES for s in families.GRIDS[f]
                 for w in screen.ROUND2_WINDOWS for c in runner_mod.ROUND2_GATE_COSTS]
     assert len(declared) == 144
-    #: The *set* is declared; the order of the two gating levels is not, so the
-    #: comparison is on the sorted list — exact in content, order-insensitive.
+    #: The *set* is declared; the **order** of the two gating levels is not a
+    #: protocol declaration — so this, the protocol-side assertion, stays
+    #: order-insensitive.  ``screen_path.py`` does pin the order in which
+    #: ``screen_round2`` iterates ``ROUND2_GATE_COSTS``; that pin is an
+    #: **implementation detail**, not a second reading of the protocol, and it does
+    #: not contradict this line (tidy, ROUND2_VACUITY_AUDIT_FINDINGS.md).
     assert sorted((f, c, w, cost) for f, c, w, cost, _sz in calls) == sorted(declared), \
         "every declared cell must run on both windows at both gating levels"
     assert {cost for *_x, cost, _sz in calls} == set(runner_mod.ROUND2_GATE_COSTS)

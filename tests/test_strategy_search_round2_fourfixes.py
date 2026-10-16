@@ -27,6 +27,11 @@ with its header in ``docs/ROUND2_FOURFIXES_PREFIX_EVIDENCE.md``.
 * **A5** — ``engine_sha()`` returned the string ``"unknown"`` on any failure,
   run records were replaced silently by an unconditional ``write_text``, and
   the filename carried neither hash.
+
+The one test added by the vacuity audit's fix pass (M5 — the real producer of a
+``slip_x1_5`` record, ``ROUND2_VACUITY_AUDIT_FINDINGS.md``) is **not**
+failing-first: the code it exercises is correct today, so its evidence is a
+mutation check in ``docs/ROUND2_VACUITY_MUTATIONS.txt``.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.backtesting.replay_costs import CostModel  # noqa: E402
+from src.backtesting.strategy_search import costs as cost_levels  # noqa: E402
 from src.backtesting.strategy_search import engine, families  # noqa: E402
 from src.backtesting.strategy_search.engine import (  # noqa: E402
     Instrument,
@@ -269,6 +275,52 @@ def test_the_cost_columns_split_slippage_from_fees(label):
     assert tr["pnl_gross"] + tr["slip_drag"] == pytest.approx(0.0, abs=1e-6)
     assert tr["pnl_gross"] + tr["cost_drag"] - tr["fees"] == pytest.approx(0.0,
                                                                            abs=1e-6)
+
+
+# ── A2/M5: the ×1.5 gating level's real producer ───────────────────────
+def test_the_x1_5_gating_level_is_produced_by_the_real_runner_path(tmp_path):
+    """M5: no test ever ran the real producer of a ``slip_x1_5`` record.
+
+    Every ``slip_x1_5`` record in the suite was fabricated by a stub: the producer
+    path — ``cost_levels.cost_model(cost_label)`` -> the record's ``cost_model`` /
+    ``cost_label`` -> ``write_record``'s filename -> the baseline-only
+    reconciliation skip — was never exercised end to end.  The failure class it has
+    to catch is the one audit item 4 removed: a runner that **carries** the ×1.5
+    label while running the baseline model underneath (the old two-way
+    ``baseline``/``zero_cost`` conditional), which turns every ×1.5 gate into a
+    statement about the wrong cost level.
+    """
+    windows = {"W1": canned({"SOXL": bars()})}
+    runner = canned_runner(tmp_path, windows)
+    x15 = runner.run("A", spec_copy(), "W1", "slip_x1_5", "fixed_notional")
+
+    assert x15["cost_label"] == "slip_x1_5"
+    assert x15["cost_model"] == cost_levels.cost_model("slip_x1_5").as_dict()
+    # …and pinned by value, so a ``cost_model()`` that returned the baseline model
+    # for this label cannot make both sides of the comparison move together.
+    assert x15["cost_model"]["slippage_pct"] == pytest.approx(0.0003, abs=1e-12)
+    assert x15["cost_model"]["slippage_abs"] == pytest.approx(0.015, abs=1e-12)
+    assert x15["cost_model"]["label"] == "slip_x1_5"
+    assert x15["cost_model"] != cost_levels.cost_model("baseline").as_dict(), \
+        "the ×1.5 record must not carry the baseline toll"
+
+    # The zero-cost reconciliation runs at ``baseline`` only (its own gate), so a
+    # ×1.5 record carries none — and the *baseline* record still does.
+    assert x15["zero_cost_reconciliation"] is None
+
+    files = sorted(p.name for p in Path(tmp_path).glob("*.json"))
+    assert len(files) == 1, files
+    assert files[0].endswith(".json") and "__slip_x1_5__" in files[0], files[0]
+    assert not list(Path(tmp_path).glob("*.partial"))
+
+    base = runner.run("A", spec_copy(), "W1", "baseline", "fixed_notional")
+    assert base["cost_model"] == cost_levels.cost_model("baseline").as_dict()
+    assert base["zero_cost_reconciliation"] is not None, (
+        "the positive control for the ``None`` above: the baseline label *does* "
+        "reconcile, so a ×1.5 record carrying none is the label's property and not "
+        "a runner that never reconciles at all")
+    base_files = sorted(p.name for p in Path(tmp_path).glob("*.json"))
+    assert len(base_files) == 2 and any("__baseline__" in n for n in base_files)
 
 
 # ── A3: a W1 survivor must reach a written verdict ─────────────────────

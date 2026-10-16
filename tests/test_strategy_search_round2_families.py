@@ -19,6 +19,11 @@ Pinned by these tests, per family:
 * **future-blindness at every dense cut** for all four families.
 
 No P&L, no screen: this file builds arrays only.
+
+S5 (``ROUND2_VACUITY_AUDIT_FINDINGS.md``): the fifteen bare
+``pytest.raises(SpecError)`` refusals now carry ``match=`` for the parameter or
+signal axis each one is about — the audit's finding was that *any* ``SpecError``
+satisfied them all.
 """
 
 from __future__ import annotations
@@ -170,24 +175,32 @@ def test_all_thirty_six_cells_build_and_resolve():
     assert len(seen) == 36, "every cell resolves to its own config name"
 
 
-@pytest.mark.parametrize("family,bad", [
-    ("E1", dict(params_over={"allow_short": False})),
-    ("E2", dict(params_over={"allow_short": False})),
-    ("G", dict(params_over={"allow_short": False})),
-    ("H", dict(params_over={"allow_short": False})),
-    ("E1", dict(params_over={"entry_start_min": 10 * 60})),
-    ("G", dict(params_over={"entry_end_min": 15 * 60})),
-    ("H", dict(params_over={"eod_flat_min": 15 * 60 + 25})),
-    ("E1", dict(params_over={"max_positions": 2})),
-    ("G", dict(params_over={"notional_usd": 50_000.0})),
-    ("H", dict(params_over={"max_entries_per_session": 2})),
+@pytest.mark.parametrize("family,bad,expected", [
+    ("E1", dict(params_over={"allow_short": False}), r"allow_short"),
+    ("E2", dict(params_over={"allow_short": False}), r"allow_short"),
+    ("G", dict(params_over={"allow_short": False}), r"allow_short"),
+    ("H", dict(params_over={"allow_short": False}), r"allow_short"),
+    # the window is refused with the window it was handed, by value
+    ("E1", dict(params_over={"entry_start_min": 10 * 60}), r"entry window \(600,"),
+    ("G", dict(params_over={"entry_end_min": 15 * 60}), r"entry window \(\d+, 900\)"),
+    ("H", dict(params_over={"eod_flat_min": 15 * 60 + 25}), r"eod_flat_min=925"),
+    ("E1", dict(params_over={"max_positions": 2}), r"max_positions=2"),
+    ("G", dict(params_over={"notional_usd": 50_000.0}), r"notional_usd=50000"),
+    ("H", dict(params_over={"max_entries_per_session": 2}), r"max_entries_per_session=2"),
 ])
-def test_a_cell_off_the_pinned_literals_is_refused(family, bad):
+def test_a_cell_off_the_pinned_literals_is_refused(family, bad, expected):
+    """S5: a bare ``pytest.raises(SpecError)`` is not a contract.
+
+    Ten cases for ten different pinned literals all passed as long as *something*
+    raised ``SpecError`` — a refusal naming the wrong field, or a refusal of an
+    unrelated key, would have satisfied every one of them.  Each case now names
+    the parameter it is about, so the test says which literal is being held.
+    """
     frames = _blind_frames()
     m, aligned = market_of(frames)
     spec = cell(family, 0)
     spec["params"].update(bad["params_over"])
-    with pytest.raises(families.SpecError):
+    with pytest.raises(families.SpecError, match=expected):
         families.build(family, spec, m, aligned)
 
 
@@ -200,20 +213,28 @@ def test_a_cell_outside_the_pinned_universe_is_refused():
         families.build("E1", spec, m, aligned)
 
 
-@pytest.mark.parametrize("family,signal", [
-    ("E1", {"gap_threshold": 0.75}),
-    ("E2", {"gap_threshold": 2.0}),
-    ("G", {"breach_atr": 0.75}),
-    ("H", {"dev_threshold": 0.25, "rvol_min": 0.0005}),
-    ("H", {"dev_threshold": 1.0, "rvol_min": 0.0020}),
+@pytest.mark.parametrize("family,signal,expected", [
+    ("E1", {"gap_threshold": 0.75}, r"gap_threshold"),
+    ("E2", {"gap_threshold": 2.0}, r"gap_threshold"),
+    ("G", {"breach_atr": 0.75}, r"breach_atr"),
+    # only the offending key of each pair is named: ``dev_threshold`` on the first
+    # (its 0.25 level is off the grid), ``rvol_min`` on the second (1.0 is a
+    # declared level and 0.0020 is not)
+    ("H", {"dev_threshold": 0.25, "rvol_min": 0.0005}, r"dev_threshold"),
+    ("H", {"dev_threshold": 1.0, "rvol_min": 0.0020}, r"rvol_min"),
 ])
-def test_a_signal_level_off_the_declared_grid_is_refused(family, signal):
-    """A 37th hypothesis must not be reachable by editing a cell."""
+def test_a_signal_level_off_the_declared_grid_is_refused(family, signal, expected):
+    """S5: a 37th hypothesis must not be reachable by editing a cell.
+
+    Narrowed from a bare ``pytest.raises(SpecError)``: five different off-grid
+    signals all passed as long as something raised, so a refusal about an unrelated
+    key satisfied them all.  The failure must now name the axis it refuses.
+    """
     frames = _blind_frames()
     m, aligned = market_of(frames)
     spec = cell(family, 0)
     spec["signal"] = dict(signal)
-    with pytest.raises(families.SpecError):
+    with pytest.raises(families.SpecError, match=expected):
         families.build(family, spec, m, aligned)
 
 

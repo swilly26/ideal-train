@@ -1,0 +1,162 @@
+ROUND-2 TEST-SUITE VACUITY AUDIT — FIX PASS, MUTATION EVIDENCE
+=============================================================
+Tree        : /home/team/shared/wt-r2, branch feature/strategy-search
+Base commit : 45fd1de (the tip this pass started from; the fix pass itself is the
+              commit that adds this file)
+Source      : ROUND2_VACUITY_AUDIT_FINDINGS.md (verifier, read-only audit of the
+              round-2 tests + the round-2 functions of screen.py /
+              run_strategy_search.py).  Items M1-M5 and S1-S5.
+
+WHY THIS FILE IS THE HONEST EVIDENCE
+------------------------------------
+These are TEST defects, not code defects: the production code these assertions
+read is correct today, so every fixed assertion PASSES the moment it is written.
+Failing-first does not apply, and a green run proves nothing about the fix.  What
+does is the opposite: break the thing the assertion is supposed to notice, and
+watch the assertion fail.
+
+Method: one mutant at a time, applied in place to the worktree, the *specific*
+test(s) run, the failure captured verbatim below, then `git checkout -- <file>`
+so **no mutation is committed**.  Every mutant ran in a single pytest process
+with `-q --no-header -p no:cacheprovider`; the raw logs are the /tmp/r2_mut_*.txt
+files named per mutant.  After every revert the tree was re-checked
+(`git status --short` shows only the four test files this pass edits; neither
+`scripts/run_strategy_search.py` nor
+`src/backtesting/strategy_search/screen.py` appears, i.e. no production file and
+no mutation survived).
+
+MUTATIONS — WHAT WAS BROKEN, WHICH TEST BIT
+-------------------------------------------
+M1  ROUND2_SCREEN_FAMILIES aliased to ("A",) — the round-2 routing table emptied
+    of round-2 families
+    test: screen_path.py::test_the_stage1_kill_is_round_one_only_and_round_two_kills_on_either
+    FAILS (test bites).  rc=1, "1 failed in 0.11s"
+        >       assert tuple(runner_mod.ROUND2_SCREEN_FAMILIES) == ("E1", "E2", "G", "H"), \
+        E       AssertionError: the round-2 routing table is exactly the four
+        E       declared groups: a family missing from it is screened under round
+        E       1's screen_family rule, and its numbers are not the grid the
+        E       pre-registration declares
+        E       assert ('A',) == ('E1', 'E2', 'G', 'H')
+        E         At index 0 diff: 'A' != 'E1'
+
+M1b CONTRAST (what the fix bought): the alias *gains* a family —
+    `ROUND2_FAMILIES + ("A",)`.  The pre-fix assertion is a subset check, so a
+    superset satisfies it, and that is the dangerous direction: A would then be
+    routed to the round-2 path.
+    (a) the pinned literal: FAILS (test bites, rc=1)
+            +     'A',
+        (b) the SAME superset alias with the **pre-fix** assertion text restored
+            in the test:
+            PASSES (VACUOUS) — "1 passed in 0.11s".
+    So the literal pin, not the subset check, is what makes this drift loud.
+
+M2  main()'s round-2 branch wired to screen.screen_family — exactly the L1 /
+    audit-item-1 regression the branch exists to prevent
+    test: screen_path.py::test_main_sends_a_round2_family_down_the_round2_branch
+    FAILS (test bites).  rc=1, "1 failed in 0.12s"
+        E       AssertionError: screen_family is ROUND 1's rule (L1): --screen on
+        E       a round-2 family must go down main()'s round-2 branch into
+        E       screen_round2, and its either-sizing / W1-only / zero-cost-breadth
+        E       rules must never touch a round-2 grid
+        FAILED tests/test_strategy_search_round2_screen_path.py::test_main_sends_a_round2_family_down_the_round2_branch
+
+M3  run_key() gains a field: `f"{family}|{cell}|{window}|{cost}|{sizing}|v2"` —
+    the recorded-key builder drifts away from the declared key format
+    test: screen_path.py::test_the_round2_screen_path_is_the_both_windows_grid_not_screen_family
+    FAILS (test bites).  rc=1, "1 failed in 0.64s"
+        >       assert declared_keys == {
+        E       AssertionError: the declared run-key format is pinned by value,
+        E       not read back off the stub
+        E       assert {'E1|e1_cont_...onal|v2', ...} == {'E1|e1_cont_...otional', ...}
+        E         -     'H|h_vwap_d1_th5|W2|slip_x1_5|fixed_notional',
+        E         +     'H|h_vwap_d1_th5|W2|slip_x1_5|fixed_notional|v2',
+    Note the runner's own in-production run-set assertion does NOT fire here: it
+    compares the recorded keys with `declared_round2_run_set`, which is built with
+    the same mutated `run_key`, so both sides move together.  The by-value literal
+    is the only thing that can see this.
+
+M3b CONTRAST (what the fix bought): the SAME run_key drift with the **pre-fix**
+    assertion text restored in the test
+    (`set(recorded) == {run_key(...) for ... in calls}`):
+    PASSES (VACUOUS) — "1 passed in 0.11s".
+    A set built with the mutated builder is still one function of the stub's own
+    log; the independent expectation is what fails it.
+
+M4a ROUND2_GATE_BLOCK_KEYS["benchmark"] drops a required key ("paired_trips") —
+    an incomplete key list
+    tests: l19.py::test_a_block_that_is_none_or_absent_fails_and_names_its_required_keys
+           screen_path.py::test_assert_gate_blocks_present_names_every_missing_block
+    FAILS (both files).  rc=1, "2 failed, 2 passed in 0.13s"
+        E       AssertionError: 'benchmark' requires 23 keys, the gate doc
+        E       declares 24 (M4)
+        E       assert 23 == 24
+
+M4b ROUND2_GATE_BLOCK_KEYS["benchmark"] renames a gating-critical key
+    ("delta_lower_bound_p0.0694" -> "delta_lower_bound_p0.05") with the **key
+    count unchanged** — so only the literals can see it
+    tests: the same two
+    FAILS (both files).  rc=1, "2 failed, 2 passed in 0.12s"
+        E       AssertionError: 'benchmark' no longer requires
+        E       'delta_lower_bound_p0.0694': a gate decision is read off that key,
+        E       so dropping it removes a gate step rather than a report row (M4)
+        E       assert 'delta_lower_bound_p0.0694' in ('variant', 'source', ...)
+
+M5  Runner.run carries the slip_x1_5 label while running the **baseline** model
+    underneath (the two-way baseline/zero_cost conditional audit item 4 removed)
+    test: fourfixes.py::test_the_x1_5_gating_level_is_produced_by_the_real_runner_path
+    FAILS (test bites).  rc=1, "1 failed in 0.18s"
+        >       assert x15["cost_model"] == cost_levels.cost_model("slip_x1_5").as_dict()
+        E       Differing items:
+        E       {'slippage_pct': 0.0002} != {'slippage_pct': 0.00030000000000000003}
+        E       {'label': 'baseline'} != {'label': 'slip_x1_5'}
+        E       {'slippage_abs': 0.01} != {'slippage_abs': 0.015}
+    The by-value pins (0.0003 / 0.015 / label) are what stop a `cost_model()` that
+    quietly returned the baseline model from moving both sides together.
+
+S2's POSITIVE CONTROL, MUTATION-CHECKED
+---------------------------------------
+S2 added an in-tree positive control for the duplicate-definition scan.  A
+positive control is worth only what it catches, so the scan itself was mutated:
+
+S2a the scan reports only names bound **three** times
+    (`if len(v) > 1` -> `if len(v) > 2`), i.e. it silently stops reporting the
+    two-binding case the whole L19.2 sweep exists for
+    test: l19.py::test_the_duplicate_scan_reports_a_duplicate_and_ignores_an_import
+    FAILS (test bites).  rc=1, "1 failed in 0.13s" (expected {'same','other'},
+    got the empty set)
+
+S2b the scan counts imports as bindings (cries wolf on `import os` + `def os`)
+    FAILS (test bites).  rc=1, "1 failed in 0.14s"
+        +     'os',
+              'other',
+              'same',
+
+S1, S4, S5 — WHAT IS AND IS NOT PROVEN HERE
+-------------------------------------------
+These three are *tightenings of assertions that pass today*, not new producers,
+so the mutation method above does not apply to them in the same way and this file
+does not claim it does:
+
+* **S4** (`tuple(decl["families"]) == ("E1","E2","G","H")`) replaces a constant
+  compared with itself.  Its failure mode is a fifth group appearing in the
+  search package — a protocol event that must be loud, not something to mutate
+  quietly here.
+* **S1** replaces `assert "a" in msg` (unfailable: "a" occurs in "absent",
+  "carry" and "a gate" whatever the record is) with the fixture's own exact
+  identity string, and **S5** replaces `match="base"` / bare
+  `pytest.raises(SpecError)` with the offending level or axis by name.  They are
+  narrowings of an assertion, evidenced by inspection of the message the code
+  emits (`breadth_at_base`: "… its cost level is 'zero_cost', expected
+  'baseline'") rather than by a mutant, and this file says so rather than
+  implying otherwise.
+
+STATUS OF THE CODE AFTER THE BATTERY
+------------------------------------
+No mutation was committed and no production file was touched by this pass.
+`git status --short` after every battery shows exactly the four test files this
+pass edits — see the per-run "STATUS AFTER EVERY REVERT" section in the raw logs.
+Mutation checks are re-runnable: /tmp/r2_vacuity_mutations.py (M1-M5),
+/tmp/r2_vacuity_mutations_b.py (M1b/M3b contrast probes) and
+/tmp/r2_vacuity_s2_mutations.py (S2a/S2b) each patch, run, revert and assert the
+revert.  They live outside the repo deliberately: a battery that can be committed
+is a battery that can be run against the wrong tree by accident.
