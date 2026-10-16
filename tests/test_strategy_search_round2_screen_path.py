@@ -15,7 +15,8 @@ What is pinned here, and why it is not cosmetic:
   function is not the grid the protocol declares, so its numbers cannot be
   reported.  The test at the top of this file runs the round-2 entry point over
   the real declared family grids with a stubbed replay and asserts what was
-  called: every declared cell, both windows, base cost, ``fixed_notional`` only
+  called: every declared cell, both windows, **both gating cost levels**
+  (``baseline`` complete before ``slip_x1_5``, L19.4), ``fixed_notional`` only
   — and that ``screen_family`` was never entered.
 * **Either window kills.**  Round 2 is not stage 1: a cell dies when it fails
   ``W1`` **or** ``W2`` (R3-3(iii)/(iv)); a cell with no record on a window is a
@@ -64,15 +65,28 @@ def rec(cell: str, window: str, cost: str = "baseline",
     return out
 
 
+def populated() -> dict:
+    """Every declared gate block, populated from its own required keys (L19.3).
+
+    The values are placeholders on purpose: ``assert_gate_blocks_present`` asks
+    whether there is a block to check, never what it says — a block's contents
+    are the gate build's contract (L19.6-L19.13).
+    """
+    return {gate: {key: f"<{key}>" for key in keys}
+            for gate, keys in screen.ROUND2_GATE_BLOCK_KEYS.items()}
+
+
 # ── item 1: the wired path is the declared one ─────────────────────────
 def test_the_round2_screen_path_is_the_both_windows_grid_not_screen_family(
         tmp_path, monkeypatch):
     """``--screen`` on a round-2 family runs ``screen_grid_both_windows``.
 
     The replay is stubbed, so this asserts the *declaration* the runner
-    executes: 36 cells x 2 windows = 72 runs, all at base cost and
-    ``fixed_notional`` — and not one of them through ``screen_family``, whose
-    either-sizing admission would make N = 72.
+    executes: the declared grid — 36 cells x 2 windows — at ``baseline`` and
+    then the **same grid** at ``slip_x1_5`` (L19.4: the runner loops
+    ``for cost in ROUND2_GATE_COSTS``), 144 runs in all, every one of them
+    ``fixed_notional`` (L1) — and not one of them through ``screen_family``,
+    whose either-sizing admission would make N = 72.
     """
     def forbidden(*_a, **_k):
         raise AssertionError(
@@ -98,20 +112,49 @@ def test_the_round2_screen_path_is_the_both_windows_grid_not_screen_family(
         runner, list(families.ROUND2_FAMILIES), out_dir=tmp_path / "out",
         log=lambda *_: None)
 
-    declared = [(f, s["name"], w)
-                for f in families.ROUND2_FAMILIES for s in families.GRIDS[f]
+    costs = tuple(runner_mod.ROUND2_GATE_COSTS)
+    assert costs == ("baseline", "slip_x1_5"), \
+        "the two declared gating cost levels, in the declared order"
+    # L19.4: the declared order is family → cost level → cell → window, i.e. one
+    # *complete* grid per gating level (`for cost in ROUND2_GATE_COSTS`).
+    declared = [(f, s["name"], w, cost)
+                for f in families.ROUND2_FAMILIES
+                for cost in costs
+                for s in families.GRIDS[f]
                 for w in screen.ROUND2_WINDOWS]
-    assert len(declared) == 2 * screen.ROUND2_N_CONFIGS == 72
-    assert [(f, c, w) for f, c, w, _cost, _sz in calls] == declared, \
-        "every declared cell must be run on both windows, in the declared order"
-    assert {cost for *_x, cost, _sz in calls} == {screen.ROUND2_BASE_COST}, \
-        "the declared 72 base records are at base cost"
-    assert {sz for *_x, sz in calls} == {screen.ROUND2_SIZING}, \
-        "fixed_notional is the sole gating sizing (L1)"
+    assert len(declared) == 2 * 2 * screen.ROUND2_N_CONFIGS == 144
+    assert [(f, c, w, cost) for f, c, w, cost, _sz in calls] == declared, \
+        "the full declared grid must run at every declared gating level, " \
+        "in the declared order (baseline complete before ×1.5)"
+    assert len({(c, w, cost) for _f, c, w, cost, _s in calls}) == len(calls), \
+        "every (cell, window, cost) combination runs exactly once"
+    # no early kill: the ×1.5 half is reached even though every stubbed record
+    # lost money.  Per family, all of the base-level runs precede the ×1.5 runs.
+    for fam in families.ROUND2_FAMILIES:
+        per_level = len(families.GRIDS[fam]) * len(screen.ROUND2_WINDOWS)
+        assert [cost for f, _c, _w, cost, _s in calls if f == fam] == \
+            [costs[0]] * per_level + [costs[1]] * per_level, \
+            f"family {fam}: the baseline grid must be complete before the " \
+            f"×1.5 grid starts (L19.4)"
+    assert {sz for *_x, sz in calls} == {screen.ROUND2_SIZING} \
+        == {"fixed_notional"}, "fixed_notional is the sole gating sizing (L1)"
+    assert set(runner.recorded) == {runner_mod.run_key(f, c, w, cost, sz)
+                                    for f, c, w, cost, sz in calls}, \
+        "the run set the runner kept is exactly the declared one"
     assert {p["status"] for p in payloads} == {"COLLECTED_NOT_JUDGED"}, \
         "the round-2 path collects the declared records; the gates are the " \
         "next delegation's job, so it must not write a verdict"
     assert all("verdict" not in p for p in payloads)
+    for payload in payloads:
+        assert payload["gating_costs"] == list(costs)
+        assert payload["cost"] == screen.ROUND2_BASE_COST
+        n = (len(families.GRIDS[payload["family"]])
+             * len(screen.ROUND2_WINDOWS) * len(costs))
+        assert len(payload["runs"]) == n, \
+            "the payload carries the 144-record grid, cost level in the key"
+        assert {k.split("|")[-1] for k in payload["runs"]} == set(costs)
+        assert {k.split("|")[-2] for k in payload["runs"]} \
+            == set(screen.ROUND2_WINDOWS)
 
 
 def test_the_declared_round2_grid_is_36_cells_with_z_bar_3_196():
@@ -149,10 +192,29 @@ def test_the_second_sizing_mode_can_be_recorded_but_can_never_admit_a_cell():
 
 
 def test_the_declared_round2_run_set_never_declares_the_reporting_sizing():
+    """L19.4: the declared set is cells × 2 windows × 2 gating levels.
+
+    Three cells declare **12** keys, not 6: the ×1.5 level is a declared gate
+    (spec step 4 — ``net_bps_per_trip > 0`` at ``slip_x1_5`` on both windows),
+    so the round-2 path runs it as part of the declared set.  ``equity_fraction``
+    is the *reported* sizing (R3-3(ii)): it may be run and recorded, but it is
+    never part of the declared gating set, so no admission test can read it.
+    """
     expected = runner_mod.declared_round2_run_set("H", grid("a", "b", "c"))
-    assert len(expected) == 6
+    assert expected == {
+        f"H|{c}|{w}|{cost}|fixed_notional"
+        for c in ("a", "b", "c")
+        for w in screen.ROUND2_WINDOWS
+        for cost in ("baseline", "slip_x1_5")}
+    assert len(expected) == 3 * 2 * 2 == 12
     assert {k.split("|")[-1] for k in expected} == {"fixed_notional"}
-    assert {k.split("|")[-2] for k in expected} == {"baseline"}
+    assert {k.split("|")[-2] for k in expected} == {"baseline", "slip_x1_5"}
+    # the reporting sizing is not "absent because nothing declares it": it has a
+    # declared home of its own, and it is disjoint from the gating set.
+    report = runner_mod.declared_round2_report_set("H", grid("a"),
+                                                   ("equity_fraction",))
+    assert report and all(k.endswith("|equity_fraction") for k in report)
+    assert not (report & expected)
 
 
 # ── item 2: a cell dies on EITHER window ───────────────────────────────
@@ -247,20 +309,44 @@ def test_the_round2_breadth_cost_is_the_declared_base_level():
 
 # ── item 5 (L16): two assertions, two names ───────────────────────────
 def test_assert_gate_blocks_present_names_every_missing_block():
-    """The gate-block assertion fails closed and names what is missing."""
-    empty = rec("a", "W1")
+    """The gate-block assertion fails closed and names what is missing.
+
+    L19.3: **absent**, ``None`` and ``{}`` all fail.  An empty mapping used to
+    count as present, which made ``{"benchmark": {}, "fat_tail": {},
+    "concentration": {}}`` satisfy the one check the acceptance criteria cite as
+    proof that the gates were written.  The failure must name the offending
+    block *and* the keys that block must carry.
+    """
+    required = screen.ROUND2_GATE_BLOCK_KEYS
+
+    absent = rec("a", "W1")
     with pytest.raises(screen.GateBlocksMissing) as exc:
-        screen.assert_gate_blocks_present(empty)
+        screen.assert_gate_blocks_present(absent)
     msg = str(exc.value)
     for block in screen.ROUND2_GATE_BLOCKS:
         assert block in msg, f"the failure must name the missing block {block!r}"
+        for key in required[block]:
+            assert key in msg, (f"the failure must say which keys the {block!r} "
+                                f"block requires — {key!r} is missing")
     assert "a" in msg and "W1" in msg, "the failure must name the record"
 
-    full = rec("a", "W1", benchmark={}, fat_tail={}, concentration={})
-    screen.assert_gate_blocks_present(full)          # no raise
-    with pytest.raises(screen.GateBlocksMissing, match="fat_tail"):
-        screen.assert_gate_blocks_present(rec("a", "W1", benchmark={},
-                                              concentration={}))
+    # ``None`` and ``{}`` fail exactly as absence does (L19.3) ...
+    for value in (None, {}):
+        broken = rec("a", "W1",
+                     **{g: value for g in screen.ROUND2_GATE_BLOCKS})
+        with pytest.raises(screen.GateBlocksMissing, match="absent|empty"):
+            screen.assert_gate_blocks_present(broken)
+
+    # ... and so does a single block that is missing from an otherwise
+    # populated record, naming *that* block.
+    for missing in screen.ROUND2_GATE_BLOCKS:
+        partial = populated()
+        del partial[missing]
+        with pytest.raises(screen.GateBlocksMissing, match=missing):
+            screen.assert_gate_blocks_present(rec("a", "W1", **partial))
+
+    # the positive case: a fully populated record passes, whatever it says.
+    screen.assert_gate_blocks_present(rec("a", "W1", **populated()))
 
 
 def test_the_run_set_assertion_and_the_gate_block_assertion_are_different_checks(
@@ -269,7 +355,9 @@ def test_the_run_set_assertion_and_the_gate_block_assertion_are_different_checks
 
     A record with the right key and no gate block at all passes the run-set
     assertion — the split is the point: the run-set assertion cannot be cited
-    as evidence that the gates were written.
+    as evidence that the gates were written.  L19.3 sharpens the *other* half:
+    what the gate-block assertion requires is a **populated** block, while the
+    run-set assertion keeps looking only at keys.
     """
     runner = runner_mod.Runner(cache_dir=Path("/nonexistent-cache"),
                                out_dir=tmp_path / "out", verbose=False)
@@ -283,10 +371,34 @@ def test_the_run_set_assertion_and_the_gate_block_assertion_are_different_checks
         with pytest.raises(screen.GateBlocksMissing):
             screen.assert_gate_blocks_present(runner.recorded[key])
     for key in expected:
-        runner.recorded[key].update({"benchmark": {}, "fat_tail": {},
-                                     "concentration": {}})
+        runner.recorded[key].update(populated())
         screen.assert_gate_blocks_present(runner.recorded[key])
     runner.assert_screen_recorded("X", specs, {}, "split")   # still only keys
+    # an *empty* block is now a failure too, and says so in L19.3's words
+    for key in expected:
+        runner.recorded[key]["fat_tail"] = {}
+        with pytest.raises(screen.GateBlocksMissing, match="present but empty"):
+            screen.assert_gate_blocks_present(runner.recorded[key])
+        runner.recorded[key]["fat_tail"] = populated()["fat_tail"]
+
+    # the run-set assertion is a *key* assertion: it still fails on a key
+    # mismatch, and it does not care that every block in the record is populated
+    r2 = runner_mod.Runner(cache_dir=Path("/nonexistent-cache"),
+                           out_dir=tmp_path / "out", verbose=False)
+    r2.recorded = {}
+    for key in runner_mod.declared_round2_run_set("X", specs):
+        cell, window, cost, sizing = key.split("|")[1:]
+        r2.recorded[key] = rec(cell, window, cost, sizing, **populated())
+    r2.assert_round2_grid_recorded("X", specs, "split")      # keys match
+    for key in r2.recorded:
+        screen.assert_gate_blocks_present(r2.recorded[key])  # blocks populated
+    r2.recorded["X|a|W1|zero_cost|fixed_notional"] = rec("a", "W1", "zero_cost")
+    with pytest.raises(RuntimeError, match="unexpected"):
+        r2.assert_round2_grid_recorded("X", specs, "split")
+    del r2.recorded["X|a|W1|zero_cost|fixed_notional"]
+    del r2.recorded["X|a|W2|slip_x1_5|fixed_notional"]
+    with pytest.raises(RuntimeError, match="missing"):
+        r2.assert_round2_grid_recorded("X", specs, "split")
 
 
 def test_the_declared_gate_blocks_are_the_three_gate_docs_blocks():
