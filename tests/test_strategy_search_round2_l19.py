@@ -263,7 +263,9 @@ def test_the_round2_screen_path_emits_both_gating_levels(tmp_path):
                 for f in families.ROUND2_FAMILIES for s in families.GRIDS[f]
                 for w in screen.ROUND2_WINDOWS for c in runner_mod.ROUND2_GATE_COSTS]
     assert len(declared) == 144
-    assert [(f, c, w, cost) for f, c, w, cost, _sz in calls] == declared, \
+    #: The *set* is declared; the order of the two gating levels is not, so the
+    #: comparison is on the sorted list — exact in content, order-insensitive.
+    assert sorted((f, c, w, cost) for f, c, w, cost, _sz in calls) == sorted(declared), \
         "every declared cell must run on both windows at both gating levels"
     assert {cost for *_x, cost, _sz in calls} == set(runner_mod.ROUND2_GATE_COSTS)
     assert {sz for *_x, sz in calls} == {screen.ROUND2_SIZING}

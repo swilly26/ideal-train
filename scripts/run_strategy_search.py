@@ -198,17 +198,26 @@ def declared_screen_run_set(family: str, specs: Sequence[dict],
 
 def declared_round2_run_set(family: str, specs: Sequence[dict],
                             sizing: str = screen.ROUND2_SIZING,
-                            cost: str = screen.ROUND2_BASE_COST) -> set[str]:
-    """R3-3(iii): **every** declared cell, on **both** windows (audit §B4).
+                            costs: Sequence[str] = ROUND2_GATE_COSTS) -> set[str]:
+    """R3-3(iii) + L19.4: **every** declared cell, both windows, **both gating levels**.
 
     The stage-1 set (:func:`declared_screen_run_set`) is conditional past W1 — a
     cell that loses W1 licenses no W2 record — which is the round-1 kill rule.
-    Round 2 is unconditional: two run keys per declared cell, so a 36-cell grid
-    declares 36 x 2 = **72** base records and a run that produced 71 is a hard
-    failure rather than a slightly smaller grid whose report still says N = 36.
+    Round 2 is unconditional, and (L19.4) it is declared over **both** gating cost
+    levels, not the base level alone: 36 cells x 2 windows x 2 gating levels =
+    **144** records, so a run that produced 143 is a hard failure rather than a
+    slightly smaller grid whose report still says N = 36.
+
+    The ×1.5 level is a declared gate (spec step 4: ``net_bps_per_trip > 0`` at
+    ``slip_x1_5`` on both windows), so it is part of the declared set.  Declaring
+    only the base level made the ×1.5 records look *unexpected* to
+    :func:`assert_exact_run_set` — a declared gating level that cannot be run as
+    a set is not declared, and producing it one config at a time by hand is not a
+    screen.  The equality is **exact in both directions**: a missing key and an
+    extra key are both failures (never weakened to "at least these").
     """
     return {run_key(family, s["name"], window, cost, sizing)
-            for s in specs for window in WINDOWS}
+            for s in specs for window in WINDOWS for cost in costs}
 
 
 def declared_round2_report_set(family: str, specs: Sequence[dict],
@@ -478,7 +487,8 @@ class Runner:
     def assert_round2_grid_recorded(self, family: str, specs: Sequence[dict],
                                     where: str,
                                     report_sizings: Sequence[str] = ()) -> None:
-        """The recorded round-2 set must be every cell × both windows (R3-3(iii)).
+        """The recorded round-2 set must be every cell × both windows × both gating
+        levels (R3-3(iii), L19.4) — exactly, in both directions.
 
         Called before any round-2 number is read.  A missing key is a **hard
         failure**, so a cell that could not be resolved or run cannot survive as
@@ -506,8 +516,10 @@ def screen_round2(runner: Runner, fams: Sequence[str], out_dir: Path | str,
     stage 1 in the three ways the audit found:
 
     * the record set is ``declared_round2_run_set`` — every declared cell on
-      **both** windows at base cost, ``fixed_notional`` the **sole** gating
-      sizing, so the grid's N is the declared 36 and not 72;
+      **both** windows at **both** gating cost levels (``baseline`` and
+      ``slip_x1_5``, L19.4), ``fixed_notional`` the **sole** gating sizing, so the
+      grid's N is the declared 36 and not 72, and the declared record set is
+      36 x 2 x 2 = 144;
     * there is **no early kill** — a cell that loses W1 is still run on W2, and
       it dies only if it fails either window (:func:`screen.round2_cell_fates`);
     * fold breadth is read at **base** cost (:func:`screen.round2_fold_breadth`,
@@ -524,21 +536,32 @@ def screen_round2(runner: Runner, fams: Sequence[str], out_dir: Path | str,
     """
     decl = screen.assert_round2_declaration()
     log(f"=== round 2: {decl['n_configs']} declared cells "
-        f"({', '.join(decl['families'])}), z_bar={decl['z_bar']}, "
-        f"cost={screen.ROUND2_BASE_COST}, gating sizing={screen.ROUND2_SIZING} ===")
+        f"({', '.join(decl['families'])}), z_bar={decl['z_bar']}, gating costs="
+        f"{tuple(ROUND2_GATE_COSTS)}, gating sizing={screen.ROUND2_SIZING} ===")
     out_dir = None if out_dir is None else Path(out_dir)
     payloads: list[dict] = []
     for fam in fams:
         specs = families.GRIDS[fam]
         log(f"=== family {fam}: {len(specs)} cells x "
-            f"{len(screen.ROUND2_WINDOWS)} windows (no early kill) ===")
-        collected = screen.screen_grid_both_windows(
-            fam, specs,
-            lambda spec, window, cost, sizing, fam=fam:
-                runner.run(fam, spec, window, cost, sizing),
-            log=log)
+            f"{len(screen.ROUND2_WINDOWS)} windows x {len(ROUND2_GATE_COSTS)} "
+            f"gating levels (no early kill) ===")
+        #: L19.4: **both** gating levels are run, in one pass over the declared
+        #: grid, so the ×1.5 records are produced by the screen path itself and
+        #: the run-set assertion covers them.  A cell that fails at either level
+        #: aborts the family (whole-grid-or-nothing, unchanged).
+        by_cost: dict[str, dict] = {}
+        for cost in ROUND2_GATE_COSTS:
+            by_cost[cost] = screen.screen_grid_both_windows(
+                fam, specs,
+                lambda spec, window, cost, sizing, fam=fam:
+                    runner.run(fam, spec, window, cost, sizing),
+                cost=cost, log=log)
         runner.assert_round2_grid_recorded(fam, specs,
                                            f"family {fam} round-2 screen")
+        #: The two rules that need no gate block are read at **base** cost
+        #: (L6 / spec step 5): the ×1.5 records are gating records for the
+        #: headline and the benchmark, not inputs to these two.
+        collected = by_cost[screen.ROUND2_BASE_COST]
         fates = screen.round2_cell_fates(collected["runs"])
         breadth = screen.round2_fold_breadth(collected["runs"])
         log(f"=== family {fam}: {len(fates['dead'])} dead, "
@@ -555,8 +578,9 @@ def screen_round2(runner: Runner, fams: Sequence[str], out_dir: Path | str,
                            "here; these are the declared records plus the two "
                            "rules that need no gate block"),
             "windows": collected["windows"],
-            "cost": collected["cost"],
-            "cost_label_canonical": collected["cost"],
+            "cost": screen.ROUND2_BASE_COST,
+            "cost_label_canonical": screen.ROUND2_BASE_COST,
+            "gating_costs": list(ROUND2_GATE_COSTS),
             "gating_sizing": collected["sizing"],
             "n_configs": len(collected["cells"]),
             "z_bar": screen.ROUND2_Z_BAR,
@@ -564,8 +588,12 @@ def screen_round2(runner: Runner, fams: Sequence[str], out_dir: Path | str,
             "cells": collected["cells"],
             "both_windows_kill": fates,
             "fold_breadth_at_base": breadth,
-            "runs": {f"{c}|{w}": _trim(r)
-                     for (c, w), r in collected["runs"].items()},
+            #: L19.4: keyed ``cell|window|cost`` — the record set is the 144
+            #: declared records, and the cost level is part of the key because
+            #: two records now share a (cell, window).
+            "runs": {f"{c}|{w}|{cost}": _trim(r)
+                     for cost, coll in by_cost.items()
+                     for (c, w), r in coll["runs"].items()},
         }
         if out_dir is not None:
             (out_dir / f"round2_screen_{fam}.json").write_text(
@@ -659,9 +687,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 def _trim(rec: dict) -> dict:
-    """Keep the screen's verdicts and headline numbers in the family JSON."""
+    """Keep the screen's verdicts and headline numbers in the family JSON.
+
+    ``cost_label``, ``folds`` and ``per_symbol`` are kept because the **judge
+    reads them from the persisted artefact** (L19.5): step 5 (fold breadth at base
+    cost) needs ``folds`` and the record's own cost level, step 6 (benchmark) and
+    step 8 (concentration) need the per-symbol rows.  A judge built against a
+    payload without them would silently mis-score — the same "the numbers on disk
+    cannot support the claim" class as the stage-2 re-derivation gap.
+    """
     keep = ("family", "config", "cell_id", "config_name_resolved", "window",
             "sizing", "engine_sha", "resolved_hash", "resolved_params",
+            "cost_label", "folds", "per_symbol",
             "identity_key", "declaration",
             "trips", "net_pnl", "net_pct",
             "net_bps_per_trip", "net_bps_t_stat", "cost_drag_per_trip",

@@ -358,6 +358,46 @@ ROUND2_KILL_WINDOWS: tuple[str, ...] = ROUND2_WINDOWS
 #: delegation's work; this constant is the *contract* the judge asserts.
 ROUND2_GATE_BLOCKS: tuple[str, ...] = ("benchmark", "fat_tail", "concentration")
 
+#: L19.3: the keys each declared gate block must carry, so that the failure for a
+#: block that is absent or empty can **name what that block requires**.  The lists
+#: are the gate docs' own published block fields (R3-6.1 §4, R3-6.2 §5, R3-6.3 §5);
+#: the blocks' *values* are the gate build's contract (L19.6-L19.13), and this
+#: assertion never evaluates them.  One entry per declared block.
+ROUND2_GATE_BLOCK_KEYS: Mapping[str, tuple[str, ...]] = {
+    "benchmark": (
+        "variant", "source", "eod_flat_min", "entry_convention",
+        "exit_convention", "cost_label", "sizing", "notional_usd",
+        "config_trips", "benchmark_trips", "paired_trips", "benchmark_unpriced",
+        "config_net_bps_per_trip", "benchmark_net_bps_per_trip", "delta_bps",
+        "delta_lower_bound_p0.0694", "delta_resamples", "delta_seed",
+        "config_cost_drag_per_trip_bps", "benchmark_cost_drag_per_trip_bps",
+        "benchmark_fills_per_trip", "pass", "why", "per_symbol",
+    ),
+    "fat_tail": (
+        "version", "window", "config_name_resolved", "resolved_hash", "sizing",
+        "cost_label", "n_trips", "n_sessions", "n_months", "k_trips_removed",
+        "k_formula", "removed_fraction", "removal_cutoff_bps",
+        "total_net_pnl_usd", "net_bps_per_trip", "remainder_after_best_k_bps",
+        "remainder_after_best_10_bps", "best_k_trips_pnl_usd",
+        "worst_case_removed_month", "remainder_after_best_month_bps",
+        "best_month_by_total_pnl", "remainder_after_that_month_bps",
+        "worst_session_date", "worst_session_symbols",
+        "worst_session_net_pnl_usd", "best_session_share",
+        "best_single_trip_share", "notional_uniform", "total_matches_record",
+        "x1_5", "status", "pass", "why", "rules",
+    ),
+    "concentration": (
+        "version", "window", "config_name_resolved", "resolved_hash", "sizing",
+        "cost_label", "caps", "symbol_priority", "universe", "n_trips",
+        "total_net_pnl_usd", "symbol_unit", "symbol_unit_ok",
+        "shares_are_dollar_based", "decomposition_max_abs_residual",
+        "max_symbol", "max_symbol_share", "max_symbol_net_pnl_usd",
+        "n_symbols_traded", "traded_symbols", "min_traded_symbol",
+        "min_traded_symbol_trips", "per_symbol", "rules", "status", "pass",
+        "why",
+    ),
+}
+
 
 class GridCellFailure(RuntimeError):
     """A cell of the frozen grid could not be resolved or run (R3-3(iii)).
@@ -458,172 +498,6 @@ def screen_grid_both_windows(family: str, specs: Sequence[dict],
             "reported_failures": report_failures}
 
 
-class GateBlocksMissing(RuntimeError):
-    """A round-2 base record is missing one of the declared gate blocks (L16).
-
-    Deliberately **not** raised by :meth:`Runner.assert_screen_recorded`: that
-    name means run-set equality and nothing else (L16).  A record whose gate
-    block was never written cannot be scored, and citing the run-set assertion
-    as evidence that the gates were written is the mistake this split prevents.
-    """
-
-
-def assert_gate_blocks_present(record: Mapping,
-                               gates: Sequence[str] = ROUND2_GATE_BLOCKS) -> None:
-    """L16: the gate-block half of the split, by a name of its own.
-
-    A block that is present but empty counts as present — this asserts the gate
-    was *written*, not that it passed (evaluating it is the judge's job).  A
-    missing block is a hard failure naming the record and every missing block.
-    """
-    missing = [g for g in gates if record.get(g) is None]
-    if not missing:
-        return
-    key = record.get("identity_key")
-    if not key:
-        key = "|".join(str(record.get(k, "?")) for k in
-                       ("family", "cell_id", "window", "cost_label", "sizing"))
-    raise GateBlocksMissing(
-        f"{key}: the round-2 base record is missing the gate block(s) {missing} "
-        f"(L16, declared blocks {tuple(gates)}).  The run-set assertion "
-        f"(assert_screen_recorded) only compares keys; it says nothing about "
-        f"whether a gate was written.")
-
-
-def assert_round2_declaration(n_configs: int = ROUND2_N_CONFIGS) -> dict:
-    """The declared round-2 grid: N = 36 cells, z_bar = 3.196 (R3-1/R3-3).
-
-    Read off the tree's own ``families.GRIDS``, so a grid that has drifted from
-    the pre-registration fails *before* it is run rather than inside the report.
-    ``z_bar`` is a function of this N, which is why the two are checked
-    together.
-    """
-    from src.backtesting.strategy_search import families as _families
-    names: list[str] = []
-    per_family: dict[str, list[str]] = {}
-    for fam in _families.ROUND2_FAMILIES:
-        cells = [s["name"] for s in _families.GRIDS[fam]]
-        per_family[fam] = cells
-        names.extend(cells)
-    dupes = sorted({n for n in names if names.count(n) > 1})
-    if dupes:
-        raise ValueError(f"the declared round-2 grid has duplicate cell names "
-                         f"({dupes}) — two cells under one name is a silent drop")
-    if len(names) != n_configs:
-        raise ValueError(
-            f"the declared round-2 grid has {len(names)} cells but the "
-            f"pre-registration declares N = {n_configs} (R3-1/R3-3); z_bar "
-            f"{ROUND2_Z_BAR} is derived from N and would be wrong")
-    return {"families": list(_families.ROUND2_FAMILIES),
-            "cells": names, "per_family": per_family,
-            "n_configs": len(names), "z_bar": ROUND2_Z_BAR}
-
-
-def round2_cell_fates(runs: Mapping[tuple[str, str], Mapping],
-                      windows: Sequence[str] = ROUND2_KILL_WINDOWS,
-                      fails_on: Callable[[Mapping], tuple[bool, str]]
-                      = gate_power_and_net) -> dict:
-    """A round-2 cell is dead if it fails **either** window (R3-3(iii)/(iv)).
-
-    This is the minimal conjunctive rule that replaces stage 1's W1-only kill on
-    the round-2 path — the power floor and net-positive expectancy of
-    :func:`gate_power_and_net`, re-read per window.  The four gates of
-    ``ROUND2_GATE_ORDER_SPEC.md`` §1 and the ranking are the next delegation's
-    work; ``fails_on`` is a parameter so they can pass their own conjunct
-    without rewriting this rule.
-
-    A cell-window with no record is a **hard error** (:class:`GridCellFailure`),
-    never a cell scored as a loser: a cell that failed to run on either window
-    means the grid did not run.
-    """
-    cells: dict[str, dict[str, Mapping]] = {}
-    for (cell, window), record in runs.items():
-        cells.setdefault(cell, {})[window] = record
-    out: dict[str, dict] = {}
-    dead: list[str] = []
-    alive: list[str] = []
-    for cell in sorted(cells):
-        detail: dict[str, dict] = {}
-        why: list[str] = []
-        for window in windows:
-            record = cells[cell].get(window)
-            if record is None:
-                raise GridCellFailure(
-                    f"round-2 cell {cell!r} has no record on {window}: a cell "
-                    f"that fails to run on either window is a hard error, never "
-                    f"a silent drop (R3-3(iii))")
-            ok, reason = fails_on(record)
-            detail[window] = {"pass": bool(ok), "why": reason}
-            if not ok:
-                why.append(f"{window}: {reason}")
-        out[cell] = {"dead": bool(why), "windows": detail,
-                     "why": "; ".join(why) if why else "clears both windows"}
-        (dead if why else alive).append(cell)
-    return {"dead": dead, "alive": alive, "cells": out, "windows": list(windows),
-            "rule": ("a round-2 cell dies if it fails EITHER window "
-                     "(R3-3(iii)/(iv)); stage 1's W1-only kill is "
-                     f"{STAGE1_KILL_SCOPE} and is not applied here")}
-
-
-def breadth_at_base(record: Mapping, cost_label: Optional[str] = None
-                    ) -> tuple[bool, str]:
-    """L6: round-2 fold breadth, read off the **base-cost** record.
-
-    Stage 1's :func:`breadth` reads a zero-cost record.  The brief's kill
-    criteria are stated at base cost, so round 2 reads base — and the cost level
-    is *checked*, not assumed: handing this a record from another level is an
-    error, not a silent reading of the wrong column.
-    """
-    label = record.get("cost_label") if cost_label is None else cost_label
-    if label != ROUND2_BREADTH_COST:
-        raise ValueError(
-            f"round-2 fold breadth is a base-cost statistic (L6): the record's "
-            f"cost level is {label!r}, expected {ROUND2_BREADTH_COST!r} — "
-            f"reading the zero-cost column is round 1's rule (audit item 10)")
-    ok, why, _zero = fold_stability(record.get("folds") or [])
-    return (ok, f"base-cost {why}")
-
-
-def round2_fold_breadth(runs: Mapping[tuple[str, str], Mapping],
-                        windows: Sequence[str] = ROUND2_WINDOWS) -> dict:
-    """Per-cell fold breadth at base cost, conjunctive across windows (L6).
-
-    A cell passes only if **both** windows' base-cost records clear
-    :func:`fold_stability` (12 months, ≥ :data:`MIN_TRIPS_PER_MONTH` trips each,
-    ≥ :data:`MIN_POSITIVE_FOLDS` positive).  A missing window record is a hard
-    error, for the same reason as in :func:`round2_cell_fates`.
-    """
-    cells: dict[str, dict[str, Mapping]] = {}
-    for (cell, window), record in runs.items():
-        cells.setdefault(cell, {})[window] = record
-    out: dict[str, dict] = {}
-    passed: list[str] = []
-    for cell in sorted(cells):
-        detail: dict[str, dict] = {}
-        oks: list[bool] = []
-        for window in windows:
-            record = cells[cell].get(window)
-            if record is None:
-                raise GridCellFailure(
-                    f"round-2 cell {cell!r} has no record on {window}: fold "
-                    f"breadth is read at base cost (L6) and a missing window is "
-                    f"a hard error (R3-3(iii))")
-            ok, why = breadth_at_base(record)
-            detail[window] = {"pass": ok, "why": why}
-            oks.append(ok)
-        ok_all = all(oks)
-        out[cell] = {"pass": ok_all, "windows": detail,
-                     "why": ("base-cost breadth holds on both windows"
-                             if ok_all else
-                             "; ".join(f"{w}: {detail[w]['why']}"
-                                       for w in windows
-                                       if not detail[w]["pass"]))}
-        if ok_all:
-            passed.append(cell)
-    return {"pass": passed, "cells": out, "cost": ROUND2_BREADTH_COST,
-            "windows": list(windows)}
-
-
 def _best_w1(runs: Mapping[str, Mapping], window: str, cost: str) -> dict:
     """The family's best W1 config, by the screen's own ordering (bps, then net)."""
     cands = [r for k, r in runs.items() if k.startswith(f"{window}|{cost}|")]
@@ -675,29 +549,46 @@ class GateBlocksMissing(RuntimeError):
 
 def assert_gate_blocks_present(record: Mapping,
                                gates: Sequence[str] = ROUND2_GATE_BLOCKS) -> None:
-    """Every declared gate block is present in this record (L16).
+    """Every declared gate block is present **and carries content** (L16, L19.3).
 
     ``record`` is one round-2 base run record; ``gates`` is the set of block
     names the pre-registration requires (default :data:`ROUND2_GATE_BLOCKS`).
-    A block that is missing, or present as ``None``, fails; an **empty** dict
-    counts as present — this asserts the gate was *written*, not that it passed
-    (evaluating a gate is the judge's job).
+    A block fails when it is **missing**, ``None``, **or an empty mapping**: an
+    empty dict used to count as present, which made
+    ``{"benchmark": {}, "fat_tail": {}, "concentration": {}}`` satisfy the one
+    check the acceptance criteria cite as proof that the gates were written —
+    the L17 "presence is not content" failure class, one level down (L19.3).
+    The failure names the offending block and the keys that block must carry
+    (:data:`ROUND2_GATE_BLOCK_KEYS`).
+
+    It still does **not** evaluate a gate: a non-empty block passes whatever its
+    values say.  What a block's fields must *contain* is the gate build's
+    contract (L19.6-L19.13); this asserts only that there is a block to check.
 
     The counterpart of :meth:`run_strategy_search.Runner.assert_screen_recorded`,
     which asserts run-set equality and nothing else.  A record whose gate block
     was never written cannot be scored, and a run-set assertion must not be
     quoted as evidence that it was.
     """
-    missing = [g for g in gates if record.get(g) is None]
-    if not missing:
+    problems: list[str] = []
+    for gate in gates:
+        block = record.get(gate)
+        required = list(ROUND2_GATE_BLOCK_KEYS.get(gate, ()))
+        if block is None:
+            problems.append(f"{gate}: absent — it must carry {required}")
+        elif not isinstance(block, Mapping) or not block:
+            problems.append(f"{gate}: present but empty ({block!r}) — it must "
+                            f"carry {required}")
+    if not problems:
         return
     where = record.get("identity_key") or "|".join(
         str(record.get(k, "?")) for k in ("family", "cell_id", "config", "window",
                                           "cost_label", "sizing"))
     raise GateBlocksMissing(
-        f"{where}: the round-2 base record is missing the gate block(s) "
-        f"{missing} (L16, required {tuple(gates)}) — a gate that was never "
-        f"written cannot be scored, and the run-set assertion does not check it")
+        f"{where}: the round-2 base record has no gate block for "
+        f"{'; '.join(problems)} (L16/L19.3, required blocks {tuple(gates)}) — a "
+        f"gate that was never written, or written empty, cannot be scored, and "
+        f"the run-set assertion does not check it")
 
 
 # ── the round-2 declared grid, by value ────────────────────────────────
