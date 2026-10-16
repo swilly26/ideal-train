@@ -1,0 +1,175 @@
+Round-2 cost module — the guard, the label set and the missing pins
+(verifier audit ``ROUND2_COSTS_AUDIT_FINDINGS.md``, defects 1, 3 and 4).
+pytest: tests/test_strategy_search_round2_cost_labels.py,
+tests/test_strategy_search_round2_l19.py.
+
+Run from wt-r2 at 2a89df6 (branch feature/strategy-search) with the new and
+updated tests present and NO costs.py change:
+
+    5 failed, 50 passed in 0.32s
+    rc=1
+
+Each failure is the finding it pins:
+
+* test_no_canonical_label_is_listed_twice — CANONICAL_LABELS lists
+  'slip_x1_5' twice (7 entries, 6 distinct), because
+  REPORT_ONLY_COST_LABELS = (ZERO_COST,) + STRESS_COST_LABELS puts the gating
+  label in the report-only set (defect 3).
+* test_the_gating_and_report_only_sets_partition_the_canonical_labels — the
+  same, seen as a partition failure: gating & report-only == {'slip_x1_5'},
+  which makes the ':64' comment "every level that is reported and never gates"
+  false for it (defect 3).
+* test_the_slippage_levels_are_strictly_ordered_across_the_price_bands —
+  costs.GATE_PROBE_PRICES does not exist; the guard's probe prices do not
+  exist either (fix 3b).
+* test_the_guard_refuses_a_gating_level_that_carries_a_half_spread — DID NOT
+  RAISE: the invariant checks commissions only, so a gating level with a 1 bp
+  half-spread passes the import check (defect 1).
+* test_the_guard_refuses_an_x1_5_that_is_not_strictly_harder — DID NOT RAISE:
+  with SLIP_X1_5_MULTIPLIER collapsed to 1.0 the declared tuple still reads
+  ("baseline", "slip_x1_5"), so nothing catches the ×1.5 level ceasing to be
+  strictly harder than baseline (defect 1, fix 3b).
+
+The three positive controls that already pass on this tree pin reach the old
+guard did have (duplicate gate labels, a commission-bearing gate model, and
+that it checks every gating label, not only the first); the five above are the
+ones that need the fix.  The 50 passing tests include the whole of
+tests/test_strategy_search_round2_l19.py.
+
+Command (run from the tree under test, live stack verified down by pgrep before
+and after):
+
+    cd /home/team/shared/wt-r2
+    export WATCHDOG_SCRIPT="$PWD/watchdog.sh"
+    export SUPERVISE_SCRIPT="$PWD/scripts/supervise_traders.sh"
+    /home/team/shared/engine/.venv/bin/python -m pytest \
+        tests/test_strategy_search_round2_cost_labels.py \
+        tests/test_strategy_search_round2_l19.py -q
+    # -> 5 failed, 50 passed in 0.32s   (rc=1)
+
+....FF..F....F.F.......................................                  [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+___________________ test_no_canonical_label_is_listed_twice ____________________
+
+    def test_no_canonical_label_is_listed_twice():
+        """Defect 3: the report-only set used to carry the gating label ``slip_x1_5``.
+    
+        ``REPORT_ONLY_COST_LABELS = (ZERO_COST,) + STRESS_COST_LABELS`` put the
+        gating label in ``CANONICAL_LABELS`` twice — safe for ``argparse`` today
+        and silently collapsing for any consumer that builds a mapping from the
+        tuple.  One label, one entry.
+        """
+        canonical = tuple(cost_levels.CANONICAL_LABELS)
+>       assert len(set(canonical)) == len(canonical), (
+            f"a canonical label is listed twice: {canonical!r} — REPORT_ONLY must "
+            f"exclude the gating labels (audit defect 3)")
+E       AssertionError: a canonical label is listed twice: ('baseline', 'slip_x1_5', 'zero_cost', 'slip_x1_5', 'slip_x2', 'pessimistic', 'pessimistic_x2') — REPORT_ONLY must exclude the gating labels (audit defect 3)
+E       assert 6 == 7
+E        +  where 6 = len({'baseline', 'pessimistic', 'pessimistic_x2', 'slip_x1_5', 'slip_x2', 'zero_cost'})
+E        +    where {'baseline', 'pessimistic', 'pessimistic_x2', 'slip_x1_5', 'slip_x2', 'zero_cost'} = set(('baseline', 'slip_x1_5', 'zero_cost', 'slip_x1_5', 'slip_x2', 'pessimistic', ...))
+E        +  and   7 = len(('baseline', 'slip_x1_5', 'zero_cost', 'slip_x1_5', 'slip_x2', 'pessimistic', ...))
+
+tests/test_strategy_search_round2_cost_labels.py:123: AssertionError
+_____ test_the_gating_and_report_only_sets_partition_the_canonical_labels ______
+
+    def test_the_gating_and_report_only_sets_partition_the_canonical_labels():
+        """Defect 3: gating or report-only — never both, never neither.
+    
+        ``slip_x1_5`` is *reported* and *gates*, so it stays in
+        ``STRESS_COST_LABELS`` (the set the stage-2 runner reports) and in
+        ``GATE_COST_LABELS``; what it must not be is report-**only**.
+        """
+        gating = set(cost_levels.GATE_COST_LABELS)
+        report_only = set(cost_levels.REPORT_ONLY_COST_LABELS)
+        canonical = set(cost_levels.CANONICAL_LABELS)
+>       assert gating & report_only == set(), (
+            "a gating label is also in REPORT_ONLY_COST_LABELS — the 'reported and "
+            "never gates' comment is then false for it (audit defect 3)")
+E       AssertionError: a gating label is also in REPORT_ONLY_COST_LABELS — the 'reported and never gates' comment is then false for it (audit defect 3)
+E       assert {'slip_x1_5'} == set()
+E         
+E         Extra items in the left set:
+E         'slip_x1_5'
+E         
+E         Full diff:
+E         - set()
+E         + {
+E         +     'slip_x1_5',
+E         + }
+
+tests/test_strategy_search_round2_cost_labels.py:140: AssertionError
+_____ test_the_slippage_levels_are_strictly_ordered_across_the_price_bands _____
+
+    def test_the_slippage_levels_are_strictly_ordered_across_the_price_bands():
+        """Defect 4: baseline < ×1.5 < ×2 at every probe price, floor band included.
+    
+        ``slip_per_share(p) = max(|p| * slippage_pct, slippage_abs)``: the 1¢ floor
+        binds below $50 and the percentage term above it, and both levels scale
+        **both** terms, so the strict ordering must hold on either side of the
+        crossover.
+        """
+>       assert tuple(cost_levels.GATE_PROBE_PRICES) == PROBE_PRICES, (
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            "the guard's probe prices must span both bands (audit fix 3b)")
+E       AttributeError: module 'src.backtesting.strategy_search.costs' has no attribute 'GATE_PROBE_PRICES'
+
+tests/test_strategy_search_round2_cost_labels.py:194: AttributeError
+_______ test_the_guard_refuses_a_gating_level_that_carries_a_half_spread _______
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0550209340>
+
+    def test_the_guard_refuses_a_gating_level_that_carries_a_half_spread(monkeypatch):
+        """Defect 1, positive control: the invariant checked commissions only.
+    
+        A gating level carrying a 1 bp half-spread passed the old import check
+        while adding ~2 bps per single-leg round trip — the level would no longer
+        be slippage-only.
+        """
+        def fake(label: str) -> CostModel:
+            return dataclasses.replace(CostModel.baseline(),
+                                       half_spread_pct=0.0001, label=label)
+    
+        monkeypatch.setattr(cost_levels, "cost_model", fake)
+>       with pytest.raises(AssertionError, match="half-spread"):
+E       Failed: DID NOT RAISE AssertionError
+
+tests/test_strategy_search_round2_cost_labels.py:265: Failed
+__________ test_the_guard_refuses_an_x1_5_that_is_not_strictly_harder __________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f055020a030>
+
+    def test_the_guard_refuses_an_x1_5_that_is_not_strictly_harder(monkeypatch):
+        """Defect 1, positive control (b): ×1.5 that does not beat baseline.
+    
+        The declared tuple still reads ``("baseline", "slip_x1_5")``, so only the
+        strictness check can catch a multiplier that collapses to 1.0 — which is
+        exactly the edit the old guard let through.
+        """
+        monkeypatch.setattr(cost_levels, "SLIP_X1_5_MULTIPLIER", 1.0)
+>       with pytest.raises(AssertionError, match="strictly harder"):
+E       Failed: DID NOT RAISE AssertionError
+
+tests/test_strategy_search_round2_cost_labels.py:291: Failed
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_cost_labels.py::test_no_canonical_label_is_listed_twice - AssertionError: a canonical label is listed twice: ('baseline', 'slip_x1_5', 'zero_cost', 'slip_x1_5', 'slip_x2', 'pessimistic', 'pessimistic_x2') — REPORT_ONLY must exclude the gating labels (audit defect 3)
+assert 6 == 7
+ +  where 6 = len({'baseline', 'pessimistic', 'pessimistic_x2', 'slip_x1_5', 'slip_x2', 'zero_cost'})
+ +    where {'baseline', 'pessimistic', 'pessimistic_x2', 'slip_x1_5', 'slip_x2', 'zero_cost'} = set(('baseline', 'slip_x1_5', 'zero_cost', 'slip_x1_5', 'slip_x2', 'pessimistic', ...))
+ +  and   7 = len(('baseline', 'slip_x1_5', 'zero_cost', 'slip_x1_5', 'slip_x2', 'pessimistic', ...))
+FAILED tests/test_strategy_search_round2_cost_labels.py::test_the_gating_and_report_only_sets_partition_the_canonical_labels - AssertionError: a gating label is also in REPORT_ONLY_COST_LABELS — the 'reported and never gates' comment is then false for it (audit defect 3)
+assert {'slip_x1_5'} == set()
+  
+  Extra items in the left set:
+  'slip_x1_5'
+  
+  Full diff:
+  - set()
+  + {
+  +     'slip_x1_5',
+  + }
+FAILED tests/test_strategy_search_round2_cost_labels.py::test_the_slippage_levels_are_strictly_ordered_across_the_price_bands - AttributeError: module 'src.backtesting.strategy_search.costs' has no attribute 'GATE_PROBE_PRICES'
+FAILED tests/test_strategy_search_round2_cost_labels.py::test_the_guard_refuses_a_gating_level_that_carries_a_half_spread - Failed: DID NOT RAISE AssertionError
+FAILED tests/test_strategy_search_round2_cost_labels.py::test_the_guard_refuses_an_x1_5_that_is_not_strictly_harder - Failed: DID NOT RAISE AssertionError
+5 failed, 50 passed in 0.32s
