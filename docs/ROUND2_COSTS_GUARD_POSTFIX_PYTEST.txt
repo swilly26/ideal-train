@@ -1,0 +1,64 @@
+Round-2 cost module — the guard, the label set and the missing pins
+(verifier audit ``ROUND2_COSTS_AUDIT_FINDINGS.md``, defects 1, 3 and 4).
+Post-fix evidence: the same run as
+``docs/ROUND2_COSTS_GUARD_PREFIX_PYTEST.txt``, with the costs.py fix present.
+
+Tests: tests/test_strategy_search_round2_cost_labels.py (12 new tests),
+tests/test_strategy_search_round2_l19.py, tests/test_replay_costs_parity.py.
+
+    67 passed in 0.31s
+    rc=0
+    [containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+The five tests that failed on the pre-fix tree now pass, and the three positive
+controls that already passed still pass — so the guard is pinned in both
+directions (it can fail, and it does not fire on the declared levels).
+
+FULL SUITE (one run, ``nice -n 19``, from the tree under test):
+
+    1039 passed, 1 warning in 126.14s (0:02:06)
+    rc=0
+    [containment] containment summary: 1 refusal(s), 20 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+The single refusal is the deliberate one — the containment test that hands the
+guard the pre-fix spawn pattern and expects it to be refused before a process
+is created; the 20 reaped processes are that suite's own bounded spawns.
+``pgrep -af 'watchdog.sh|live_trader.py|turbo_trader.py'`` was empty before and
+after the run.  (``crontab`` is not installed in this container, so the
+supervisor line could not be re-checked from here.)
+
+**No coefficient moved.**  ``cost_model`` for all six canonical labels, dumped
+from the committed tree with ``replay_costs.COST_FIELDS`` order
+(slippage_pct, slippage_abs, half_spread_pct, commission_per_share,
+commission_pct):
+
+    baseline       0.0002                 0.01   0.0      0.0    0.0
+    slip_x1_5      0.00030000000000000003 0.015  0.0      0.0    0.0
+    zero_cost      0.0                    0.0    0.0      0.0    0.0
+    slip_x2        0.0004                 0.02   0.0      0.0    0.0
+    pessimistic    0.0002                 0.01   0.0001   0.005  0.0
+    pessimistic_x2 0.0004                 0.02   0.0001   0.005  0.0
+
+The ×1.5 row is the stage-2 stress set's ``0.00030000000000000003/0.015``
+bit-for-bit, and ``tests/test_replay_costs_parity.py`` is green (the wrapper
+``costs.cost_model("pessimistic")`` is now pinned to the turbo variant from
+that file's perspective too — the pin itself lives in the cost-labels test).
+
+Label sets after the fix (defect 3):
+
+    CANONICAL_LABELS        ('baseline','slip_x1_5','zero_cost','slip_x2','pessimistic','pessimistic_x2')   # 6 entries, 6 distinct
+    GATE_COST_LABELS        ('baseline','slip_x1_5')
+    REPORT_ONLY_COST_LABELS ('zero_cost','slip_x2','pessimistic','pessimistic_x2')
+    STRESS_COST_LABELS      ('slip_x1_5','slip_x2','pessimistic','pessimistic_x2')   # unchanged: ×1.5 is still reported
+
+``argparse``'s ``--cost`` choice list is one entry shorter and its accepted set
+is unchanged (the duplicate was ``slip_x1_5``); no screen path semantics change.
+
+Command:
+
+    cd /home/team/shared/wt-r2
+    export WATCHDOG_SCRIPT="$PWD/watchdog.sh"
+    export SUPERVISE_SCRIPT="$PWD/scripts/supervise_traders.sh"
+    nice -n 19 /home/team/shared/engine/.venv/bin/python -m pytest tests -q
+    # -> 1039 passed, 1 warning in 126.14s   (rc=0)
+

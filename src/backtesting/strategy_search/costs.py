@@ -35,18 +35,26 @@ label              construction                                         gating?
 ``pessimistic_x2`` ``pessimistic`` with 4 bps / 2¢                      no
 =================  ====================================================  =======
 
-The gating levels charge **no commission** (L3).  With cap = |universe| = 4 and
-4 × 24 000 = 96 000 of the 100 000 equity, the fourth slot is affordable only
-while the fill's own cost fits the 4 000 of headroom; a commission-bearing level
-would gate on a 3-symbol basket while base gated on 4 — a different portfolio at
-a gating level (audit item 6).  :func:`assert_gate_cost_labels` pins both facts
-and runs at import.
+The gating levels charge **no commission and no half-spread** (L3), and what
+holds that is the declaration itself — not a cash mechanism.  Post-L17 the
+fixed notional is 24 000 with cap = |universe| = 4, so 4 × 24 000 = 96 000 of
+the 100 000 equity: cash after three fills is ~$27 99x, which exceeds one more
+24 000 plus its own fee by ~$4 000 against a fee of a few dollars, so a
+commission-bearing gating level would still fund the fourth fill and would
+**not** gate on a smaller basket (``ROUND2_DECLARATIONS_AUDIT.md`` item 6,
+``ROUND2_PREREG_CONSISTENCY_AUDIT.md`` §6).  The pre-L17 arithmetic this module
+used to quote — 4 × 25 000 = 100 000, so any fee refuses slot 4 — is falsified
+by its own numbers (at exact full cash the engine's ``outlay > cash`` test
+passes) and it protects nothing that is still true.  What protects the invariant
+is the R3-5 declaration this module implements: gating is slippage-only, so the
+gated basket is the same 4 × 24 000 at both gating levels (audit item 6).
+:func:`assert_gate_cost_labels` pins that declaration, and runs at import.
 """
 from __future__ import annotations
 
 import dataclasses
 
-from src.backtesting.replay_costs import CostModel
+from src.backtesting.replay_costs import COST_FIELDS, CostModel
 
 BASE_COST = "baseline"
 ZERO_COST = "zero_cost"
@@ -61,8 +69,14 @@ GATE_COST_LABELS: tuple[str, ...] = (BASE_COST, SLIP_X1_5)
 #: used before this module existed, under the canonical ×1.5 spelling.
 STRESS_COST_LABELS: tuple[str, ...] = (SLIP_X1_5, SLIP_X2, PESSIMISTIC,
                                        PESSIMISTIC_X2)
-#: Every level that is reported and never gates (R3-5).
-REPORT_ONLY_COST_LABELS: tuple[str, ...] = (ZERO_COST,) + STRESS_COST_LABELS
+#: Every level that is reported and **never** gates (R3-5).  The gating labels
+#: are excluded by construction: ``slip_x1_5`` is *reported* (it stays in
+#: ``STRESS_COST_LABELS``, the key set the stage-2 runner writes) **and** gates,
+#: so listing it here too would put it in ``CANONICAL_LABELS`` twice — an entry
+#: ``argparse`` tolerates and any consumer that builds a mapping from the tuple
+#: silently collapses (``ROUND2_COSTS_AUDIT_FINDINGS.md`` defect 3).
+REPORT_ONLY_COST_LABELS: tuple[str, ...] = (ZERO_COST,) + tuple(
+    label for label in STRESS_COST_LABELS if label not in GATE_COST_LABELS)
 CANONICAL_LABELS: tuple[str, ...] = GATE_COST_LABELS + REPORT_ONLY_COST_LABELS
 
 #: Stale spellings of a canonical label: refused, never silently rewritten.
@@ -71,6 +85,12 @@ REJECTED_SPELLINGS: dict[str, str] = {"slip_x1.5": SLIP_X1_5}
 #: The multiplier the ×1.5 level applies to **both** slippage knobs.
 SLIP_X1_5_MULTIPLIER = 1.5
 SLIP_X2_MULTIPLIER = 2.0
+
+#: The probe prices the gating invariant checks the ×1.5 level at — both sides
+#: of the $50 crossover, where ``max(price × slippage_pct, slippage_abs)`` swaps
+#: its binding term: the 1¢ floor binds **below** $50, and a level that scaled
+#: only ``slippage_pct`` would be identical to baseline there.
+GATE_PROBE_PRICES: tuple[float, ...] = (4.75, 12.50, 49.99, 50.00, 500.00)
 
 
 def canonical_label(label: str) -> str:
@@ -133,24 +153,59 @@ def gate_costs() -> dict[str, CostModel]:
 
 
 def assert_gate_cost_labels() -> None:
-    """The declared invariant: exactly two gating levels, both commission-free.
+    """The declared invariant: exactly two gating levels, both slippage-only.
 
-    Runs at import, so a future edit that adds a gating label or gives one a
-    commission fails where it is written, not in the middle of a screen.
+    Runs at import, so a future edit that adds a gating label, gives one a
+    commission or a half-spread, or lets the ×1.5 level stop being strictly
+    harder than baseline fails where it is written, not in the middle of a
+    screen.  Every branch here is exercised by a positive control in
+    ``tests/test_strategy_search_round2_cost_labels.py`` — nothing proved this
+    guard could fail before that (``ROUND2_COSTS_AUDIT_FINDINGS.md`` defect 1).
     """
     if tuple(GATE_COST_LABELS) != (BASE_COST, SLIP_X1_5):
         raise AssertionError(
             f"the gating cost set is exactly ({BASE_COST!r}, {SLIP_X1_5!r}) "
             f"(L3); got {GATE_COST_LABELS!r}")
+    if len(set(GATE_COST_LABELS)) != len(GATE_COST_LABELS):
+        raise AssertionError(
+            f"the gating labels must be distinct — one label per level (L3); "
+            f"got {GATE_COST_LABELS!r}")
     for label in GATE_COST_LABELS:
         cm = cost_model(label)
         if cm.commission_per_share or cm.commission_pct:
             raise AssertionError(
                 f"gating level {label!r} charges a commission "
                 f"(${cm.commission_per_share}/share, {cm.commission_pct:.4%}): "
-                f"at 4 × notional + a fee the fourth slot is refused "
-                f"mechanically, so the level would gate on a 3-symbol basket "
-                f"while base gated on 4 (audit item 6 / L3)")
+                f"the gating levels are slippage-only by **declaration** "
+                f"(R3-5 / L3; ROUND2_DECLARATIONS_AUDIT.md item 6).  The "
+                f"declaration is what keeps the gated basket the same 4 × 24 000 "
+                f"at every gating level — not a cash mechanism, since post-L17 "
+                f"the fourth fill is funded at full cash (~$4 000 of headroom "
+                f"against a fee of a few dollars), so a commission would no "
+                f"longer refuse the slot and would change nothing a gate could "
+                f"see")
+        if cm.half_spread_pct:
+            raise AssertionError(
+                f"gating level {label!r} carries a half-spread "
+                f"({cm.half_spread_pct:.4%}): a half-spread is a cost the "
+                f"gating levels must not have — the levels gate on slippage "
+                f"only (L3), and 1 bp of half-spread adds ~2 bps per "
+                f"single-leg round trip to every trip the level gates")
+    base = cost_model(BASE_COST)
+    harder = cost_model(SLIP_X1_5)
+    for price in GATE_PROBE_PRICES:
+        if not harder.slip_per_share(price) > base.slip_per_share(price):
+            raise AssertionError(
+                f"the ×1.5 gating level must be strictly harder than baseline "
+                f"at every price: at ${price} it charges "
+                f"{harder.slip_per_share(price)} against baseline's "
+                f"{base.slip_per_share(price)}.  Both slippage knobs are scaled "
+                f"(L3) — scaling ``slippage_pct`` alone leaves the level "
+                f"identical to baseline below $50, where the 1¢ floor binds")
+    if all(getattr(base, field) == getattr(harder, field) for field in COST_FIELDS):
+        raise AssertionError(
+            f"the two gating levels must not be the same model; {BASE_COST!r} "
+            f"and {SLIP_X1_5!r} both resolve to {base!r}")
 
 
 assert_gate_cost_labels()
