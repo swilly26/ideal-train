@@ -1,0 +1,108 @@
+ROUND-2 — L19.6 / L19.9 TESTS, MUTATION EVIDENCE
+================================================
+Tree        : /home/team/shared/wt-r2, branch feature/strategy-search
+Commit      : cb2803f (the tests this file is evidence for; L19.6's and L19.9's
+              code half landed earlier, in 3c2dfd0)
+Tests       : tests/test_strategy_search_round2_l19_contract.py (15 tests; the 8
+              added by cb2803f are the L19.6 / L19.9 guards)
+Driver      : /home/team/shared/r2_l196_mutations.py
+Raw log     : /tmp/r2_l196_mut_run2.txt (the run transcribed below)
+
+WHY THIS FILE IS THE HONEST EVIDENCE
+------------------------------------
+The code these guards read is **already correct** — `screen.round2_bucket`,
+`screen.round2_neighbour_stage` and `screen.neighbour_cells` landed in 3c2dfd0 —
+so every guard passes the moment it is written and a green run proves nothing
+about it.  What proves something is the opposite: break the thing the guard is
+supposed to notice and watch the guard fail.
+
+Method: one mutant at a time, applied **in place** to
+`src/backtesting/strategy_search/screen.py`, the contract file run, the failure
+captured, then the file restored from the original bytes; the tree was clean
+after the battery (`git status --short` empty).  No mutation is committed.
+Each run: `pytest tests/test_strategy_search_round2_l19_contract.py -q
+--no-header -p no:cacheprovider` from the tree under test, with
+`WATCHDOG_SCRIPT`/`SUPERVISE_SCRIPT` pointed at that tree.
+
+Reproduce:
+
+    cd /home/team/shared/wt-r2
+    export WATCHDOG_SCRIPT="$PWD/watchdog.sh"
+    export SUPERVISE_SCRIPT="$PWD/scripts/supervise_traders.sh"
+    nice -n 19 /home/team/shared/engine/.venv/bin/python \
+        /home/team/shared/r2_l196_mutations.py
+
+RESULT
+------
+7 mutants, **7 bit** (rc=0).  Baseline (no mutation): 15 passed.
+
+| # | mutant | breaks | verdict |
+|---|---|---|---|
+| M1 | bucket = the **last** failure in the declared order, not the first | totality sweep + 3 more | BITES |
+| M2 | a stage passed twice is accepted (duplicate guard dropped) | partial/duplicated set | BITES |
+| M3 | a missing stage is bucketed anyway (totality guard dropped) | partial/duplicated set | BITES |
+| M4 | a precondition mismatch buckets `headline_rejected` | one-spelling guard + 1 | BITES |
+| M5 | the neighbour set counts a clone cell (hash dedupe dropped) | clone-exclusion + 1 | BITES |
+| M6 | a verdict path reads the `B` annotations | B guard | BITES |
+| M7 | `B` becomes an input of `round2_bucket` | B guard | BITES |
+
+Two notes on the mutants, because they are what makes the evidence readable:
+
+* **M1 is the C1 control.**  With the labelling order reversed the sweep, the
+  input-order test, the one-spelling control and the step-2 slug test all fail —
+  i.e. four independent guards are reading the declared order, not a coincidence
+  of the fixture.
+* **M5 had to be re-pointed once, and the first version is evidence too.**  The
+  clone exclusion is implemented **twice** in `neighbour_cells` (the explicit
+  same-hash `continue` *and* a `setdefault` keyed by resolved hash), so the first
+  mutant — dropping the `continue` — was absorbed by the dedupe and the guard
+  stayed green.  That is exactly the "is this guard blind?" question the battery
+  exists to ask; the mutant was re-pointed at the dedupe itself, which the guard
+  does catch.  Both facts are recorded here rather than only the second.
+
+VERBATIM PER-MUTANT OUTPUT
+--------------------------
+baseline (no mutation): 15 passed.
+
+M1 bucket = LAST failure in the declared order, not the first
+    rc : 1   summary : 4 failed, 11 passed in 1.91s
+    FAILED ...::test_the_vocabulary_is_total_over_the_whole_verdict_space - AssertionError: with ['benchmark', 'headline'] failing the cell bucketed 'benchmark_rejected', not 'headline_rejected': the bucket is the FIRST failure in the declared order ('headline', 'benchmark', 'fat_tail', 'concentration', 'fold_breadth', 'neighbour') (L19.6/C1)
+    FAILED ...::test_the_bucket_is_the_first_failure_in_the_declared_order_not_the_input_order - AssertionError: headline outranks concentration in the declared order, so a cell failing both is benchmark-independent: it is headline_rejected (L19.6)
+    FAILED ...::test_a_precondition_failure_is_not_evaluated_one_spelling_only - AssertionError: control: with step 2 satisfied the same six gate failures is a reject, so the `not_evaluated` above is the short-circuit doing the work
+    FAILED ...::test_the_step_2_slug_decides_the_bucket_and_the_two_slugs_are_not_interchangeable - AssertionError: a paired-subset shortfall is headline_rejected (L19.7/C10), got 'benchmark_rejected'
+
+M2 a stage passed twice is accepted (duplicate guard dropped)
+    rc : 1   summary : 1 failed, 14 passed in 1.82s
+    FAILED ...::test_a_partial_or_duplicated_verdict_set_is_refused_not_bucketed - Failed: DID NOT RAISE ValueError
+
+M3 a missing stage is bucketed anyway (totality guard dropped)
+    rc : 1   summary : 1 failed, 14 passed in 1.73s
+    FAILED ...::test_a_partial_or_duplicated_verdict_set_is_refused_not_bucketed - KeyError: 'preconditions'
+
+M4 a precondition mismatch buckets headline_rejected (one-spelling broken)
+    rc : 1   summary : 2 failed, 13 passed in 1.73s
+    FAILED ...::test_a_precondition_failure_is_not_evaluated_one_spelling_only - AssertionError: a precondition mismatch bucketed 'headline_rejected'; the one spelling is `not_evaluated` (C2) and the reason belongs in `why`, not in a second bucket name
+    FAILED ...::test_the_step_2_slug_decides_the_bucket_and_the_two_slugs_are_not_interchangeable - AssertionError: routing the same refusal through the precondition stage yields not_evaluated — wrong for `paired_floor`, which is exactly why the slug, and not the stage, decides
+
+M5 the neighbour set counts a clone cell (L9 dedupe-by-hash dropped)
+    rc : 1   summary : 2 failed, 13 passed in 1.73s
+    FAILED ...::test_the_neighbour_stage_runs_the_real_neighbour_rule_and_reaches_the_vocabulary - AssertionError: both axes have a positive neighbour; got (False, 'stop_atr_mult: only 1/2 neighbours positive on both windows (need 2)')
+    FAILED ...::test_a_clone_cell_is_excluded_from_the_neighbour_set_only - AssertionError: the neighbour set is {'or_minutes': ['c4'], 'stop_atr_mult': ['c1', 'c2']}: the clone c2 and the two-axis c3 are both out, the survivor c0 is out, and one neighbour per axis is in (L9/L19.12)
+
+M6 a verdict path reads the B annotations
+    rc : 1   summary : 1 failed, 14 passed in 1.71s
+    FAILED ...::test_B_is_recorded_and_no_verdict_path_reads_it - AssertionError: round2_neighbour_stage reads the B annotation constants — 3 and N/4 are annotations retained for the report, never evaluated (L19.9/C6)
+
+M7 B becomes an input of round2_bucket
+    rc : 1   summary : 1 failed, 14 passed in 1.73s
+    FAILED ...::test_B_is_recorded_and_no_verdict_path_reads_it - AssertionError: round2_bucket's inputs are ['cell', 'per_gate_results', 'b_blocks']: B is not one of them and must not become one (L19.9)
+
+all mutants bit: True  (rc=0)
+
+FIRST M5 ATTEMPT (kept, because it is the honest half of the story)
+---------------------------------------------------------------
+    M5 (v1) the neighbour set counts a clone cell (the same-hash `continue` dropped)
+        rc : 0   summary : 15 passed
+        verdict    : DID NOT BITE — guard is blind
+The mutant was absorbed by the second, hash-keyed dedupe in the same function.
+Re-pointed at that dedupe (M5 above), which the guard does catch.
