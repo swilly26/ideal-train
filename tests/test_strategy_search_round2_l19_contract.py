@@ -25,6 +25,8 @@ golden ``tests/data/round2_l198_persisted.json``.
 """
 from __future__ import annotations
 
+import inspect
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -36,7 +38,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.backtesting.strategy_search import screen  # noqa: E402
+from src.backtesting.strategy_search import families, screen  # noqa: E402
 
 SPEC = Path("/home/team/shared/ROUND2_GATE_ORDER_SPEC.md")
 PREREG = Path("/home/team/shared/ROUND2_PREREG_DECLARATIONS.md")
@@ -278,3 +280,387 @@ def test_the_helper_refuses_a_table_it_cannot_read_rather_than_guessing():
     with pytest.raises(ValueError):
         screen.session_block_lower_bound(pd.DataFrame(
             {"entry_time": [], "notional": [], "pnl_after_costs": []}))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# L19.6 — the bucket vocabulary is TOTAL, and `not_evaluated` has one spelling
+# ═══════════════════════════════════════════════════════════════════════
+#: Every stage :func:`screen.round2_bucket` must be handed a verdict for.
+#: ``preconditions`` is step 2 (L19.7): it is *not* a gate, it decides whether
+#: the cell can be scored at all, so it short-circuits to the one terminal
+#: spelling instead of to a ``*_rejected`` bucket (C2).
+_ALL_STAGES = screen.ROUND2_BUCKET_STAGES
+
+
+def _triples(failing=(), precondition_ok=True):
+    """One ``(stage, ok, why)`` triple per declared stage, as the judge hands them in.
+
+    Mirrors the shape the real producers return: the three gate blocks'
+    ``(ok, why)``, :func:`screen.round2_fold_breadth` and
+    :func:`screen.round2_neighbour_stage` for the two block-less rules, and
+    :func:`screen.round2_preconditions` for step 2.
+    """
+    out = []
+    for stage in _ALL_STAGES:
+        if stage == screen.ROUND2_PRECONDITION_STAGE:
+            ok = precondition_ok
+        else:
+            ok = stage not in failing
+        out.append((stage, ok, f"{stage} verdict"))
+    return tuple(out)
+
+
+def test_the_vocabulary_is_total_over_the_whole_verdict_space():
+    """**Every** dead cell has exactly one bucket (L19.6).
+
+    The guard L19.6 exists for: a full sweep of all ``2**6 = 64`` pass/fail
+    combinations over the six declared stages.  Each one must return exactly one
+    bucket, the bucket must be the **first** failure in the **declared labelling
+    order** — not any failure, and not the order the triples arrive in — and the
+    six ``*_rejected`` names plus ``alive`` must be the *whole* output range, so
+    no dead cell can be unbucketed.  ``fold_breadth_rejected`` and
+    ``neighbour_rejected`` had no name at all before this, which is the defect.
+    """
+    order = screen.ROUND2_BUCKET_ORDER
+    assert len(order) == 6 and len(set(order)) == 6, (
+        f"the declared bucket order is {order!r} — six distinct stages is the "
+        f"vocabulary L19.6 rules on")
+    assert screen.ROUND2_BUCKET_NAMES == tuple(f"{b}_rejected" for b in order), (
+        "one bucket name per stage, derived from the order so the two cannot "
+        "drift (L19.6)")
+    assert len(set(screen.ROUND2_BUCKET_NAMES)) == 6
+    assert screen.ROUND2_NOT_EVALUATED == "not_evaluated"
+    assert screen.ROUND2_NOT_EVALUATED not in screen.ROUND2_BUCKET_NAMES
+
+    reachable = set()
+    for mask in range(1 << len(order)):
+        failing = {order[i] for i in range(len(order)) if (mask >> i) & 1}
+        bucket, why = screen.round2_bucket("cell", *_triples(failing))
+        reachable.add(bucket)
+        first = min(order.index(stage) for stage in failing) if failing else None
+        expected = (f"{order[first]}_rejected" if first is not None
+                    else screen.ROUND2_ALIVE)
+        assert bucket == expected, (
+            f"with {sorted(failing)} failing the cell bucketed {bucket!r}, not "
+            f"{expected!r}: the bucket is the FIRST failure in the declared "
+            f"order {order} (L19.6/C1)")
+        assert why.startswith("cell:"), (
+            f"the reason must name the cell it is about, got {why!r}")
+
+    assert reachable == {screen.ROUND2_ALIVE} | set(screen.ROUND2_BUCKET_NAMES), (
+        f"the sweep reached {sorted(reachable)}; the vocabulary must be exactly "
+        f"alive + the six reject buckets, or some outcome has no name (L19.6). "
+        f"A missing name is how a dead cell stayed unbucketed before the ruling")
+
+
+def test_a_partial_or_duplicated_verdict_set_is_refused_not_bucketed():
+    """The input side of totality: fail closed on a partial picture (L19.6).
+
+    A cell bucketed from five of six stages is a cell whose bucket is a guess,
+    and a stage handed in twice is two answers to one question.  Both raise.
+    The positive control runs first, so the assertion cannot pass vacuously on a
+    helper that raises for everything.
+    """
+    full = _triples({"fat_tail"})
+    assert screen.round2_bucket("cell", *full)[0] == "fat_tail_rejected", (
+        "positive control: a complete, well-formed verdict set must bucket")
+
+    for dropped in _ALL_STAGES:
+        with pytest.raises(ValueError) as exc:
+            screen.round2_bucket("cell", *(t for t in full if t[0] != dropped))
+        assert dropped in str(exc.value), (
+            f"a verdict set with no {dropped!r} verdict must be refused *naming* "
+            f"it — a silent bucket on a partial picture is the unbucketed-dead-"
+            f"cell defect; got {str(exc.value)!r}")
+
+    with pytest.raises(ValueError) as exc:
+        screen.round2_bucket("cell", *full, ("benchmark", True, "a second opinion"))
+    assert "benchmark" in str(exc.value) and "twice" in str(exc.value), (
+        f"a stage passed twice must be refused as such, got {str(exc.value)!r}")
+
+    with pytest.raises(ValueError) as exc:
+        screen.round2_bucket("cell", *full[:-1],
+                             ("not_defined_for_multi_leg", False, "multi-leg"))
+    assert "not_defined_for_multi_leg" in str(exc.value), (
+        "a stage name outside the declared vocabulary is refused one spelling at "
+        "a time (C2): R3-6.1 §2.7 and R3-6.3 §1/§7 used "
+        "`not_defined_for_multi_leg` and it is not a bucket stage")
+
+    with pytest.raises((TypeError, ValueError)):
+        screen.round2_bucket("cell", *full[:-1], ("neighbour", True))
+
+
+def test_the_bucket_is_the_first_failure_in_the_declared_order_not_the_input_order():
+    """Input-order independence (L19.6/C1).
+
+    The labelling order and §1's evaluation order are deliberately different
+    things, so the bucket may not depend on the order the judge happens to
+    assemble its verdicts in.  Every permutation of the same seven triples gives
+    the same bucket, and the bucket is the earliest stage in
+    :data:`screen.ROUND2_BUCKET_ORDER` — here ``headline``, even when the failing
+    stages are passed last.
+    """
+    triples = _triples({"concentration", "headline"})
+    base, _ = screen.round2_bucket("cell", *triples)
+    assert base == "headline_rejected", (
+        "headline outranks concentration in the declared order, so a cell failing "
+        "both is benchmark-independent: it is headline_rejected (L19.6)")
+
+    for perm in itertools.permutations(triples):
+        bucket, _ = screen.round2_bucket("cell", *perm)
+        assert bucket == base, (
+            f"the same verdicts in a different order bucketed {bucket!r} instead "
+            f"of {base!r} (L19.6/C1): the bucket must be decided by the declared "
+            f"order, not by the order the judge assembled them in")
+
+    reversed_ = tuple(reversed(triples))
+    assert reversed_[0][0] == "neighbour" and reversed_[1][0] == "fold_breadth", (
+        "the control must actually pass the last-declared stages first")
+    assert screen.round2_bucket("cell", *reversed_)[0] == "headline_rejected"
+
+    assert screen.round2_bucket("cell", *_triples({"concentration"}))[0] == (
+        "concentration_rejected"), (
+        "non-vacuity control: with headline passing, concentration's failure is "
+        "reachable on its own — so the equality above is about the order, not "
+        "about the fixture failing everything")
+
+
+def test_a_precondition_failure_is_not_evaluated_one_spelling_only():
+    """Precondition mismatch is ``not_evaluated``, and nothing else (C2).
+
+    One terminal spelling for a cell that refuses a verdict; the *reason* rides
+    in ``why``.  The control below shows the short-circuit is load-bearing (the
+    same six gate failures with step 2 satisfied is a reject), so this is not a
+    helper that returns the same string for everything.
+    """
+    all_gates_fail = set(screen.ROUND2_BUCKET_ORDER)
+    bucket, why = screen.round2_bucket("cell", *_triples(all_gates_fail,
+                                                         precondition_ok=False))
+    assert bucket == screen.ROUND2_NOT_EVALUATED == "not_evaluated", (
+        f"a precondition mismatch bucketed {bucket!r}; the one spelling is "
+        f"`not_evaluated` (C2) and the reason belongs in `why`, not in a second "
+        f"bucket name")
+    assert "not evaluated" in why and "preconditions verdict" in why, (
+        f"the reason must be carried in `why`, got {why!r}")
+
+    assert screen.round2_bucket("cell", *_triples(all_gates_fail))[0] == (
+        "headline_rejected"), (
+        "control: with step 2 satisfied the same six gate failures is a reject, "
+        "so the `not_evaluated` above is the short-circuit doing the work")
+
+    plain, _ = screen.round2_bucket("cell", *_triples((), precondition_ok=False))
+    assert plain == screen.ROUND2_NOT_EVALUATED, (
+        "a precondition mismatch with every gate passing is still not_evaluated: "
+        "nothing downstream is meaningful, so it is decided first")
+
+
+def _step2_record(**over):
+    """A minimal record that satisfies **every** step-2 precondition."""
+    record = {
+        "trips": 150,
+        "trip_table": [{"legs": 1, "notional": families.R2_CAPS["notional_usd"]}] * 150,
+        "config_params": dict(families.R2_CAPS),
+        "benchmark": {"config_trips": 150, "benchmark_trips": 150,
+                      "paired_trips": 150, "benchmark_unpriced": 0},
+    }
+    record.update(over)
+    return record
+
+
+def test_the_step_2_slug_decides_the_bucket_and_the_two_slugs_are_not_interchangeable():
+    """``paired_floor`` is a **headline** failure, every other slug is not (L19.7/C2).
+
+    :func:`screen.round2_preconditions` returns one ``(ok, why)`` for all six
+    conjuncts and the judge reads the **slug** to pick the bucket.  That handoff
+    is the only place the L13 ambiguity could come back, so it is pinned here at
+    the bucket: the helper's own paired-floor refusal, handed in as a *headline*
+    verdict, buckets ``headline_rejected`` — while the same refusal handed in
+    under the precondition stage would bucket ``not_evaluated``, which is the
+    mis-bucket this test exists to make visible.
+    """
+    ok, why = screen.round2_preconditions(
+        _step2_record(benchmark={"config_trips": 150, "benchmark_trips": 150,
+                                 "paired_trips": 149, "benchmark_unpriced": 1}))
+    assert ok is False and why.startswith("paired_floor"), (
+        f"the paired shortfall must be refused under its own slug, got {why!r}")
+
+    others = [t for t in _triples(("benchmark",)) if t[0] != "headline"]
+    as_headline = screen.round2_bucket("cell", *others, ("headline", False, why))
+    assert as_headline[0] == "headline_rejected", (
+        f"a paired-subset shortfall is headline_rejected (L19.7/C10), got "
+        f"{as_headline[0]!r}")
+
+    as_precondition = screen.round2_bucket(
+        "cell", *_triples((), precondition_ok=False))
+    assert as_precondition[0] == screen.ROUND2_NOT_EVALUATED, (
+        "routing the same refusal through the precondition stage yields "
+        "not_evaluated — wrong for `paired_floor`, which is exactly why the slug, "
+        "and not the stage, decides")
+
+    ok, why = screen.round2_preconditions(_step2_record(trips=149))
+    assert why.startswith("trips_floor"), (
+        f"a genuine precondition mismatch keeps its own slug, got {why!r}")
+    assert why.split(":")[0] not in screen.ROUND2_BUCKET_ORDER, (
+        "a precondition slug must not collide with a stage name, or the judge's "
+        "slug->stage mapping is ambiguous")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# L19.6 — the neighbour rule is *wired* into the vocabulary
+# ═══════════════════════════════════════════════════════════════════════
+def _family_c_neighbour_grid():
+    """A five-cell grid around ``c0``: one neighbour per axis, one clone, one two-axis cell.
+
+    Built the way ``tests/test_strategy_search_round2_gate.py`` builds its
+    neighbour fixture, so the resolved-config hashing under test is the live one.
+    ``c1``/``c2`` declare the **same** behaviour (``c2`` is a clone); ``c3``
+    varies two axes at once, so it is a neighbour of neither.
+    """
+    params = dict(families.GRID_C[1]["params"])
+
+    def cell(name, stop, or_minutes):
+        return dict(name=name, params=dict(params),
+                    extras=dict(stop_atr_mult=stop, target_atr_mult=2.0,
+                                trail_atr_mult=0.0),
+                    signal=dict(or_minutes=or_minutes, allow_short=False))
+
+    return [cell("c0", 1.0, 30), cell("c1", 1.5, 30), cell("c2", 1.5, 30),
+            cell("c3", 2.0, 60), cell("c4", 1.0, 60)]
+
+
+def test_the_neighbour_stage_runs_the_real_neighbour_rule_and_reaches_the_vocabulary():
+    """The wiring point (L19.6): the one conjunct that is not per-record.
+
+    ``neighbour_cells``/``neighbour_verdict`` were pure and unwired, so a cell
+    dying on the neighbour rule had **no bucket**.  The stage must produce the
+    same verdict as calling the pair directly, must be consumable as the
+    ``neighbour`` triple, and its failure must reach ``neighbour_rejected``.
+    """
+    specs = _family_c_neighbour_grid()
+    positive = {"c1": True, "c4": True}
+
+    stage = screen.round2_neighbour_stage("C", specs, "c0", positive)
+    assert isinstance(stage, tuple) and len(stage) == 2 and isinstance(stage[0], bool), (
+        f"the stage must return the (ok, why) shape round2_bucket takes, got "
+        f"{stage!r}")
+    assert stage[0] is True, f"both axes have a positive neighbour; got {stage!r}"
+
+    direct = screen.neighbour_verdict(screen.neighbour_cells("C", specs, "c0"),
+                                      positive)
+    assert stage == direct, (
+        f"the stage returned {stage!r} but the real rule returns {direct!r} — the "
+        f"wiring must adapt neighbour_cells/neighbour_verdict, not re-implement "
+        f"the rule (L19.6)")
+
+    without_neighbour = _triples(()) [:-1]
+    alive, why = screen.round2_bucket("cell", *without_neighbour,
+                                      ("neighbour", *stage))
+    assert alive == screen.ROUND2_ALIVE, (
+        f"a passing neighbour rule leaves the cell alive; got {alive!r} ({why!r})")
+
+    failing = screen.round2_neighbour_stage("C", specs, "c0",
+                                            {"c1": False, "c4": False})
+    assert failing[0] is False
+    bucket, why = screen.round2_bucket(
+        "cell", *(_triples(()) [:-1]), ("neighbour", *failing))
+    assert bucket == "neighbour_rejected", (
+        f"a cell dying on the neighbour rule must be bucketed "
+        f"`neighbour_rejected` (L19.6) — before this it was unbucketed; got "
+        f"{bucket!r} ({why!r})")
+    assert bucket in screen.ROUND2_BUCKET_NAMES
+
+
+def test_a_clone_cell_is_excluded_from_the_neighbour_set_only():
+    """L9/L19.12: clone cells leave the neighbour set, and nothing else.
+
+    The exclusion is load-bearing, not cosmetic: with the clone counted as a
+    second neighbour the axis needs two positives and the cell fails; with the
+    clone excluded the axis has one neighbour and passes.  The two verdicts are
+    asserted against each other, so the exclusion cannot be silently dropped.
+    """
+    specs = _family_c_neighbour_grid()
+    clones = (families.resolved_hash("C", families.resolve_spec("C", specs[1]))
+              == families.resolved_hash("C", families.resolve_spec("C", specs[2])))
+    assert clones, (
+        "the fixture's c1/c2 must resolve to the same config, or this control "
+        "tests nothing")
+
+    cells = screen.neighbour_cells("C", specs, "c0")
+    assert cells == {"stop_atr_mult": ["c1"], "or_minutes": ["c4"]}, (
+        f"the neighbour set is {cells!r}: the clone c2 and the two-axis c3 are "
+        f"both out, the survivor c0 is out, and one neighbour per axis is in "
+        f"(L9/L19.12)")
+
+    positive = {"c1": True, "c2": False, "c4": True}
+    wired = screen.round2_neighbour_stage("C", specs, "c0", positive)
+    assert wired[0] is True, (
+        f"with the clone excluded, stop_atr_mult's only neighbour is c1 (positive) "
+        f"and or_minutes' is c4 (positive), so the rule holds; got {wired!r}")
+
+    as_if_clone_counted = screen.neighbour_verdict(
+        {"stop_atr_mult": ["c1", "c2"], "or_minutes": ["c4"]}, positive)
+    assert as_if_clone_counted[0] is False, (
+        "the control must fail with the clone counted (2 neighbours, 1 positive, "
+        "need 2) — otherwise the exclusion above is untested (L9/L19.12)")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# L19.9 — `B` is a recorded diagnostic; no verdict path reads it
+# ═══════════════════════════════════════════════════════════════════════
+def test_B_is_recorded_and_no_verdict_path_reads_it():
+    """L19.9/C6: the block count is reported, never scored.
+
+    Three statements, in this order of strength: the helper really does report a
+    different ``B`` for a one-session and a forty-session frame (so ``B`` is a
+    live quantity); the bucket is identical whether the record's diagnostic
+    field says ``B = 1`` or ``B = 1000``, while a stage verdict that *is* read
+    moves it (the non-vacuity control); and no verdict entry point reads the
+    annotation constants or a ``bootstrap_blocks`` field — the scan is shown to
+    be sensitive by finding a name the function does read.
+    """
+    one_block = pd.DataFrame({
+        "entry_time": pd.to_datetime(["2025-09-02 09:31", "2025-09-02 10:02",
+                                      "2025-09-02 11:00"]),
+        "notional": [24_000.0] * 3, "pnl_after_costs": [1.0, 2.0, 3.0]})
+    _, b_one = screen.session_block_lower_bound(one_block)
+    _, b_many = screen.session_block_lower_bound(_uneven_blocks_frame())
+    assert (b_one, b_many) == (1, 40), (
+        f"B must be the number of distinct entry-date blocks (L19.9): got "
+        f"{b_one} for one session and {b_many} for the uneven 40-session frame")
+
+    triples = _triples({"concentration"})
+    buckets = {screen.round2_bucket("cell", *triples)[0]
+               for _record_b in ({"bootstrap_blocks": 1},
+                                 {"bootstrap_blocks": 1000})}
+    assert buckets == {"concentration_rejected"}, (
+        f"the bucket moved with the recorded B — no verdict path may read B, it "
+        f"is a diagnostic (L19.9); got {sorted(buckets)}")
+
+    assert screen.round2_bucket("cell", *_triples({"benchmark"}))[0] == (
+        "benchmark_rejected"), (
+        "non-vacuity control: the fixture's stage verdicts do move the bucket, so "
+        "the equality asserted for B is about B alone")
+
+    params = list(inspect.signature(screen.round2_bucket).parameters)
+    assert params == ["cell", "per_gate_results"], (
+        f"round2_bucket's inputs are {params!r}: B is not one of them and must "
+        f"not become one (L19.9)")
+    assert not any("block" in name or name.strip("_") == "b" for name in params)
+
+    for fn in (screen.round2_bucket, screen.round2_neighbour_stage,
+               screen.round2_fold_breadth, screen.round2_preconditions,
+               screen.assert_benchmark_paired_identity):
+        source = inspect.getsource(fn)
+        assert "ROUND2_B_ANNOTATIONS" not in source, (
+            f"{fn.__name__} reads the B annotation constants — 3 and N/4 are "
+            f"annotations retained for the report, never evaluated (L19.9/C6)")
+        assert "bootstrap_blocks" not in source, (
+            f"{fn.__name__} reads the recorded block count; no verdict path may "
+            f"be a function of B (L19.9)")
+
+    assert "ROUND2_BUCKET_ORDER" in inspect.getsource(screen.round2_bucket), (
+        "sensitivity control: the scan above must be able to find a constant the "
+        "function *does* read, or it proves nothing")
+    assert screen.ROUND2_B_ANNOTATIONS == (3, screen.ROUND2_N_CONFIGS // 4), (
+        "the two retained annotations are 3 and N/4, documented in the spec as "
+        "diagnostics (L19.9/C6)")
