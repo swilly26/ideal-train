@@ -137,6 +137,48 @@ def test_a_signal_that_only_wins_with_a_same_bar_fill_loses_at_t_plus_1():
     assert naive - trade["cost_drag"] > 0
 
 
+def test_the_trip_table_carries_the_signal_bar_beside_the_fill_bar():
+    """L19.11 (RULING L14): ``signal_time`` gets a producer, or it is withdrawn.
+
+    The engine has **both** bars — the signal is read on bar *t*'s close and the
+    fill is made on bar *t+1*'s open — so the trip table must record the signal
+    bar as well as the fill bar.  A mandated column that no record carries is a
+    trap for whoever builds the trip table: the diagnostic-only signal-matched
+    benchmark (R3-6.1 §4/§5.1) and any future signal-vs-fill audit are
+    unimplementable from a table that has only the fill bar.
+
+    The failure this pins, measured on the pre-change tree: ``signal_time`` is
+    absent from ``res.trades`` **and** from the trade dict, because
+    ``SearchReplay._trades_df`` builds the frame strictly from its explicit
+    column list, so a field that is not in that list is silently dropped even
+    when the trade dict has it.  The recorded pre-change run is
+    ``docs/ROUND2_L19_11_PREFIX_PYTEST.txt``.
+    """
+    bars = [(100.0, 100.05, 99.95, 100.0)] * 16
+    bars.append((100.0, 110.0, 99.9, 110.0))          # the signal bar (16)
+    bars += [(111.0, 111.05, 110.95, 111.0)] * 4      # t+1 open, then flat
+    market, axis = _one_symbol_market({"2025-01-02": bars})
+    entry = np.zeros(len(axis), dtype=np.int8)
+    entry[16] = 1
+    inst = Instrument(key="SOXL", legs=(Leg("SOXL", 1, 1.0),), entry_dir=entry,
+                      exit_now=np.zeros(len(axis), dtype=np.int8),
+                      valid=market.valid((Leg("SOXL", 1, 1.0),)))
+    cfg = simple_cfg(eod_flat_min=OPEN_MIN + 20)
+    res = run_search(market, {"SOXL": inst}, cfg, CostModel.baseline())
+    assert len(res.trades) == 1
+    assert "signal_time" in res.trades.columns, (
+        "the trip table has no signal_time column (L19.11): _trades_df builds the "
+        "frame from an explicit column list, so the field has to be in that list "
+        "as well as in the trade dict")
+    trade = res.trades.iloc[0]
+    assert pd.Timestamp(trade["signal_time"]) == axis[16], (
+        f"signal_time must be the signal bar's own time ({axis[16]}), not the "
+        f"fill bar's ({trade['entry_time']}) — a column that repeats entry_time "
+        f"is the t+1 convention re-labelled, not a producer for L14")
+    assert pd.Timestamp(trade["entry_time"]) == axis[17] == axis[16] + pd.Timedelta(
+        minutes=1), "the fill is still on the bar after the signal"
+
+
 def test_a_signal_is_never_filled_across_the_overnight_gap():
     bars = [(100.0, 100.05, 99.95, 100.0)] * 21
     market, axis = _one_symbol_market({"2025-01-02": bars, "2025-01-03": bars})

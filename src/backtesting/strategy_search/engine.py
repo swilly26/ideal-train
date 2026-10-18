@@ -266,6 +266,12 @@ class _OpenPos:
     notional: float            # gross entry notional at the fill prices
     entry_time: pd.Timestamp
     entry_index: int
+    #: Axis index of the bar whose **signal** triggered this entry (L19.11).  The
+    #: fill is made on the bar after it, so ``entry_index - 1`` usually equals
+    #: this — but not always (a signal re-tried after a refused entry), which is
+    #: exactly why the signal bar is carried rather than re-derived.  It is what
+    #: gives the mandated ``signal_time`` trip-table column a producer (L14).
+    signal_index: int
     side: int                  # +1 long, −1 short (single-leg reference side)
     ref_symbol: str            # symbol whose bars drive stop/target/trail
     ref_entry: float           # reference fill price at entry
