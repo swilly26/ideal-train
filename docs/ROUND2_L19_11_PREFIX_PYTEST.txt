@@ -1,0 +1,67 @@
+L19.11 (RULING L14; L19-S C8) — ``signal_time`` gets a producer, or it is
+withdrawn.  pytest, tests/test_strategy_search_engine.py,
+test_the_trip_table_carries_the_signal_bar_beside_the_fill_bar.
+
+Run from wt-r2 with the new test present and the engine at its PRE-change state:
+src/backtesting/strategy_search/engine.py taken from 15fec91, i.e. before any of
+the three L19.11 writes — no ``_OpenPos.signal_index`` field, no ``signal_time``
+key in ``_close``'s trade dict, no ``signal_time`` column in
+``SearchReplay._trades_df``'s explicit list.  The test fails at the *column*
+assertion, which is the point: the frame builds strictly from that list, so a
+field that is not in it is silently dropped even when the trade dict carries it.
+
+Command (run from the tree under test, live stack verified down by pgrep before
+and after — 0 processes; containment reported 0 refusals / 0 strays / 0
+live-stack processes):
+cd /home/team/shared/wt-r2 && WATCHDOG_SCRIPT="$PWD/watchdog.sh" \
+  SUPERVISE_SCRIPT="$PWD/scripts/supervise_traders.sh" nice -n 19 \
+  /home/team/shared/engine/.venv/bin/python -m pytest \
+  tests/test_strategy_search_engine.py -q --no-header --tb=line -k signal_bar
+
+--- output (1 failed, 24 deselected, rc=1) ---
+F                                                                        [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+E   AssertionError: the trip table has no signal_time column (L19.11): _trades_df builds the frame from an explicit column list, so the field has to be in that list as well as in the trade dict
+    assert 'signal_time' in Index(['instrument', 'symbols', 'legs', 'notional', 'gross_notional',
+       'net_outlay', 'entry_time', 'exit_time', ...pnl_after_costs', 'identity_check',
+       'identity_residual', 'leg_detail', 'ret_pct', 'net_bps'],
+      dtype='str')
+     +  where Index(['instrument', 'symbols', 'legs', 'notional', 'gross_notional',
+       'net_outlay', 'entry_time', 'exit_time', ...pnl_after_costs', 'identity_check',
+       'identity_residual', 'leg_detail', 'ret_pct', 'net_bps'],
+      dtype='str') =   instrument symbols  ...  ret_pct  net_bps
+0       SOXL   SOXL+  ...  -0.0004  -3.9992
+
+[1 rows x 23 columns].columns
+     +    where   instrument symbols  ...  ret_pct  net_bps
+0       SOXL   SOXL+  ...  -0.0004  -3.9992
+
+[1 rows x 23 columns] = SearchResult(trades=  instrument symbols  ...  ret_pct  net_bps
+0       SOXL   SOXL+  ...  -0.0004  -3.9992
+
+[1 rows x...top_pct=None, target_pct=None, trail_pct=None, time_exit_minutes=None, allow_short=False, eod_flat_min=590, extras={})).trades
+/home/team/shared/wt-r2/tests/test_strategy_search_engine.py:169: AssertionError: the trip table has no signal_time column (L19.11): _trades_df builds the frame from an explicit column list, so the field has to be in that list as well as in the trade dict
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_engine.py::test_the_trip_table_carries_the_signal_bar_beside_the_fill_bar - AssertionError: the trip table has no signal_time column (L19.11): _trades_df builds the frame from an explicit column list, so the field has to be in that list as well as in the trade dict
+assert 'signal_time' in Index(['instrument', 'symbols', 'legs', 'notional', 'gross_notional',
+       'net_outlay', 'entry_time', 'exit_time', ...pnl_after_costs', 'identity_check',
+       'identity_residual', 'leg_detail', 'ret_pct', 'net_bps'],
+      dtype='str')
+ +  where Index(['instrument', 'symbols', 'legs', 'notional', 'gross_notional',
+       'net_outlay', 'entry_time', 'exit_time', ...pnl_after_costs', 'identity_check',
+       'identity_residual', 'leg_detail', 'ret_pct', 'net_bps'],
+      dtype='str') =   instrument symbols  ...  ret_pct  net_bps
+0       SOXL   SOXL+  ...  -0.0004  -3.9992
+
+[1 rows x 23 columns].columns
+ +    where   instrument symbols  ...  ret_pct  net_bps
+0       SOXL   SOXL+  ...  -0.0004  -3.9992
+
+[1 rows x 23 columns] = SearchResult(trades=  instrument symbols  ...  ret_pct  net_bps
+0       SOXL   SOXL+  ...  -0.0004  -3.9992
+
+[1 rows x...top_pct=None, target_pct=None, trail_pct=None, time_exit_minutes=None, allow_short=False, eod_flat_min=590, extras={})).trades
+1 failed, 24 deselected in 0.27s
+rc=1

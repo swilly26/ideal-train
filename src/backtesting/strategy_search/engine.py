@@ -555,6 +555,7 @@ class SearchReplay:
             key=inst.key, legs=open_legs,
             notional=sum(ol.qty * ol.entry_fill for ol in open_legs),
             entry_time=self.m.axis[k], entry_index=k,
+            signal_index=sig_k,
             side=primary.side if single else 0,
             ref_symbol=primary.symbol, ref_entry=ref_fill,
             stop=stop, target=target, extreme=ref_fill, direction=int(direction),
@@ -648,6 +649,13 @@ class SearchReplay:
             "gross_notional": gross_notional,
             "net_outlay": net_outlay,
             "entry_time": pos.entry_time, "exit_time": t,
+            #: L19.11 (RULING L14): the **signal** bar's own time, beside the
+            #: fill bar's.  The engine has both — the signal is read on bar
+            #: *t*'s close, the fill is made on bar *t+1*'s open — and the
+            #: mandated ``signal_time`` column is what makes the diagnostic-only
+            #: signal-matched benchmark (R3-6.1 §4/§5.1) and any future
+            #: signal-vs-fill audit expressible from the trip table alone.
+            "signal_time": self.m.axis[pos.signal_index],
             "entry_price": pos.legs[0].entry_fill,
             "exit_price": fills[(0, pos.legs[0].symbol)],
             "hold_minutes": hold,
@@ -909,7 +917,7 @@ class SearchReplay:
     # ── result assembly ────────────────────────────────────────────────
     def _trades_df(self) -> pd.DataFrame:
         cols = ["instrument", "symbols", "legs", "notional", "gross_notional",
-                "net_outlay", "entry_time",
+                "net_outlay", "entry_time", "signal_time",
                 "exit_time", "entry_price", "exit_price", "hold_minutes",
                 "exit_reason", "pnl_gross", "slip_drag", "fees",
                 "cost_drag", "pnl_gross_precost", "pnl_after_costs",
