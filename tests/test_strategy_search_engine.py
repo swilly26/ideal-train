@@ -179,6 +179,85 @@ def test_the_trip_table_carries_the_signal_bar_beside_the_fill_bar():
         minutes=1), "the fill is still on the bar after the signal"
 
 
+def test_the_trip_table_carries_the_side_as_a_column():
+    """L14 (RULING L19-B / spec §2 I5): ``side`` is a mandatory, gating column.
+
+    ``side`` is not decoration.  R3-6.1's per-trip benchmark rows carry a
+    ``side`` per trip and the whole leg-fill-symmetry family of tests reads a
+    leg's side to price a short's exit; today the side exists only inside
+    ``symbols`` (``"SOXL-"``) and ``leg_detail`` (``"0|SOXL|-1|..."``), both of
+    which are *strings a reader has to parse*.  A gating column that is only
+    recoverable by parsing another column is the same defect class as the
+    ``signal_time`` column L19.11 had to produce: the record does not carry it.
+
+    The frame builds strictly from ``SearchReplay._trades_df``'s explicit column
+    list, so a ``side`` key in the trade dict that is **not** in that list is
+    silently dropped — which is exactly how the pre-change tree behaves, and the
+    recorded run is ``docs/ROUND2_L14_SIDE_PREFIX_PYTEST.txt``.
+
+    ``side`` is the *position's* reference side (``_OpenPos.side``): +1 long,
+    -1 short, and 0 for a pair, whose legs carry their own mirrored sides in
+    ``leg_detail``.  Round 2 is single-leg only (``round2_preconditions``), so
+    the +1/-1 cases are the ones the judge reads.
+    """
+    # a long: one rising signal, flattened at the close
+    bars = [(100.0, 100.05, 99.95, 100.0)] * 16
+    bars.append((100.0, 110.0, 99.9, 110.0))
+    bars += [(111.0, 111.05, 110.95, 111.0)] * 4
+    market, axis = _one_symbol_market({"2025-01-02": bars})
+    entry = np.zeros(len(axis), dtype=np.int8)
+    entry[16] = 1
+    inst = Instrument(key="SOXL", legs=(Leg("SOXL", 1, 1.0),), entry_dir=entry,
+                      exit_now=np.zeros(len(axis), dtype=np.int8),
+                      valid=market.valid((Leg("SOXL", 1, 1.0),)))
+    cfg = simple_cfg(eod_flat_min=OPEN_MIN + 20)
+    res = run_search(market, {"SOXL": inst}, cfg, CostModel.baseline())
+    assert len(res.trades) == 1
+    assert "side" in res.trades.columns, (
+        "the trip table has no side column (L14/L19-B): _trades_df builds the "
+        "frame from an explicit column list, so the field has to be in that list "
+        "as well as in the trade dict")
+    trade = res.trades.iloc[0]
+    assert int(trade["side"]) == 1, (
+        f"a long trip's side must be +1 (got {trade['side']!r}); the side is only "
+        f"otherwise recoverable by parsing 'symbols' {trade['symbols']!r}")
+
+    # a short: a falling signal, allow_short, flattened at the close
+    falling = [(100.0 - 0.01 * i, 100.2 - 0.01 * i, 99.8 - 0.01 * i,
+                100.0 - 0.01 * i) for i in range(390)]
+    market2, axis2 = _one_symbol_market({"2025-01-02": falling})
+    entry2 = np.zeros(len(axis2), dtype=np.int8)
+    entry2[60] = -1
+    inst2 = Instrument(key="SOXL", legs=(Leg("SOXL", 1, 1.0),), entry_dir=entry2,
+                       exit_now=np.zeros(len(axis2), dtype=np.int8),
+                       valid=market2.valid((Leg("SOXL", 1, 1.0),)))
+    res2 = run_search(market2, {"SOXL": inst2},
+                      simple_cfg(allow_short=True), CostModel.baseline())
+    assert len(res2.trades) == 1
+    short = res2.trades.iloc[0]
+    assert short["symbols"] == "SOXL-", "the short leg is mirrored"
+    assert int(short["side"]) == -1, (
+        f"a short trip's side must be -1 (got {short['side']!r}) — the column "
+        f"must be the position's mirrored side, not the declared leg's +1")
+
+    # a pair: the position's reference side is 0 (legs carry their own signs)
+    bars3 = [(100.0, 100.2, 99.8, 100.0)] * 390
+    m3 = Market({"SOXL": mk_frame({"2025-01-02": bars3}),
+                 "TQQQ": mk_frame({"2025-01-02": bars3})})
+    entry3 = np.zeros(m3.n(), dtype=np.int8)
+    entry3[60] = -1
+    legs3 = (Leg("SOXL", 1, 1.0), Leg("TQQQ", -1, 1.0))
+    inst3 = Instrument(key="SOXL/TQQQ", legs=legs3, entry_dir=entry3,
+                       exit_now=np.full(m3.n(), 2, dtype=np.int8),
+                       valid=m3.valid(legs3), kind="pair")
+    res3 = run_search(m3, {"SOXL/TQQQ": inst3},
+                      simple_cfg(max_positions=2, allow_short=True),
+                      CostModel.baseline())
+    assert int(res3.trades.iloc[0]["side"]) == 0, (
+        "a pair's reference side is 0 — its legs' mirrored sides live in "
+        "leg_detail; inventing a non-zero pair side would misprice every exit")
+
+
 def test_a_signal_is_never_filled_across_the_overnight_gap():
     bars = [(100.0, 100.05, 99.95, 100.0)] * 21
     market, axis = _one_symbol_market({"2025-01-02": bars, "2025-01-03": bars})

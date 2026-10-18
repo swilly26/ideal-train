@@ -645,6 +645,16 @@ class SearchReplay:
             "instrument": key,
             "symbols": ",".join(f"{l.symbol}{'+' if l.side > 0 else '-'}" for l in pos.legs),
             "legs": len(pos.legs),
+            #: L14 (RULING L19-B, spec §2 I5): the trip's **side** as a column,
+            #: not a string to be parsed out of ``symbols``/``leg_detail``.
+            #: ``side`` is the *position's* reference side (``_OpenPos.side``):
+            #: +1 long, -1 short, and 0 for a pair, whose legs carry their own
+            #: mirrored signs.  Round 2 is single-leg only, so the judge and
+            #: R3-6.1's per-trip benchmark rows always read +1/-1.  Same
+            #: producer contract as ``signal_time`` (L19.11): the frame builds
+            #: strictly from :meth:`_trades_df`'s explicit list, so the key is
+            #: not enough on its own.
+            "side": pos.side,
             "notional": pos.notional,
             "gross_notional": gross_notional,
             "net_outlay": net_outlay,
@@ -916,7 +926,8 @@ class SearchReplay:
 
     # ── result assembly ────────────────────────────────────────────────
     def _trades_df(self) -> pd.DataFrame:
-        cols = ["instrument", "symbols", "legs", "notional", "gross_notional",
+        cols = ["instrument", "symbols", "legs", "side", "notional",
+                "gross_notional",
                 "net_outlay", "entry_time", "signal_time",
                 "exit_time", "entry_price", "exit_price", "hold_minutes",
                 "exit_reason", "pnl_gross", "slip_drag", "fees",

@@ -1,0 +1,64 @@
+L14's OTHER HALF (spec §2 I5, R3-6.1; ruled L19-B) — the trip table's `side`
+column.  `side` was encoded ONLY inside `symbols` (`"SOXL-"`) and `leg_detail`
+(`"0|SOXL|-1|12.5|..."`), both strings a reader has to parse; the spec names
+`side` as a mandatory, gating column.  pytest,
+tests/test_strategy_search_engine.py::test_the_trip_table_carries_the_side_as_a_column.
+
+Run from wt-r2 with the new test present and the engine at its PRE-change state:
+src/backtesting/strategy_search/engine.py `_close`'s trade dict has no `"side"`
+key and `SearchReplay._trades_df`'s explicit column list has no `"side"`.  The
+test fails at the *column* assertion, which is the point: the frame builds
+strictly from that list, so a field that is not in it is silently dropped even
+when the trade dict carries it (the same trap L19.11's `signal_time` was caught
+by).
+
+Command (run from the tree under test, live stack verified down by pgrep before
+and after — 0 processes; containment reported 0 refusals / 0 strays / 0
+live-stack processes):
+cd /home/team/shared/wt-r2 && WATCHDOG_SCRIPT="$PWD/watchdog.sh" \
+  SUPERVISE_SCRIPT="$PWD/scripts/supervise_traders.sh" nice -n 19 \
+  /home/team/shared/engine/.venv/bin/python -m pytest \
+  tests/test_strategy_search_engine.py -q --no-header --tb=line -k side_as_a_column
+
+--- output (1 failed, 25 deselected, rc=1) ---
+F                                                                        [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+E   AssertionError: the trip table has no side column (L14/L19-B): _trades_df builds the frame from an explicit column list, so the field has to be in that list as well as in the trade dict
+    assert 'side' in Index(['instrument', 'symbols', 'legs', 'notional', 'gross_notional',
+       'net_outlay', 'entry_time', 'signal_time'...er_costs',
+       'identity_check', 'identity_residual', 'leg_detail', 'ret_pct',
+       'net_bps'],
+      dtype='str')
+     +  where Index([... same 24 columns ...]) =   instrument symbols  ...  ret_pct  net_bps
+0       SOXL   SOXL+  ...  -0.0004  -3.9992
+
+[1 rows x 24 columns].columns
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_engine.py::test_the_trip_table_carries_the_side_as_a_column - AssertionError: the trip table has no side column (L14/L19-B): _trades_df builds the frame from an explicit column list, so the field has to be in that list as well as in the trade dict
+1 failed, 25 deselected in 0.20s
+rc=1
+
+--- post-change output (1 passed, 25 deselected, rc=0) ---
+.                                                                        [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+1 passed, 25 deselected in 0.15s
+rc=0
+
+--- the change (three writes, all in src/backtesting/strategy_search/engine.py) ---
+1. `_close`'s trade dict gains `"side": pos.side` beside `"legs"` (the
+   position's reference side: +1 long, -1 short, 0 for a pair — `_OpenPos.side`).
+2. `SearchReplay._trades_df`'s explicit column list gains `"side"` (after
+   `"legs"`), so the frame actually carries it; the frame is built strictly from
+   that list, which is why one write without the other is invisible.
+3. A comment at the trade-dict key names the producer contract.
+
+No downstream consumer breaks: `replay_legs`/`reconcile_zero_cost` read
+`leg_detail` and named columns; no test in the tree pins the search engine's
+full column list (only the *scalpset* engine's `TRADE_COLUMNS` is pinned, by
+tests/test_scalpset_engine.py, a different engine).  `_trim` read no column
+list.  The pair case (side 0) is asserted too, so the column cannot silently
+become "the declared leg's +1" — a pair's legs carry their own mirrored signs
+and inventing a non-zero pair side would misprice every exit.

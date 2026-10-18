@@ -352,6 +352,27 @@ ROUND2_Z_BAR = 3.196
 ROUND2_BREADTH_COST = ROUND2_BASE_COST
 #: L1: round 2's kill runs on either window — the stage-1 W1-only rule does not.
 ROUND2_KILL_WINDOWS: tuple[str, ...] = ROUND2_WINDOWS
+#: L19.8 / L19-S: the **declared** session-block bootstrap.  These three are the
+#: literals the pre-registration pins (§4's ``Statistic`` line); they are declared
+#: here so :func:`session_block_lower_bound` cannot drift from them, and they are
+#: the *only* place the round-2 bootstrap reads a number.  L19.14: nothing in L19
+#: changes any of them — a percentile, a seed and a resample count are part of the
+#: verdict and may not be re-chosen after a P&L number is seen.
+ROUND2_BOOTSTRAP_SEED = 20260930
+ROUND2_BOOTSTRAP_RESAMPLES = 4000
+#: The decision number is the **empirical** 0.0694th percentile of the bootstrap
+#: draws (alpha/2N = 6.944e-4 at N = 36).  :data:`ROUND2_Z_BAR` = 3.196 is the
+#: normal-approximation *reference* for the same bar and is **never applied** by
+#: the judge (C7) — the two must not be conflated in the report.
+ROUND2_HEADLINE_PERCENTILE = 0.0694
+#: L19.9 / C6: ``B`` (the number of distinct entry-date blocks) is a **recorded
+#: diagnostic**, not a gate.  3 and ``N / 4`` bound the bootstrap's *block count*
+#: (not fold breadth — that is R3-6.2/R3-6.3's business), they are inert as
+#: conditions, and no verdict path may read them.  ``B`` is recorded per (cell,
+#: window) and reported; if a future re-pin lets ``B`` fall, the bootstrap
+#: degenerates toward the sample mean and *that is stated in the report* rather
+#: than policed by a fifth gate.
+ROUND2_B_ANNOTATIONS: tuple[int, ...] = (3, ROUND2_N_CONFIGS // 4)
 #: L16: the blocks every round-2 base record must carry, as the gate docs name
 #: them (R3-6.1 benchmark, R3-6.2 fat_tail, R3-6.3 concentration).  The headline
 #: statistic's own fields (L2) are record fields, not a block, and are the next
@@ -755,6 +776,104 @@ def assert_benchmark_paired_identity(block: Mapping) -> None:
         f"{config_trips:g}; "
         f"paired_trips+benchmark_unpriced==benchmark_trips is {paired:g}+"
         f"{unpriced:g} vs {benchmark_trips:g} (L19.7; both checked to 1e-9)")
+
+
+# ── the headline statistic's producer (L19.8) ──────────────────────────
+def _bootstrap_trip_frame(trades) -> "object":
+    """The trip table as a frame with the three columns the bootstrap reads.
+
+    Accepts the same two shapes :func:`_trip_column` accepts — the engine's own
+    trip frame (``SearchResult.trades``) and its JSON projection (the
+    ``trip_table`` of a per-run record file) — so persisted and in-process
+    numbers come from one function rather than two.
+    """
+    import pandas as _pd
+    if hasattr(trades, "columns"):
+        frame = trades
+    else:
+        rows = list(trades)
+        frame = _pd.DataFrame(rows)
+    missing = [c for c in ("entry_time", "notional", "pnl_after_costs")
+               if c not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"the trip table cannot produce the session-block bootstrap: it has "
+            f"no {', '.join(missing)} (L19.8 reads entry_time, notional and "
+            f"pnl_after_costs, the same three the trip frame carries)")
+    return frame
+
+
+def session_block_lower_bound(trades, seed: int = ROUND2_BOOTSTRAP_SEED,
+                              resamples: int = ROUND2_BOOTSTRAP_RESAMPLES
+                              ) -> tuple[float, int]:
+    """The round-2 headline: the 0.0694th percentile of the session-block
+    bootstrap of mean net bps/trip, and ``B``, the number of blocks (L19.8/L19.9).
+
+    **Pinned by its CALL SEQUENCE, not by four literals** (L19.8).  Two
+    implementations that agree on seed, percentile and resample count but differ
+    on any of the five points below return different lower bounds, and the
+    difference is material whenever sessions differ in trip count.  The sequence,
+    in order:
+
+    (a) each trip's **block** is its entry date, ``entry_time.date()``;
+    (b) the blocks are ordered **ascending by date** (``DataFrame.groupby``'s
+        default sort — *not* first appearance in the frame, which is what
+        ``Series.unique()`` would give and is a different draw);
+    (c) ``rng = numpy.random.default_rng(seed)`` — **one** stream, seeded once;
+    (d) per resample, ``idx = rng.integers(0, n_blocks, n_blocks)`` and the
+        drawn sessions' trips are concatenated **in draw order**;
+    (e) the statistic is the mean of ``net_bps`` over the **concatenated trips** —
+        i.e. a trip-weighted mean — *not* the mean of the drawn sessions' means;
+    (f) that draw is repeated ``resamples`` times and **no other number is drawn
+        from the stream**;
+    (g) the decision number is the ``ROUND2_HEADLINE_PERCENTILE``-th percentile of
+        the **empirical draws**.  ``ROUND2_Z_BAR`` is a normal-approximation
+        *reference* for the same bar and is not applied here or by any gate (C7).
+
+    This is a **verbatim port** of the block half of
+    ``scripts/run_strategy_search_stage2.py::bootstrap`` — the same key, the same
+    groupby order, the same single seeded ``default_rng``, the same
+    ``integers(0, len(by_day), len(by_day))`` draw and the same
+    ``np.concatenate([...]).mean()`` statistic — so stage 2's published block
+    numbers stay re-derivable from round 2's own code.  Two deliberate
+    differences, both stated rather than implicit:
+
+    * stage 2 draws a second, i.i.d. ``rng.choice`` cross-check from the **same**
+      stream; that draw is **not** ported.  Every block draw is therefore the
+      first ``resamples`` draws of the stream, exactly as in stage 2's block half,
+      and a future caller that re-adds the i.i.d. draw must state that its order
+      now depends on it;
+    * ``np.percentile(blocks, 0.0694)`` replaces stage 2's ``percentile(_, 2.5)``
+      — the 2.5th percentile is ~36x looser (finding 3 / L2) and is not the
+      round-2 bar.
+
+    Returns ``(lower_bound, B)``.  ``B`` is the number of **distinct entry-date
+    blocks**, recorded per (cell, window) as a diagnostic (L19.9); no gate reads
+    it.  It degenerates toward the sample mean as ``B`` falls.
+    """
+    import numpy as _np
+    import pandas as _pd
+    frame = _bootstrap_trip_frame(trades)
+    if len(frame) == 0:
+        raise ValueError(
+            "the session-block bootstrap needs at least one trip (L19.8); this "
+            "trip table is empty, so the headline has no denominator at all")
+    day = _pd.to_datetime(frame["entry_time"]).dt.strftime("%Y-%m-%d")
+    bps = frame["pnl_after_costs"] / frame["notional"] * 1e4
+    # (b): groupby's default sort is ascending by date — the block order the draw
+    # uses.  `Series.unique()` would give first-appearance order instead.
+    by_day = [g.to_numpy()
+              for _, g in _pd.DataFrame({"day": day, "bps": bps}).groupby("day")]
+    n_blocks = len(by_day)
+    if n_blocks < 1:
+        raise ValueError("the session-block bootstrap found no entry-date block")
+    rng = _np.random.default_rng(seed)                       # (c): one stream
+    blocks = _np.empty(int(resamples), dtype=float)
+    for i in range(int(resamples)):
+        idx = rng.integers(0, n_blocks, n_blocks)            # (d)
+        blocks[i] = _np.concatenate([by_day[j] for j in idx]).mean()   # (e)
+    lower = float(_np.percentile(blocks, ROUND2_HEADLINE_PERCENTILE))  # (g)
+    return lower, n_blocks
 
 
 # ── the round-2 declared grid, by value ────────────────────────────────
