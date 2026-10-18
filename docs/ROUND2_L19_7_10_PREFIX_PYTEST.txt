@@ -1,0 +1,77 @@
+L19.7 + L19.10 (the step-2 preconditions, the two benchmark identities, and the
+benchmark block's own per-trip rows) — pytest, tests/test_strategy_search_round2_l19.py.
+
+Run from wt-r2 with the new tests present and **no implementation**: the tree is
+at the pre-change screen.py, so ``screen.round2_preconditions``,
+``screen.assert_benchmark_paired_identity``, ``screen.BenchmarkIdentityError``
+and the benchmark block's ``per_trip`` key do not exist yet.  Every test is
+failing-first; the one that does not raise ``AttributeError`` is the key-list
+test, which fails on the missing ``per_trip`` key (asserted by value).
+
+Command (run from the tree under test, live stack verified down by pgrep before
+and after — 0 processes; containment reported 0 refusals / 0 strays / 0
+live-stack processes):
+cd /home/team/shared/wt-r2 && WATCHDOG_SCRIPT="$PWD/watchdog.sh" \
+  SUPERVISE_SCRIPT="$PWD/scripts/supervise_traders.sh" nice -n 19 \
+  /home/team/shared/engine/.venv/bin/python -m pytest \
+  tests/test_strategy_search_round2_l19.py -q --no-header --tb=line \
+  -k "step_2_preconditions or paired_floor or paired_identity or identity_is_checked or per_trip_rows"
+
+--- output (16 failed, 35 deselected, rc=1) ---
+FFFFFFFFFFFFFFFF                                                         [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:476: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:522: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:542: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'assert_benchmark_paired_identity'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:555: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'assert_benchmark_paired_identity'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'BenchmarkIdentityError'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:574: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'BenchmarkIdentityError'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'BenchmarkIdentityError'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:574: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'BenchmarkIdentityError'
+E   AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'assert_benchmark_paired_identity'
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:580: AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'assert_benchmark_paired_identity'
+E   AssertionError: the benchmark block must carry its own per-trip rows (entry_time, qty, y_i, symbol, side) or F10's 'no drift' claim has nothing to check (L19.10)
+    assert 'per_trip' in ('variant', 'source', 'eod_flat_min', 'entry_convention', 'exit_convention', 'cost_label', ...)
+/home/team/shared/wt-r2/tests/test_strategy_search_round2_l19.py:600: AssertionError: the benchmark block must carry its own per-trip rows (entry_time, qty, y_i, symbol, side) or F10's 'no drift' claim has nothing to check (L19.10)
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_accept_a_record_that_violates_none - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[trips_floor] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[legs] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[notional] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[caps0] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[caps1] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[caps2] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[paired_floor0] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[paired_floor1] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[trip_table] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_the_paired_floor_is_the_only_precondition_that_stays_a_headline_failure - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_preconditions'
+FAILED tests/test_strategy_search_round2_l19.py::test_the_paired_identity_accepts_an_identity_that_holds - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'assert_benchmark_paired_identity'
+FAILED tests/test_strategy_search_round2_l19.py::test_the_paired_identity_can_fail_on_either_identity[block0-benchmark_trips==config_trips] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'BenchmarkIdentityError'
+FAILED tests/test_strategy_search_round2_l19.py::test_the_paired_identity_can_fail_on_either_identity[block1-paired_trips+benchmark_unpriced==benchmark_trips] - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'BenchmarkIdentityError'
+FAILED tests/test_strategy_search_round2_l19.py::test_the_identity_is_checked_to_1e_9_and_not_by_equality - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'assert_benchmark_paired_identity'
+FAILED tests/test_strategy_search_round2_l19.py::test_the_benchmark_block_declares_the_per_trip_rows_it_compares - AssertionError: the benchmark block must carry its own per-trip rows (entry_time, qty, y_i, symbol, side) or F10's 'no drift' claim has nothing to check (L19.10)
+assert 'per_trip' in ('variant', 'source', 'eod_flat_min', 'entry_convention', 'exit_convention', 'cost_label', ...)
+16 failed, 35 deselected in 0.22s
+rc=1

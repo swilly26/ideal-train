@@ -371,7 +371,7 @@ ROUND2_GATE_BLOCK_KEYS: Mapping[str, tuple[str, ...]] = {
         "config_net_bps_per_trip", "benchmark_net_bps_per_trip", "delta_bps",
         "delta_lower_bound_p0.0694", "delta_resamples", "delta_seed",
         "config_cost_drag_per_trip_bps", "benchmark_cost_drag_per_trip_bps",
-        "benchmark_fills_per_trip", "pass", "why", "per_symbol",
+        "benchmark_fills_per_trip", "pass", "why", "per_symbol", "per_trip",
     ),
     "fat_tail": (
         "version", "window", "config_name_resolved", "resolved_hash", "sizing",
@@ -589,6 +589,172 @@ def assert_gate_blocks_present(record: Mapping,
         f"{'; '.join(problems)} (L16/L19.3, required blocks {tuple(gates)}) — a "
         f"gate that was never written, or written empty, cannot be scored, and "
         f"the run-set assertion does not check it")
+
+
+# ── L19.7: step 2 (the shared fail-closed preconditions), executable ─────
+#: The key under which the per-(cell, window) **trip table** (L4) reaches the
+#: judge.  Step 2's ``legs == 1 ∀i`` and ``|notional_i / notional_usd − 1| < 1e-6
+#: ∀i`` are statements about *trips*, so they are not readable from the aggregate
+#: record: the judge hands the table in here, as either the engine's own trip
+#: frame (a ``DataFrame`` with ``legs``/``notional`` columns) or its JSON
+#: projection (a sequence of mappings with those keys).
+ROUND2_TRIP_TABLE_KEY = "trip_table"
+
+
+class BenchmarkIdentityError(RuntimeError):
+    """A benchmark block's two trip-count identities do not hold (L19.7).
+
+    The identities are ``benchmark_trips == config_trips`` (``benchmark_trips``
+    is the **generated** count) and
+    ``paired_trips + benchmark_unpriced == benchmark_trips``.  L19.7 replaces
+    L13's ``benchmark_trips + benchmark_unpriced == config_trips``, which made a
+    generated count out of a paired one and left the paired floor inside the
+    benchmark gate.
+    """
+
+
+def _trip_column(table, column: str):
+    """One column of the trip table in either accepted shape; ``None`` if absent.
+
+    Accepting two shapes is not tolerance for its own sake: the round-2 judge
+    reads the **per-run record files** (L19-S implementation notes), where the
+    table has been through JSON, while the same helper is called in-process
+    against the engine's own frame.  Both are the same table.
+    """
+    if table is None:
+        return None
+    if hasattr(table, "columns"):                       # the engine's trip frame
+        if column not in table.columns:
+            return None
+        return list(table[column])
+    if isinstance(table, (str, bytes)) or not isinstance(table, Iterable):
+        return None
+    out = []
+    for row in list(table):
+        if not isinstance(row, Mapping) or column not in row:
+            return None
+        out.append(row[column])
+    return out
+
+
+def _same_number(a, b) -> bool:
+    """Numeric equality that survives a JSON round trip (``4`` vs ``4.0``)."""
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return False
+
+
+def round2_preconditions(record: Mapping) -> tuple[bool, str]:
+    """Spec §1 step 2 — the shared fail-closed preconditions, in one place (L19.7).
+
+    All conjunctive, all computed before any gate is read: the 150-trip floor on
+    the **generated** count, single-leg trips, uniform notional, the caps in
+    force equal to the pinned caps, and the paired-subset floor (L19.7's move: it
+    is a step-2 precondition so a cell can no longer be either
+    ``headline_rejected`` or "fails closed" depending on the reader).
+
+    Returns ``(ok, why)``.  ``why`` is ``"ok"`` when the record passes and
+    otherwise **starts with the slug of the precondition that refused it**, so
+    the judge's bucket pass reads the verdict off the reason instead of
+    re-deriving it:
+
+    * ``trips_floor`` / ``trip_table`` / ``legs`` / ``notional`` / ``caps`` — a
+      precondition mismatch: the cell refuses a verdict (``not_evaluated``), one
+      spelling (C2);
+    * ``paired_floor`` — ``config_trips >= 150`` with ``paired_trips < 150`` — the
+      cell is ``headline_rejected``, unambiguously (L19.7 / C10).  The floor is
+      read from *this* record's benchmark block, i.e. at each gating level.
+
+    It **evaluates no gate**: what it reads is either :data:`POWER_FLOOR` or a
+    pinned literal.
+    """
+    trips = int(record.get("trips", 0) or 0)
+    if trips < POWER_FLOOR:
+        return False, f"trips_floor: trips {trips} < {POWER_FLOOR}"
+    table = record.get(ROUND2_TRIP_TABLE_KEY)
+    legs = _trip_column(table, "legs")
+    if legs is None:
+        return False, (f"trip_table: no per-trip 'legs' column (the L4 trip table "
+                       f"is handed in under {ROUND2_TRIP_TABLE_KEY!r})")
+    for i, n in enumerate(legs):
+        if int(n) != 1:
+            return False, (f"legs: trip {i} has {int(n)} legs — round 2 is "
+                           f"single-leg only (R3-6.1 §2.7)")
+    notional = _trip_column(table, "notional")
+    if notional is None:
+        return False, (f"trip_table: no per-trip 'notional' column (the L4 trip "
+                       f"table is handed in under {ROUND2_TRIP_TABLE_KEY!r})")
+    from src.backtesting.strategy_search import families as _families
+    # The reference is the pinned literal: the caps check below requires the run's
+    # own notional_usd to equal it, so this cannot disagree with the run.
+    ref = float(_families.R2_CAPS["notional_usd"])
+    for i, n in enumerate(notional):
+        try:
+            uniform = abs(float(n) / ref - 1.0) < 1e-6
+        except (TypeError, ValueError):
+            uniform = False
+        if not uniform:
+            return False, (f"notional: trip {i} notional {n!r} — "
+                           f"|notional_i/notional_usd - 1| must be < 1e-6 at "
+                           f"notional_usd {ref:g}")
+    params = record.get("config_params")
+    if not isinstance(params, Mapping):
+        return False, ("caps: the record carries no 'config_params', so the caps "
+                       "in force cannot be read — refuse a verdict rather than "
+                       "score a run whose caps are unknown")
+    wrong = [k for k, v in _families.R2_CAPS.items()
+             if k not in params or not _same_number(params[k], v)]
+    if wrong:
+        return False, (f"caps: {', '.join(sorted(wrong))} do not equal the pinned "
+                       f"caps {dict(_families.R2_CAPS)}")
+    block = record.get("benchmark")
+    if not isinstance(block, Mapping) or "paired_trips" not in block:
+        return False, ("paired_floor: the record carries no benchmark block with "
+                       "paired_trips — the paired floor is a step-2 precondition "
+                       "(L19.7), so an absent block cannot be left to the gate")
+    paired = float(block["paired_trips"])
+    if paired < POWER_FLOOR:
+        return False, (f"paired_floor: paired_trips {paired:g} < {POWER_FLOOR} "
+                       f"with config_trips {trips} >= {POWER_FLOOR} → "
+                       f"headline_rejected (L19.7)")
+    return True, "ok"
+
+
+def assert_benchmark_paired_identity(block: Mapping) -> None:
+    """Both benchmark trip-count identities hold, **to 1e-9** (L19.7).
+
+    ``benchmark_trips == config_trips`` — the benchmark's trip count is the
+    **generated** count, one benchmark trip per realised config trip (R3-6.1
+    §2.4); and ``paired_trips + benchmark_unpriced == benchmark_trips`` — the
+    unpriceable-EOD trips are *inside* the generated count, not extra (§2.7).
+    This is what L19.7 puts in place of L13's
+    ``benchmark_trips + benchmark_unpriced == config_trips``.
+
+    Called from the judge **before any ``delta_bps`` is read**: a block whose
+    counts do not close cannot be scored, and a silently mismatched pair makes
+    every gate number read off it incomparable with the trip table it claims to
+    describe.
+    """
+    missing = [k for k in ("config_trips", "benchmark_trips", "paired_trips",
+                           "benchmark_unpriced") if k not in block]
+    if missing:
+        raise BenchmarkIdentityError(
+            f"the benchmark block carries no {', '.join(missing)}, so neither "
+            f"identity is checkable (L19.7)")
+    config_trips = float(block["config_trips"])
+    benchmark_trips = float(block["benchmark_trips"])
+    paired = float(block["paired_trips"])
+    unpriced = float(block["benchmark_unpriced"])
+    if (abs(benchmark_trips - config_trips) <= 1e-9
+            and abs((paired + unpriced) - benchmark_trips) <= 1e-9):
+        return
+    raise BenchmarkIdentityError(
+        f"the benchmark block's trip counts do not close: "
+        f"benchmark_trips==config_trips is {benchmark_trips:g} vs "
+        f"{config_trips:g}; "
+        f"paired_trips+benchmark_unpriced==benchmark_trips is {paired:g}+"
+        f"{unpriced:g} vs {benchmark_trips:g} (L19.7; both checked to 1e-9)")
 
 
 # ── the round-2 declared grid, by value ────────────────────────────────

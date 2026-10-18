@@ -45,9 +45,12 @@ not a pre-change run — ``docs/ROUND2_VACUITY_MUTATIONS.txt``.
 from __future__ import annotations
 
 import ast
+import inspect
+import re
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -174,12 +177,15 @@ GATE_BLOCK_CRITICAL_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 #: The full key count of each block, hand-verified against the same doc lines
-#: (``R3-6.1.md:73`` 24, ``R3-6.2.md:92`` 34, ``R3-6.3.md:92`` 27 — the audit's own
-#: count).  A *dropped non-critical* key is invisible to the critical-key pin above
-#: and invisible to the implementation-vs-itself comparison, so the count is pinned
-#: too: the key lists are the gate contract and may only change with their docs.
+#: (``R3-6.1.md:73`` 25 after L19.10's ``per_trip``, ``R3-6.2.md:92`` 34,
+#: ``R3-6.3.md:92`` 27 — the audit's own count, plus C5's one added key).  A
+#: *dropped non-critical* key is invisible to the critical-key pin above and
+#: invisible to the implementation-vs-itself comparison, so the count is pinned
+#: too: the key lists are the gate contract and may only change with their docs —
+#: which is why C5 moves this literal, R3-6.1 §4's field list and
+#: ``screen.ROUND2_GATE_BLOCK_KEYS`` in **one** commit.
 GATE_BLOCK_KEY_COUNTS: dict[str, int] = {
-    "benchmark": 24, "fat_tail": 34, "concentration": 27}
+    "benchmark": 25, "fat_tail": 34, "concentration": 27}
 
 
 def gate_record(**blocks) -> dict:
@@ -436,3 +442,206 @@ def test_trim_keeps_every_field_the_judge_reads(field):
         f"_trim drops {field!r}: the judge's step-5/6/8 inputs must survive into "
         f"the persisted screen artefact (L19.5)")
     assert trimmed[field] == {"sentinel": True}
+
+
+# ── L19.7: step 2 becomes executable, one name per number ──────────────
+def step2_record(**kw) -> dict:
+    """A record that violates **no** step-2 precondition (L19.7).
+
+    It carries the three things step 2 reads besides the trip count: the caps in
+    force (``config_params``, the run's own config — the concentration block's
+    ``caps`` field is the gate doc's publication of the same five literals), the
+    trip table (L4) whose per-trip ``legs``/``notional`` the two ∀i statements
+    are about, and the benchmark block's trip counts.
+    """
+    trips = int(kw.pop("trips", 200))
+    notional = families.R2_CAPS["notional_usd"]
+    out = {
+        "family": "X", "cell_id": "a", "config": "a", "window": "W1",
+        "cost_label": "baseline", "sizing": "fixed_notional",
+        "identity_key": "X|a|a|W1|baseline|fixed_notional",
+        "trips": trips,
+        "notional_usd": notional,
+        "config_params": dict(families.R2_CAPS),
+        "trip_table": [{"legs": 1, "notional": notional} for _ in range(trips)],
+        "benchmark": {"config_trips": trips, "benchmark_trips": trips,
+                      "paired_trips": trips, "benchmark_unpriced": 0},
+    }
+    out.update(kw)
+    return out
+
+
+def test_step_2_preconditions_accept_a_record_that_violates_none():
+    """The positive control on the accepting side: a clean record passes.
+
+    Without this, a helper that returned ``False`` for everything would satisfy
+    every rejection test below while making step 2 unevaluable — the vacuity the
+    audit keeps finding.  ``why`` is the declared one-spelling ``"ok"``.
+    """
+    ok, why = screen.round2_preconditions(step2_record())
+    assert ok is True, f"a record violating no precondition must pass, got {why!r}"
+    assert why == "ok", (
+        "the accepting reason is one spelling, 'ok' — the judge reads it, so a "
+        "second spelling would fork the contract")
+
+
+def _trip_table(*notionals: float, legs: tuple = ()) -> list:
+    notional = families.R2_CAPS["notional_usd"]
+    return [{"legs": legs[i] if i < len(legs) else 1,
+             "notional": notionals[i]} for i in range(len(notionals))]
+
+
+#: ``(mutation, expected reason slug)``.  Each mutation breaks **exactly one**
+#: precondition, and the slug names which — the judge maps the slug to the bucket
+#: (C2: the ``not_evaluated`` preconditions; C10/L19.7: the paired floor, which is
+#: ``headline_rejected``), so a single wrong slug is a wrong verdict bucket.
+STEP2_VIOLATIONS = [
+    ({"trips": 149}, "trips_floor"),
+    ({"trip_table": _trip_table(*([families.R2_CAPS["notional_usd"]] * 150),
+                                legs=(1,) * 10 + (2,) + (1,) * 139)}, "legs"),
+    ({"trip_table": _trip_table(*([families.R2_CAPS["notional_usd"]] * 150
+                                  + [families.R2_CAPS["notional_usd"] + 1.0]))},
+     "notional"),
+    ({"config_params": {**families.R2_CAPS, "max_positions": 2}}, "caps"),
+    ({"config_params": {k: v for k, v in families.R2_CAPS.items()
+                        if k != "notional_usd"}}, "caps"),
+    ({"config_params": None}, "caps"),
+    ({"benchmark": {"config_trips": 200, "benchmark_trips": 200,
+                    "paired_trips": 149, "benchmark_unpriced": 51}}, "paired_floor"),
+    ({"benchmark": None}, "paired_floor"),
+    ({"trip_table": None}, "trip_table"),
+]
+
+
+@pytest.mark.parametrize("mutation,slug", STEP2_VIOLATIONS,
+                         ids=[s for _m, s in STEP2_VIOLATIONS])
+def test_step_2_preconditions_can_fail_on_every_declared_precondition(
+        mutation, slug):
+    """Every precondition bites, and the reason names which one (L19.7).
+
+    This is the *positive control that the helper can fail*: one record per
+    precondition, each violating only that one, each asserted to be refused with
+    its own slug.  A helper that always returned True fails every case here; one
+    that always returned False fails the accepting test above.
+    """
+    ok, why = screen.round2_preconditions(step2_record(**mutation))
+    assert ok is False, (
+        f"the mutation {mutation!r} violates {slug!r} and must be refused "
+        f"(L19.7: step 2 is the one place 'refuse a verdict' happens), got {why!r}")
+    assert why.startswith(slug), (
+        f"the refusal must name the precondition it is about: expected the slug "
+        f"{slug!r} first, got {why!r} — the judge buckets on that slug, so an "
+        f"unrelated reason is a mis-bucketed cell")
+
+
+def test_the_paired_floor_is_the_only_precondition_that_stays_a_headline_failure():
+    """``config_trips >= 150`` with ``paired_trips < 150`` is ``headline_rejected``.
+
+    L19.7 settles L13's bucket ambiguity: the paired-subset shortfall is a
+    *headline* failure (the floor moved into step 2), while every other
+    precondition mismatch is a precondition mismatch and refuses a verdict.  The
+    two are one slug apart in this helper, and the judge's bucket pass reads
+    exactly that slug, so this pins the distinction where it is decidable — in
+    the helper — rather than in prose.
+    """
+    ok, why = screen.round2_preconditions(
+        step2_record(benchmark={"config_trips": 200, "benchmark_trips": 200,
+                                "paired_trips": 40, "benchmark_unpriced": 160}))
+    assert ok is False and why.startswith("paired_floor")
+    # and the headline count itself is still the generated count (L19.7):
+    assert screen.round2_preconditions(step2_record(trips=200))[0] is True
+
+
+# ── L19.7: the two benchmark identities, asserted before any delta is read ─
+def test_the_paired_identity_accepts_an_identity_that_holds():
+    """The positive control: ``benchmark_trips == config_trips`` and
+    ``paired_trips + benchmark_unpriced == benchmark_trips`` (L19.7, replacing
+    L13's ``benchmark_trips + benchmark_unpriced == config_trips``)."""
+    screen.assert_benchmark_paired_identity(
+        {"config_trips": 200, "benchmark_trips": 200,
+         "paired_trips": 197, "benchmark_unpriced": 3})       # no raise
+
+
+@pytest.mark.parametrize("block,broken", [
+    ({"config_trips": 200, "benchmark_trips": 199,
+      "paired_trips": 199, "benchmark_unpriced": 0}, "benchmark_trips==config_trips"),
+    ({"config_trips": 200, "benchmark_trips": 200,
+      "paired_trips": 197, "benchmark_unpriced": 4},
+     "paired_trips+benchmark_unpriced==benchmark_trips"),
+])
+def test_the_paired_identity_can_fail_on_either_identity(block, broken):
+    """Each identity bites **independently** — one broken identity per case.
+
+    Two identities folded into one check would pass a record that satisfies
+    their sum while failing the count they are both about, which is the failure
+    mode the L13/L19.7 rewrite exists to remove.
+    """
+    with pytest.raises(screen.BenchmarkIdentityError, match=re.escape(broken)):
+        screen.assert_benchmark_paired_identity(block)
+
+
+def test_the_identity_is_checked_to_1e_9_and_not_by_equality():
+    """A float round-trip must not fail the identity (L19.7: ``to 1e-9``)."""
+    screen.assert_benchmark_paired_identity(
+        {"config_trips": 200.0, "benchmark_trips": 200.0 + 1e-12,
+         "paired_trips": 200.0 - 1e-12, "benchmark_unpriced": 1e-12})  # no raise
+    with pytest.raises(screen.BenchmarkIdentityError):
+        screen.assert_benchmark_paired_identity(
+            {"config_trips": 200.0, "benchmark_trips": 200.0 + 1e-6,
+             "paired_trips": 200.0 - 1e-6, "benchmark_unpriced": 1e-6})
+
+
+# ── L19.10: the benchmark block carries its own per-trip rows ──────────
+def test_the_benchmark_block_declares_the_per_trip_rows_it_compares():
+    """``per_trip`` is a declared key of the benchmark block (L19.10, C5).
+
+    The block's per-trip equality (F10) is only checkable if the rows it compares
+    are *in the block*: the rows come from the same builder that produces
+    ``delta_bps``, so ``mean(y_i)`` cannot drift from the published
+    ``benchmark_net_bps_per_trip``.  The key list is the gate contract, which is
+    why its count is pinned next to this (24 -> 25) in the same commit.
+    """
+    required = screen.ROUND2_GATE_BLOCK_KEYS["benchmark"]
+    assert "per_trip" in required, (
+        "the benchmark block must carry its own per-trip rows (entry_time, qty, "
+        "y_i, symbol, side) or F10's 'no drift' claim has nothing to check (L19.10)")
+    assert len(required) == GATE_BLOCK_KEY_COUNTS["benchmark"] == 25, (
+        "adding per_trip moves the pinned count with it, in one commit (C5)")
+
+
+def test_the_step_2_trip_table_is_accepted_in_the_engines_own_frame_shape():
+    """The trip table is the engine's frame in-process and JSON on disk (L19.7).
+
+    ``round2_preconditions`` is called by the judge against the persisted record
+    and, in the engine's own path, against ``res.trades`` itself.  A helper that
+    only understood one of the two shapes would silently refuse every verdict on
+    the other path — the "cannot be evaluated" failure this precondition exists
+    to make loud.
+    """
+    trips = 200
+    frame = pd.DataFrame({"legs": [1] * trips,
+                          "notional": [families.R2_CAPS["notional_usd"]] * trips})
+    ok, why = screen.round2_preconditions(step2_record(trip_table=frame))
+    assert ok is True, f"the engine's own trip frame must be accepted, got {why!r}"
+    bad = frame.copy()
+    bad.loc[7, "legs"] = 2
+    ok, why = screen.round2_preconditions(step2_record(trip_table=bad))
+    assert ok is False and why.startswith("legs"), (
+        f"a multi-leg row in the frame shape must still be caught; got {why!r}")
+
+
+def test_the_step_2_preconditions_are_not_wired_into_the_screen_paths_fate():
+    """The judge build consumes them; ``round2_cell_fates`` keeps its injection point.
+
+    Step 2 is *not* wired into the screen's own fate function: doing so would
+    decide the paired floor before the judge's bucket pass exists, and would make
+    the injectable ``fails_on`` contract a second, silent precondition path.  The
+    judge build is what calls :func:`screen.round2_preconditions`.
+    """
+    params = inspect.signature(screen.round2_cell_fates).parameters
+    assert "fails_on" in params, (
+        "round2_cell_fates keeps its injectable fails_on — it is the judge's "
+        "step-2/step-3 conjunction that replaces the default, not this helper")
+    assert "round2_preconditions" not in inspect.getsource(screen.round2_cell_fates)
+    assert "round2_preconditions" not in inspect.getsource(
+        screen.screen_grid_both_windows)
