@@ -1,0 +1,11 @@
+{
+  "blocks": 251,
+  "lower_bound": -13.630576834870187,
+  "p2_5_of_the_same_draws": -9.381813321383438,
+  "percentile": 0.0694,
+  "resamples": 4000,
+  "sample_mean_bps": -2.7354887127316463,
+  "seed": 20260930,
+  "source": "strategy_search/stage2/stage2_trades_W1.csv",
+  "trips": 251
+}

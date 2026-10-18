@@ -862,7 +862,7 @@ def session_block_lower_bound(trades, seed: int = ROUND2_BOOTSTRAP_SEED,
     bps = frame["pnl_after_costs"] / frame["notional"] * 1e4
     # (b): groupby's default sort is ascending by date — the block order the draw
     # uses.  `Series.unique()` would give first-appearance order instead.
-    by_day = [g.to_numpy()
+    by_day = [g["bps"].to_numpy()
               for _, g in _pd.DataFrame({"day": day, "bps": bps}).groupby("day")]
     n_blocks = len(by_day)
     if n_blocks < 1:
@@ -1005,3 +1005,123 @@ def round2_fold_breadth(runs: Mapping[tuple[str, str], Mapping],
             passed.append(cell)
     return {"cells": out, "pass": passed, "cost": ROUND2_BREADTH_COST,
             "windows": list(windows)}
+
+
+# ── L19.6: the verdict vocabulary must be TOTAL ────────────────────────
+#: The **labelling** order (L19.6 / C1).  A cell's bucket is the *first* stage it
+#: fails, in this order — which is **not** the order §1 evaluates the steps in.
+#: Bucket assignment is a second pass, run after every cell is scored (which is
+#: what step 9's neighbour rule needs, since it is not per-record).  C1 keeps the
+#: two orders apart on purpose: conflating them would silently re-order the
+#: filters and change which failure each cell is reported under.
+ROUND2_BUCKET_ORDER: tuple[str, ...] = ("headline", "benchmark", "fat_tail",
+                                        "concentration", "fold_breadth",
+                                        "neighbour")
+#: One name per bucket, derived from :data:`ROUND2_BUCKET_ORDER` so the two
+#: cannot drift: ``headline_rejected``, ``benchmark_rejected``,
+#: ``fat_tail_rejected``, ``concentration_rejected``, ``fold_breadth_rejected``,
+#: ``neighbour_rejected``.  Two of them (fold breadth, neighbour) had no name at
+#: all before L19.6, so a cell that died on one of them was **unbucketed** — the
+#: failure mode the ruling exists to remove.
+ROUND2_BUCKET_NAMES: tuple[str, ...] = tuple(f"{b}_rejected"
+                                             for b in ROUND2_BUCKET_ORDER)
+#: One spelling for a precondition mismatch (C2).  The reason rides in ``why``
+#: (e.g. ``why: "multi_leg"``) — never a second bucket name, and never
+#: ``not_defined_for_multi_leg``, which R3-6.1 §2.7 and R3-6.3 §1/§7 used.
+ROUND2_NOT_EVALUATED = "not_evaluated"
+#: The bucket of a cell that fails no stage.  Every scored cell has exactly one
+#: bucket, dead or alive, so nothing can fall out of the vocabulary.
+ROUND2_ALIVE = "alive"
+#: The stage name a **precondition** result is passed under.  Step 2 is not a
+#: gate (L19.7): it decides *whether the cell can be scored at all*, so it
+#: short-circuits to :data:`ROUND2_NOT_EVALUATED` rather than to a bucket.
+ROUND2_PRECONDITION_STAGE = "preconditions"
+#: Every stage name :func:`round2_bucket` accepts.
+ROUND2_BUCKET_STAGES: tuple[str, ...] = ((ROUND2_PRECONDITION_STAGE,)
+                                        + ROUND2_BUCKET_ORDER)
+
+
+def round2_bucket(cell: str, *per_gate_results) -> tuple[str, str]:
+    """A cell's bucket: the **first** failure in :data:`ROUND2_BUCKET_ORDER` (L19.6).
+
+    ``per_gate_results`` are ``(stage, ok, why)`` triples, one per stage that
+    decided this cell — the three gate blocks' verdicts, the two block-less
+    rules (:func:`round2_fold_breadth`, :func:`round2_neighbour_stage`) and the
+    step-2 :func:`round2_preconditions` result under
+    :data:`ROUND2_PRECONDITION_STAGE`.  Returns ``(bucket, why)``.
+
+    The rules, in order:
+
+    * a **precondition** failure is :data:`ROUND2_NOT_EVALUATED` — the cell
+      refuses a verdict, one spelling, the reason in ``why`` (C2).  It
+      short-circuits: nothing downstream is meaningful, so it is decided first;
+    * otherwise the bucket is the first stage in :data:`ROUND2_BUCKET_ORDER`
+      whose ``ok`` is false, named ``f"{stage}_rejected"``.  With concentration
+      ranked fourth, a cell that fails the benchmark **and** concentration is
+      ``benchmark_rejected`` (the §2 I3 reconciliation) — the earlier stage wins,
+      and the later stages' evidence is still carried in the gate docs' own
+      per-window rejection lists (C9: both verdict shapes are retained);
+    * a cell that fails nothing is :data:`ROUND2_ALIVE`.
+
+    **Total by construction, and fail-closed on incompleteness**: every stage in
+    :data:`ROUND2_BUCKET_STAGES` must be present exactly once.  A missing stage
+    raises rather than quietly bucketing the cell on a partial picture — the
+    "no dead cell is unbucketed" rule applied at the input side too.  The input
+    order is irrelevant: the bucket is decided by :data:`ROUND2_BUCKET_ORDER`,
+    which is the whole point of separating the labelling order from the
+    evaluation sequence (C1).
+
+    ``B`` (L19.9) is **not an input and is never read here**: it is a recorded
+    diagnostic, and no verdict path may be a function of it.
+    """
+    seen: dict[str, tuple[bool, str]] = {}
+    for i, res in enumerate(per_gate_results):
+        try:
+            stage, ok, why = res
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"round2_bucket({cell!r}) takes (stage, ok, why) triples; got "
+                f"{res!r} at position {i}") from None
+        if stage not in ROUND2_BUCKET_STAGES:
+            raise ValueError(
+                f"round2_bucket({cell!r}): {stage!r} is not a bucket stage — the "
+                f"vocabulary is {ROUND2_BUCKET_STAGES} (L19.6, one spelling)")
+        if stage in seen:
+            raise ValueError(
+                f"round2_bucket({cell!r}): {stage!r} was passed twice — two "
+                f"verdicts for one stage is two answers to one question")
+        seen[stage] = (bool(ok), str(why))
+    missing = [s for s in ROUND2_BUCKET_STAGES if s not in seen]
+    if missing:
+        raise ValueError(
+            f"round2_bucket({cell!r}): no verdict for {', '.join(missing)} — a "
+            f"cell cannot be bucketed on a partial picture, and a cell with no "
+            f"bucket is exactly the unbucketed-dead-cell defect L19.6 removes")
+    pre_ok, pre_why = seen[ROUND2_PRECONDITION_STAGE]
+    if not pre_ok:
+        return ROUND2_NOT_EVALUATED, f"{cell}: not evaluated ({pre_why})"
+    for stage in ROUND2_BUCKET_ORDER:
+        ok, why = seen[stage]
+        if not ok:
+            return f"{stage}_rejected", f"{cell}: {stage}_rejected ({why})"
+    return ROUND2_ALIVE, f"{cell}: passes every stage in the declared order"
+
+
+def round2_neighbour_stage(family: str, specs: Sequence[dict], survivor: str,
+                           positive_both: Mapping[str, bool]) -> tuple[bool, str]:
+    """The **wiring point** for the neighbour rule (L19.6).
+
+    :func:`neighbour_cells` and :func:`neighbour_verdict` are pure and were
+    already in the tree, but nothing called them — so the one conjunct that is
+    not per-record had no verdict in the bucket vocabulary, and a cell dying on
+    it was unbucketed.  This adapts the pair into the ``(ok, why)`` shape
+    :func:`round2_bucket` takes, as stage ``"neighbour"``.
+
+    It must be called **after the whole grid is scored** (step 9): the neighbour
+    set is a function of the grid, and ``positive_both`` is read off every peer's
+    both-window records.  Clone cells are excluded from the neighbour set inside
+    :func:`neighbour_cells` (L9/L19.12), and clone discovery changes nothing
+    else about the judge's inputs.
+    """
+    neighbours = neighbour_cells(family, specs, survivor)
+    return neighbour_verdict(neighbours, positive_both)
