@@ -996,3 +996,214 @@ def test_the_port_reproduces_stage2s_published_block_bound_at_p2_5(monkeypatch):
         f"control: the round-2 bar ({round2_bar!r}) and stage 2's 2.5th "
         f"percentile ({port!r}) coincide on this table, so the equality above "
         f"does not show the percentile is read at all")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# L19.6/L19.8/L19.9 — the spec and the prereg, pinned **by value**
+# ═══════════════════════════════════════════════════════════════════════
+#: ``SPEC`` and ``PREREG`` are defined at the top of this file.  Until these
+#: tests, nothing in the suite ever opened them — which is how the six drifts the
+#: audit found (a stage count of six where the code requires seven, a percentile
+#: citation two lines off, "no code home exists" for a helper that exists) all
+#: survived a green run.  Every assertion below names the document and the
+#: sentence it is about, because the failure is a document defect, not a code
+#: defect.
+_SPEC_SOURCE = {
+    "screen.py": ROOT / "src" / "backtesting" / "strategy_search" / "screen.py",
+    "replay_costs.py": ROOT / "src" / "backtesting" / "replay_costs.py",
+    "scripts/run_strategy_search_stage2.py":
+        ROOT / "scripts" / "run_strategy_search_stage2.py",
+}
+#: The spec spells a stage the way a report reads it; the code spells it with an
+#: underscore.  The mapping is the *only* difference the pin allows.
+_SPEC_STAGE_SPELLING = {
+    "headline": "headline", "benchmark": "benchmark", "fat_tail": "fat-tail",
+    "concentration": "concentration", "fold_breadth": "fold breadth",
+    "neighbour": "neighbour",
+}
+
+
+def _norm(text: str) -> str:
+    """Whitespace-collapsed text: a pin is about the words, not the line wrapping."""
+    return " ".join(text.split())
+
+
+def _doc(path: Path, name: str) -> str:
+    """Read a live contract document, or fail as a contract failure (not a skip)."""
+    assert path.exists(), (
+        f"{path} is missing although {SHARED_TREE} is mounted: this test pins the "
+        f"live {name} by value, so a vanished or renamed document is a failure "
+        f"about the contract, not a reason to skip (audit item G)")
+    return path.read_text()
+
+
+def test_the_spec_pins_the_labelling_order_the_l19_8_literals_and_the_seven_triples():
+    """The load-bearing spec sentences, by value, against the code's own literals.
+
+    Five pins, in the order the judge depends on them: the **labelling order**
+    (L19.6) and its "first failure in that order" rule; the **L19.8 declared
+    literals** (0.0694th percentile / 4000 resamples / seed 20260930 / z_bar
+    3.196 / N 36), each re-rendered from ``screen``'s constants so the document
+    and the code cannot drift apart; the **seven-triples requirement** (the
+    audit's item F.1: the spec said six, the code requires seven); and the
+    **L19.9** rule that ``B`` is recorded and no verdict path may read it.
+    """
+    text = _norm(_doc(SPEC, "round-2 gate-order spec"))
+    order = screen.ROUND2_BUCKET_ORDER
+
+    sentence = ("The bucket order (labelling order, L19.6 / C1):** headline → "
+                "benchmark → fat-tail → concentration → fold breadth → neighbour.")
+    assert sentence in text, (
+        f"{SPEC} no longer carries the L19.6 labelling-order sentence: expected "
+        f"«{sentence}» verbatim (whitespace aside).  The bucket is the FIRST "
+        f"failure in that order, and that order is not the evaluation order (C1)")
+    chain = sentence.split(":** ", 1)[1].rstrip(".").split(" → ")
+    assert chain == [_SPEC_STAGE_SPELLING[s] for s in order], (
+        f"{SPEC}'s labelling order {chain!r} is not screen.ROUND2_BUCKET_ORDER "
+        f"{order!r} spelled as the spec spells it — the document and the code "
+        f"have drifted apart (L19.6)")
+    assert "first** failure in that order" in text, (
+        f"{SPEC} no longer states that a cell's bucket is the **first** failure "
+        f"in the labelling order (L19.6/C1)")
+
+    for literal, value in (
+            ("0.0694th percentile of the session-block bootstrap",
+             screen.ROUND2_HEADLINE_PERCENTILE),
+            ("4000 resamples", screen.ROUND2_BOOTSTRAP_RESAMPLES),
+            ("seed 20260930", screen.ROUND2_BOOTSTRAP_SEED),
+            ("z_bar = 3.196", screen.ROUND2_Z_BAR),
+            ("n_configs = 36", screen.ROUND2_N_CONFIGS)):
+        assert literal in text, (
+            f"{SPEC} no longer declares «{literal}» (L19.8/L19.12).  The code's "
+            f"value is {value!r}; if the code moved, the spec must move with it "
+            f"in the same commit — none of these five may be re-chosen after the "
+            f"data is seen")
+    assert (screen.ROUND2_HEADLINE_PERCENTILE, screen.ROUND2_BOOTSTRAP_RESAMPLES,
+            screen.ROUND2_BOOTSTRAP_SEED) == (0.0694, 4000, 20260930), (
+        "the code's declared percentile / resample count / seed are no longer "
+        "(0.0694, 4000, 20260930): that is a re-declaration of the headline, not "
+        "a refactor (L19.14)")
+
+    seven = "the **seven** declared stages is missing or duplicated"
+    assert seven in text, (
+        f"{SPEC} no longer requires «{seven}» — the audit's item F.1.  "
+        f"screen.ROUND2_BUCKET_STAGES is preconditions + the six "
+        f"ROUND2_BUCKET_ORDER stages, i.e. {len(screen.ROUND2_BUCKET_STAGES)}: a "
+        f"document that says six is one stage short of the code it describes")
+    assert "six declared stages" not in text, (
+        f"{SPEC} has gone back to «six declared stages»: the code requires "
+        f"{len(screen.ROUND2_BUCKET_STAGES)} and a literal six raises KeyError on "
+        f"the precondition stage before any bucket is assigned (audit item F.1)")
+    assert screen.ROUND2_BUCKET_STAGES == ((screen.ROUND2_PRECONDITION_STAGE,)
+                                           + order) and len(order) == 6, (
+        f"the code's stage vocabulary moved: {screen.ROUND2_BUCKET_STAGES!r}")
+
+    for rule in ("recorded, never scored", "no verdict path may read it"):
+        assert rule in text, (
+            f"{SPEC} no longer states «{rule}» (L19.9/C6): B is recorded per "
+            f"(cell, window) and no verdict path may be a function of it")
+
+
+def _d8_row(text: str, number: int) -> str:
+    """One row of the D8 table, by its number, with the document named on failure."""
+    d8 = text.split("## D8")
+    assert len(d8) == 2, (
+        f"{PREREG} has no «## D8» section: the literals table the audit's item F "
+        f"corrects is gone, so its rows cannot be pinned")
+    for line in d8[1].splitlines():
+        if line.startswith(f"| {number} |"):
+            return line
+    raise AssertionError(
+        f"{PREREG}'s D8 table has no row {number}; the audit's items F.3/F.6 "
+        f"correct rows 7, 13 and 15 and they must keep existing to be pinned")
+
+
+def test_the_prereg_pins_the_withdrawn_b_annotations_and_the_d8_code_homes():
+    """D8 row 15 by value, plus the two rows item F corrected (13 and 7).
+
+    Row 15 is the **withdrawn** row (L19.9/C6): ``B`` is a recorded diagnostic,
+    the ``3`` and ``N/4`` annotations are annotation only, and none of it is
+    evaluated.  Its literals are pinned here — including the expression the code
+    actually carries — because a withdrawn literal that quietly comes back as a
+    threshold is exactly what the ruling forbids.  Rows 13 and 7 are pinned only
+    for the two things item F fixed: the code home exists, and the citation is
+    the line the definition is on.
+    """
+    text = _doc(PREREG, "round-2 pre-registration")
+    row15 = _d8_row(text, 15)
+    for phrase in ("withdrawn as literals",
+                   "screen.ROUND2_B_ANNOTATIONS = (3, screen.ROUND2_N_CONFIGS // 4)",
+                   "never evaluated", "**withdrawn**"):
+        assert phrase in row15, (
+            f"{PREREG} D8 row 15 no longer says «{phrase}»: that row is where B "
+            f"and the 3 / N/4 annotations are WITHDRAWN as literals (L19.9/C6).  "
+            f"Row 15 is: {row15!r}")
+    assert screen.ROUND2_B_ANNOTATIONS == (3, screen.ROUND2_N_CONFIGS // 4), (
+        f"screen.ROUND2_B_ANNOTATIONS is {screen.ROUND2_B_ANNOTATIONS!r}, not "
+        f"(3, N // 4) = {(3, screen.ROUND2_N_CONFIGS // 4)!r} — the prereg's row "
+        f"15 pins the expression by value")
+
+    row13 = _d8_row(text, 13)
+    assert "screen.session_block_lower_bound" in row13, (
+        f"{PREREG} D8 row 13 does not name screen.session_block_lower_bound "
+        f"(audit item F.3): the helper that produces the headline has a code "
+        f"home, and the row must say so.  Row 13 is: {row13!r}")
+    assert "no code home exists" not in row13, (
+        f"{PREREG} D8 row 13 still claims «no code home exists»; "
+        f"screen.session_block_lower_bound (screen.py) returns (lower_bound, B) "
+        f"— the audit's item F.3 is the exact drift this pin exists to stop")
+    assert "**promoted**" in row13, (
+        f"{PREREG} D8 row 13 must be **promoted** once its code home exists: "
+        f"an outstanding row that is not outstanding inflates the freeze list.  "
+        f"Row 13 is: {row13!r}")
+
+    freeze = _norm(text.split("Still outstanding after this section", 1)[1]
+                   .split("---", 1)[0])
+    assert "items 2, 3, 8–11 and 14" in freeze, (
+        f"{PREREG}'s freeze list no longer reads «items 2, 3, 8–11 and 14»: item "
+        f"13 is promoted (row 13), so the list must not still demand it.  The "
+        f"list is: {freeze!r}")
+    assert "13–14" not in freeze, (
+        f"{PREREG}'s freeze list still demands items 13–14; 13 is promoted.  The "
+        f"list is: {freeze!r}")
+
+    row7 = _d8_row(text, 7)
+    assert "`replay_costs.py:67-70`" in row7, (
+        f"{PREREG} D8 row 7 cites the wrong lines for `pessimistic` (audit item "
+        f"F.6: it said 64-67, the definition is at 67-70).  Row 7 is: {row7!r}")
+
+
+def test_the_audit_citations_resolve_to_the_lines_they_name():
+    """A citation is a claim: ``file.py:NNN`` must contain what the doc says.
+
+    The audit's items F.2/F.3/F.6 were all one defect — a ``file:line`` citation
+    that no longer pointed at the line it described — and nothing read them.  Each
+    citation below is resolved against the file it names; a drift fails here with
+    the document named, and the fix is to update the citation, not this test.
+    """
+    spec = _doc(SPEC, "round-2 gate-order spec")
+    prereg = _doc(PREREG, "round-2 pre-registration")
+    checks = (
+        (spec, "scripts/run_strategy_search_stage2.py", "180-181",
+         "np.percentile(blocks, 2.5)",
+         "the stage-2 percentile it says round 2 cannot reuse (item F.2)"),
+        (spec, "screen.py", "1174", "ROUND2_BUCKET_STAGES",
+         "the stage vocabulary the seven-triples sentence names (item F.1)"),
+        (prereg, "screen.py", "934", "def session_block_lower_bound",
+         "the code home row 13 now points at (item F.3)"),
+        (prereg, "replay_costs.py", "67-70", "def pessimistic",
+         "the pessimistic cost level row 7 points at (item F.6)"),
+    )
+    for document, filename, span, token, why in checks:
+        citation = f"{filename}:{span}"
+        assert citation in document, (
+            f"{citation} is gone from the document that cited it — {why}.  The "
+            f"citation must be restored or replaced, not dropped")
+        path = _SPEC_SOURCE[filename]
+        lines = path.read_text().splitlines()
+        start, _, end = span.partition("-")
+        window = lines[int(start) - 1:int(end or start)]
+        assert any(token in line for line in window), (
+            f"{citation} does not point at {token!r}: that line range is "
+            f"{window!r} — {why}.  Update the citation in the document (the file "
+            f"moved underneath it), which is exactly the drift the audit found")
