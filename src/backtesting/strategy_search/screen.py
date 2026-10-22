@@ -33,6 +33,7 @@ between windows.  Round 2 declares ``fixed_notional`` the **sole gating** sizing
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 POWER_FLOOR = 150
@@ -622,6 +623,44 @@ def assert_gate_blocks_present(record: Mapping,
 ROUND2_TRIP_TABLE_KEY = "trip_table"
 
 
+#: The one precondition slug that is **not** a refusal but a *verdict*
+#: (L19.7 / C10): ``config_trips >= 150`` with a finite ``paired_trips < 150``.
+#: Every other slug refuses a verdict — the cell is ``not_evaluated``.
+ROUND2_PAIRED_FLOOR_SLUG = "paired_floor"
+#: The slug for a **malformed benchmark block**: absent, empty, or carrying a
+#: count that is not a finite number.  It is deliberately *not*
+#: :data:`ROUND2_PAIRED_FLOOR_SLUG`: "the block was never written" is a broken
+#: input, not a headline failure, and one slug for both reported the former as
+#: the latter (the contract audit's item A).
+ROUND2_BENCHMARK_BLOCK_SLUG = "benchmark_block"
+#: Every slug :func:`round2_preconditions` may put at the front of its reason,
+#: one spelling each (C2).  :func:`round2_precondition_stage` is **fail-closed**
+#: on a slug outside this tuple: a new precondition must be declared here, or the
+#: judge would route it to a bucket it was never ruled to belong to.
+ROUND2_PRECONDITION_SLUGS: tuple[str, ...] = (
+    "trips_floor", "trip_table", "legs", "side", "notional", "caps",
+    ROUND2_PAIRED_FLOOR_SLUG, ROUND2_BENCHMARK_BLOCK_SLUG,
+)
+
+
+def _finite_count(value) -> Optional[float]:
+    """``value`` as a **finite** float, or ``None`` when it is not a count.
+
+    ``float("nan")`` and ``float("inf")`` are the reason this exists: every
+    comparison a gate makes against them is either ``False`` (NaN) or trivially
+    true (inf), so a count that cannot be read must be refused *before* it is
+    compared rather than compared and believed.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+
 class BenchmarkIdentityError(RuntimeError):
     """A benchmark block's two trip-count identities do not hold (L19.7).
 
@@ -680,17 +719,29 @@ def round2_preconditions(record: Mapping) -> tuple[bool, str]:
     the judge's bucket pass reads the verdict off the reason instead of
     re-deriving it:
 
-    * ``trips_floor`` / ``trip_table`` / ``legs`` / ``notional`` / ``caps`` — a
-      precondition mismatch: the cell refuses a verdict (``not_evaluated``), one
-      spelling (C2);
-    * ``paired_floor`` — ``config_trips >= 150`` with ``paired_trips < 150`` — the
-      cell is ``headline_rejected``, unambiguously (L19.7 / C10).  The floor is
-      read from *this* record's benchmark block, i.e. at each gating level.
+    * ``trips_floor`` / ``trip_table`` / ``legs`` / ``side`` / ``notional`` /
+      ``caps`` / ``benchmark_block`` — a precondition mismatch or a malformed
+      input: the cell refuses a verdict (``not_evaluated``), one spelling (C2);
+    * ``paired_floor`` — ``config_trips >= 150`` with a finite
+      ``paired_trips < 150`` — the cell is ``headline_rejected``, unambiguously
+      (L19.7 / C10).  The floor is read from *this* record's benchmark block,
+      i.e. at each gating level.
+
+    The two halves of step 2 are kept apart by slug, and
+    :func:`round2_precondition_stage` is the **only** place the slug is turned
+    into a stage: an absent or malformed benchmark block is a broken *input*
+    (``benchmark_block``) and can never be read as a verdict about the strategy.
 
     It **evaluates no gate**: what it reads is either :data:`POWER_FLOOR` or a
     pinned literal.
     """
-    trips = int(record.get("trips", 0) or 0)
+    raw_trips = record.get("trips", 0)
+    trips_n = _finite_count(0 if raw_trips is None else raw_trips)
+    if trips_n is None:
+        return False, (f"trips_floor: the record's trips {raw_trips!r} is not a "
+                       f"finite count — the {POWER_FLOOR}-trip floor cannot be "
+                       f"decided on it, and 'nan < {POWER_FLOOR}' is False (L19.7)")
+    trips = int(trips_n)
     if trips < POWER_FLOOR:
         return False, f"trips_floor: trips {trips} < {POWER_FLOOR}"
     table = record.get(ROUND2_TRIP_TABLE_KEY)
@@ -699,8 +750,12 @@ def round2_preconditions(record: Mapping) -> tuple[bool, str]:
         return False, (f"trip_table: no per-trip 'legs' column (the L4 trip table "
                        f"is handed in under {ROUND2_TRIP_TABLE_KEY!r})")
     for i, n in enumerate(legs):
-        if int(n) != 1:
-            return False, (f"legs: trip {i} has {int(n)} legs — round 2 is "
+        try:
+            legs_i = int(_finite_count(n))
+        except (TypeError, ValueError):
+            legs_i = None
+        if legs_i != 1:
+            return False, (f"legs: trip {i} has {n!r} legs — round 2 is "
                            f"single-leg only (R3-6.1 §2.7)")
     notional = _trip_column(table, "notional")
     if notional is None:
@@ -731,15 +786,65 @@ def round2_preconditions(record: Mapping) -> tuple[bool, str]:
                        f"caps {dict(_families.R2_CAPS)}")
     block = record.get("benchmark")
     if not isinstance(block, Mapping) or "paired_trips" not in block:
-        return False, ("paired_floor: the record carries no benchmark block with "
-                       "paired_trips — the paired floor is a step-2 precondition "
-                       "(L19.7), so an absent block cannot be left to the gate")
-    paired = float(block["paired_trips"])
+        return False, (f"{ROUND2_BENCHMARK_BLOCK_SLUG}: the record carries no "
+                       f"benchmark block with paired_trips — the paired floor is "
+                       f"a step-2 precondition (L19.7), so an absent block cannot "
+                       f"be left to the gate.  A missing input refuses a verdict; "
+                       f"it is never a headline failure")
+    counts = {}
+    for key in ("paired_trips", "config_trips", "benchmark_trips",
+                "benchmark_unpriced"):
+        number = _finite_count(block.get(key))
+        if number is None:
+            return False, (f"{ROUND2_BENCHMARK_BLOCK_SLUG}: the benchmark block's "
+                           f"{key} is {block.get(key)!r}, not a finite count — the "
+                           f"paired floor and both trip-count identities cannot be "
+                           f"decided on a malformed count, and 'nan < "
+                           f"{POWER_FLOOR}' is False, which would let it pass "
+                           f"(L19.7)")
+        counts[key] = number
+    paired = counts["paired_trips"]
     if paired < POWER_FLOOR:
         return False, (f"paired_floor: paired_trips {paired:g} < {POWER_FLOOR} "
                        f"with config_trips {trips} >= {POWER_FLOOR} → "
                        f"headline_rejected (L19.7)")
     return True, "ok"
+
+
+def round2_precondition_stage(ok: bool, why: str) -> tuple[str, bool, str]:
+    """Step 2's result as a ``(stage, ok, why)`` triple — **one** spelling (L19.7).
+
+    The judge buckets on the *stage* a failure is reported under, and
+    :func:`round2_preconditions` reports it in the *slug* at the front of
+    ``why``.  That mapping used to live in the judge as a literal
+    ``paired_floor`` comparison while the slugs lived here, so the contract
+    between the two was enforced by convention only (the contract audit's item
+    A).  It lives here now, beside the slugs:
+
+    * ``ok`` ⇒ the cell passes step 2 (``(preconditions, True, "ok")``);
+    * :data:`ROUND2_PAIRED_FLOOR_SLUG` ⇒ ``(headline, False, why)`` — the one
+      slug that is a *verdict*, so the bucket pass names it
+      ``headline_rejected`` (C10);
+    * any other declared slug ⇒ ``(preconditions, False, why)`` — a refusal,
+      which :func:`round2_bucket` short-circuits to ``not_evaluated``.
+
+    **Fail-closed on a slug it does not know**: an undeclared slug raises rather
+    than defaulting, because a silent default is how a future precondition would
+    acquire a bucket nobody ruled it belongs to.
+    """
+    if ok:
+        return ROUND2_PRECONDITION_STAGE, True, "ok"
+    slug = str(why).split(":", 1)[0].strip()
+    if slug not in ROUND2_PRECONDITION_SLUGS:
+        raise ValueError(
+            f"round2_precondition_stage: {slug!r} is not a declared "
+            f"precondition slug — the vocabulary is "
+            f"{ROUND2_PRECONDITION_SLUGS} (L19.7, one spelling).  Declare it "
+            f"here and rule which stage it is reported under, rather than "
+            f"letting the judge guess")
+    if slug == ROUND2_PAIRED_FLOOR_SLUG:
+        return ROUND2_HEADLINE_STAGE, False, str(why)
+    return ROUND2_PRECONDITION_STAGE, False, str(why)
 
 
 def assert_benchmark_paired_identity(block: Mapping) -> None:
@@ -1036,6 +1141,12 @@ ROUND2_ALIVE = "alive"
 #: gate (L19.7): it decides *whether the cell can be scored at all*, so it
 #: short-circuits to :data:`ROUND2_NOT_EVALUATED` rather than to a bucket.
 ROUND2_PRECONDITION_STAGE = "preconditions"
+#: The stage a **verdict-shaped** precondition failure is reported under: the
+#: paired floor (L19.7 / C10) is a headline failure, so
+#: :func:`round2_precondition_stage` returns the first stage of the labelling
+#: order and :func:`round2_bucket` names it ``headline_rejected``.  Derived from
+#: :data:`ROUND2_BUCKET_ORDER` so the two cannot drift.
+ROUND2_HEADLINE_STAGE: str = ROUND2_BUCKET_ORDER[0]
 #: Every stage name :func:`round2_bucket` accepts.
 ROUND2_BUCKET_STAGES: tuple[str, ...] = ((ROUND2_PRECONDITION_STAGE,)
                                         + ROUND2_BUCKET_ORDER)

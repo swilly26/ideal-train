@@ -30,6 +30,9 @@ breadth → neighbour — which is deliberately **not** the order §1 evaluates 
 steps in.  A cell that fails nothing is ``alive``; a cell that fails step 2 is
 ``not_evaluated``, one spelling, the reason in ``why`` (C2), with the single
 exception that the ``paired_floor`` slug is ``headline_rejected`` (L19.7 / C10).
+Which slug is which is decided **once**, by
+:func:`screen.round2_precondition_stage`; an absent or malformed benchmark block
+is a broken input (``benchmark_block``) and refuses a verdict.
 
 **Input.** The judge reads the **untrimmed per-run record files** (the
 JSON projections ``run_strategy_search.Runner.run`` writes), not the family
@@ -156,7 +159,9 @@ RESIDUAL_SENTENCE = (
 )
 
 #: The one precondition slug that is **not** ``not_evaluated`` (L19.7 / C10).
-PAIRED_FLOOR_SLUG = "paired_floor"
+#: Re-exported from ``screen``, which owns the slug vocabulary: the judge must
+#: not carry a second spelling of it (the contract audit's item A).
+PAIRED_FLOOR_SLUG = screen.ROUND2_PAIRED_FLOOR_SLUG
 
 
 # ── refusals ───────────────────────────────────────────────────────────
@@ -360,20 +365,19 @@ def cell_preconditions(record: Mapping) -> tuple[bool, str]:
 def _precondition_stage(ok: bool, why: str) -> tuple[tuple, tuple | None]:
     """Map step 2's refusal onto the bucket vocabulary (L19.7 / C10 / C2).
 
-    Returns ``(preconditions_triple, headline_override)``.  The ``paired_floor``
-    slug is the **one** exception: ``config_trips >= 150`` with
-    ``paired_trips < 150`` is a *headline* failure, never "the benchmark gate
-    failed closed", so it is reported as ``headline_rejected`` — and it is
-    decided **by the slug**, not by the stage, which is why this mapping lives in
-    the judge and not in the helper.
+    Returns ``(preconditions_triple, headline_override)``.  The mapping itself is
+    :func:`screen.round2_precondition_stage` — the **one** spelling of it, living
+    beside the slugs it maps, so the judge cannot hold a second copy that drifts.
+    The ``paired_floor`` slug is the one verdict-shaped refusal: it is reported as
+    ``headline_rejected`` through the headline override, while an absent or
+    malformed benchmark block (``benchmark_block``) is a precondition refusal and
+    the cell is ``not_evaluated``.
     """
-    if ok:
-        return (screen.ROUND2_PRECONDITION_STAGE, True, "ok"), None
-    slug = str(why).split(":", 1)[0].strip()
-    if slug == PAIRED_FLOOR_SLUG:
+    stage, stage_ok, stage_why = screen.round2_precondition_stage(ok, why)
+    if stage == screen.ROUND2_HEADLINE_STAGE:
         return ((screen.ROUND2_PRECONDITION_STAGE, True, "ok"),
-                (False, str(why)))
-    return (screen.ROUND2_PRECONDITION_STAGE, False, str(why)), None
+                (False, stage_why))
+    return (screen.ROUND2_PRECONDITION_STAGE, stage_ok, stage_why), None
 
 
 # ── I2 / L3: the two gating levels really are base and 1.5 × slippage ───

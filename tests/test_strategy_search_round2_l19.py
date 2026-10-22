@@ -508,7 +508,22 @@ STEP2_VIOLATIONS = [
     ({"config_params": None}, "caps"),
     ({"benchmark": {"config_trips": 200, "benchmark_trips": 200,
                     "paired_trips": 149, "benchmark_unpriced": 51}}, "paired_floor"),
-    ({"benchmark": None}, "paired_floor"),
+    # The contract audit's item A, second half: a **malformed** benchmark block is
+    # a malformed *input*, so it refuses a verdict (``benchmark_block``) and is
+    # never read as a headline failure.  NaN is the dangerous one — ``nan < 150``
+    # is ``False``, so without an explicit finiteness check a NaN ``paired_trips``
+    # *passes* step 2 and the paired floor silently stops existing.
+    ({"benchmark": None}, "benchmark_block"),
+    ({"benchmark": {}}, "benchmark_block"),
+    ({"benchmark": {"config_trips": 200, "benchmark_trips": 200,
+                    "paired_trips": float("nan"), "benchmark_unpriced": 0}},
+     "benchmark_block"),
+    ({"benchmark": {"config_trips": 200, "benchmark_trips": float("inf"),
+                    "paired_trips": 200, "benchmark_unpriced": 0}},
+     "benchmark_block"),
+    ({"benchmark": {"config_trips": 200, "benchmark_trips": 200,
+                    "paired_trips": 200, "benchmark_unpriced": "n/a"}},
+     "benchmark_block"),
     ({"trip_table": None}, "trip_table"),
 ]
 
@@ -550,6 +565,83 @@ def test_the_paired_floor_is_the_only_precondition_that_stays_a_headline_failure
     assert ok is False and why.startswith("paired_floor")
     # and the headline count itself is still the generated count (L19.7):
     assert screen.round2_preconditions(step2_record(trips=200))[0] is True
+
+
+def test_an_absent_benchmark_block_is_its_own_slug_not_a_headline_failure():
+    """The contract audit's item A: "block never written" ≠ "headline failed".
+
+    ``round2_preconditions`` used to report an **absent** benchmark block under
+    the ``paired_floor`` slug (``screen.py:734-736``), the same slug a genuine
+    ``paired_trips < 150`` shortfall emits.  The judge buckets by slug, so a
+    literal rule reported "the block was never written" as ``headline_rejected``
+    — a verdict about the *strategy* drawn from a record that is missing its
+    input.  The two now have one slug each: ``benchmark_block`` for a malformed
+    or absent block (a refusal), ``paired_floor`` for a finite shortfall (a
+    headline failure, L19.7 / C10).
+    """
+    ok, why = screen.round2_preconditions(step2_record(benchmark=None))
+    assert ok is False and why.startswith("benchmark_block"), (
+        f"an absent benchmark block must refuse with its own slug, got {why!r}")
+    assert not why.startswith("paired_floor"), (
+        "an absent block must not be reported as the paired floor: the judge "
+        "maps that slug to headline_rejected, which is a claim about the "
+        "strategy rather than about a malformed record")
+    # the two slugs are distinct and both declared, so neither can drift into
+    # the other's spelling:
+    assert (screen.ROUND2_BENCHMARK_BLOCK_SLUG
+            != screen.ROUND2_PAIRED_FLOOR_SLUG)
+    for slug in (screen.ROUND2_BENCHMARK_BLOCK_SLUG,
+                 screen.ROUND2_PAIRED_FLOOR_SLUG):
+        assert slug in screen.ROUND2_PRECONDITION_SLUGS
+
+
+def test_a_non_finite_benchmark_count_cannot_pass_the_paired_floor():
+    """``nan < 150`` is ``False``: the fail-open hole the audit found (item A).
+
+    A NaN ``paired_trips`` passed step 2 on the pre-fix helper, so a block that
+    could not be read at all behaved exactly like one with 200 paired trips.
+    Every count the floor and the two identities read must be a **finite**
+    number or the cell refuses a verdict.
+    """
+    for key in ("paired_trips", "config_trips", "benchmark_trips",
+                "benchmark_unpriced"):
+        block = {"config_trips": 200, "benchmark_trips": 200,
+                 "paired_trips": 200, "benchmark_unpriced": 0}
+        block[key] = float("nan")
+        ok, why = screen.round2_preconditions(step2_record(benchmark=block))
+        assert ok is False and why.startswith("benchmark_block"), (
+            f"a NaN {key} must refuse, not pass: got {why!r}")
+
+
+def test_round2_precondition_stage_is_the_only_slug_to_stage_mapping():
+    """One spelling of the slug→stage rule, fail-closed on an unknown slug.
+
+    The judge used to carry its own literal ``paired_floor`` comparison, and the
+    contract between the helper and the judge was enforced by convention only
+    (the audit's item A, first half).  The mapping now lives in ``screen``, next
+    to the slugs it maps, and a slug it does not know **raises** — a future
+    precondition cannot silently inherit ``not_evaluated`` or a bucket.
+    """
+    stage, ok, why = screen.round2_precondition_stage(True, "ok")
+    assert (stage, ok, why) == (screen.ROUND2_PRECONDITION_STAGE, True, "ok")
+
+    stage, ok, why = screen.round2_precondition_stage(
+        False, "paired_floor: paired_trips 40 < 150")
+    assert stage == screen.ROUND2_HEADLINE_STAGE, (
+        "the paired floor is reported under the headline stage, so the bucket "
+        "pass names it headline_rejected (L19.7 / C10)")
+    assert screen.ROUND2_HEADLINE_STAGE == screen.ROUND2_BUCKET_ORDER[0]
+    assert (ok, why) == (False, "paired_floor: paired_trips 40 < 150")
+
+    for slug in ("trips_floor", "trip_table", "legs", "notional", "caps",
+                 screen.ROUND2_BENCHMARK_BLOCK_SLUG):
+        stage, ok, why = screen.round2_precondition_stage(False, f"{slug}: x")
+        assert (stage, ok) == (screen.ROUND2_PRECONDITION_STAGE, False), (
+            f"{slug!r} must stay a precondition refusal (not_evaluated), got "
+            f"{stage!r}")
+
+    with pytest.raises(ValueError, match="not a declared precondition slug"):
+        screen.round2_precondition_stage(False, "a_new_slug: x")
 
 
 # ── L19.7: the two benchmark identities, asserted before any delta is read ─

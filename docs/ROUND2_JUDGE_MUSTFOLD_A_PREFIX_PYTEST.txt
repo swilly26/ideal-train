@@ -1,0 +1,309 @@
+=== tests/test_strategy_search_round2_l19.py -k 'step_2 or benchmark or non_finite or precondition_stage' ===
+.........FFFFF.FFF.....                                                  [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+_ test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block0] _
+
+mutation = {'benchmark': None}, slug = 'benchmark_block'
+
+    @pytest.mark.parametrize("mutation,slug", STEP2_VIOLATIONS,
+                             ids=[s for _m, s in STEP2_VIOLATIONS])
+    def test_step_2_preconditions_can_fail_on_every_declared_precondition(
+            mutation, slug):
+        """Every precondition bites, and the reason names which one (L19.7).
+    
+        This is the *positive control that the helper can fail*: one record per
+        precondition, each violating only that one, each asserted to be refused with
+        its own slug.  A helper that always returned True fails every case here; one
+        that always returned False fails the accepting test above.
+        """
+        ok, why = screen.round2_preconditions(step2_record(**mutation))
+        assert ok is False, (
+            f"the mutation {mutation!r} violates {slug!r} and must be refused "
+            f"(L19.7: step 2 is the one place 'refuse a verdict' happens), got {why!r}")
+>       assert why.startswith(slug), (
+            f"the refusal must name the precondition it is about: expected the slug "
+            f"{slug!r} first, got {why!r} — the judge buckets on that slug, so an "
+            f"unrelated reason is a mis-bucketed cell")
+E       AssertionError: the refusal must name the precondition it is about: expected the slug 'benchmark_block' first, got 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate' — the judge buckets on that slug, so an unrelated reason is a mis-bucketed cell
+E       assert False
+E        +  where False = <built-in method startswith of str object at 0x7f741865dac0>('benchmark_block')
+E        +    where <built-in method startswith of str object at 0x7f741865dac0> = 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate'.startswith
+
+tests/test_strategy_search_round2_l19.py:546: AssertionError
+_ test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block1] _
+
+mutation = {'benchmark': {}}, slug = 'benchmark_block'
+
+    @pytest.mark.parametrize("mutation,slug", STEP2_VIOLATIONS,
+                             ids=[s for _m, s in STEP2_VIOLATIONS])
+    def test_step_2_preconditions_can_fail_on_every_declared_precondition(
+            mutation, slug):
+        """Every precondition bites, and the reason names which one (L19.7).
+    
+        This is the *positive control that the helper can fail*: one record per
+        precondition, each violating only that one, each asserted to be refused with
+        its own slug.  A helper that always returned True fails every case here; one
+        that always returned False fails the accepting test above.
+        """
+        ok, why = screen.round2_preconditions(step2_record(**mutation))
+        assert ok is False, (
+            f"the mutation {mutation!r} violates {slug!r} and must be refused "
+            f"(L19.7: step 2 is the one place 'refuse a verdict' happens), got {why!r}")
+>       assert why.startswith(slug), (
+            f"the refusal must name the precondition it is about: expected the slug "
+            f"{slug!r} first, got {why!r} — the judge buckets on that slug, so an "
+            f"unrelated reason is a mis-bucketed cell")
+E       AssertionError: the refusal must name the precondition it is about: expected the slug 'benchmark_block' first, got 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate' — the judge buckets on that slug, so an unrelated reason is a mis-bucketed cell
+E       assert False
+E        +  where False = <built-in method startswith of str object at 0x7f741865dac0>('benchmark_block')
+E        +    where <built-in method startswith of str object at 0x7f741865dac0> = 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate'.startswith
+
+tests/test_strategy_search_round2_l19.py:546: AssertionError
+_ test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block2] _
+
+mutation = {'benchmark': {'config_trips': 200, 'benchmark_trips': 200, 'paired_trips': nan, 'benchmark_unpriced': 0}}
+slug = 'benchmark_block'
+
+    @pytest.mark.parametrize("mutation,slug", STEP2_VIOLATIONS,
+                             ids=[s for _m, s in STEP2_VIOLATIONS])
+    def test_step_2_preconditions_can_fail_on_every_declared_precondition(
+            mutation, slug):
+        """Every precondition bites, and the reason names which one (L19.7).
+    
+        This is the *positive control that the helper can fail*: one record per
+        precondition, each violating only that one, each asserted to be refused with
+        its own slug.  A helper that always returned True fails every case here; one
+        that always returned False fails the accepting test above.
+        """
+        ok, why = screen.round2_preconditions(step2_record(**mutation))
+>       assert ok is False, (
+            f"the mutation {mutation!r} violates {slug!r} and must be refused "
+            f"(L19.7: step 2 is the one place 'refuse a verdict' happens), got {why!r}")
+E       AssertionError: the mutation {'benchmark': {'config_trips': 200, 'benchmark_trips': 200, 'paired_trips': nan, 'benchmark_unpriced': 0}} violates 'benchmark_block' and must be refused (L19.7: step 2 is the one place 'refuse a verdict' happens), got 'ok'
+E       assert True is False
+
+tests/test_strategy_search_round2_l19.py:543: AssertionError
+_ test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block3] _
+
+mutation = {'benchmark': {'config_trips': 200, 'benchmark_trips': inf, 'paired_trips': 200, 'benchmark_unpriced': 0}}
+slug = 'benchmark_block'
+
+    @pytest.mark.parametrize("mutation,slug", STEP2_VIOLATIONS,
+                             ids=[s for _m, s in STEP2_VIOLATIONS])
+    def test_step_2_preconditions_can_fail_on_every_declared_precondition(
+            mutation, slug):
+        """Every precondition bites, and the reason names which one (L19.7).
+    
+        This is the *positive control that the helper can fail*: one record per
+        precondition, each violating only that one, each asserted to be refused with
+        its own slug.  A helper that always returned True fails every case here; one
+        that always returned False fails the accepting test above.
+        """
+        ok, why = screen.round2_preconditions(step2_record(**mutation))
+>       assert ok is False, (
+            f"the mutation {mutation!r} violates {slug!r} and must be refused "
+            f"(L19.7: step 2 is the one place 'refuse a verdict' happens), got {why!r}")
+E       AssertionError: the mutation {'benchmark': {'config_trips': 200, 'benchmark_trips': inf, 'paired_trips': 200, 'benchmark_unpriced': 0}} violates 'benchmark_block' and must be refused (L19.7: step 2 is the one place 'refuse a verdict' happens), got 'ok'
+E       assert True is False
+
+tests/test_strategy_search_round2_l19.py:543: AssertionError
+_ test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block4] _
+
+mutation = {'benchmark': {'config_trips': 200, 'benchmark_trips': 200, 'paired_trips': 200, 'benchmark_unpriced': 'n/a'}}
+slug = 'benchmark_block'
+
+    @pytest.mark.parametrize("mutation,slug", STEP2_VIOLATIONS,
+                             ids=[s for _m, s in STEP2_VIOLATIONS])
+    def test_step_2_preconditions_can_fail_on_every_declared_precondition(
+            mutation, slug):
+        """Every precondition bites, and the reason names which one (L19.7).
+    
+        This is the *positive control that the helper can fail*: one record per
+        precondition, each violating only that one, each asserted to be refused with
+        its own slug.  A helper that always returned True fails every case here; one
+        that always returned False fails the accepting test above.
+        """
+        ok, why = screen.round2_preconditions(step2_record(**mutation))
+>       assert ok is False, (
+            f"the mutation {mutation!r} violates {slug!r} and must be refused "
+            f"(L19.7: step 2 is the one place 'refuse a verdict' happens), got {why!r}")
+E       AssertionError: the mutation {'benchmark': {'config_trips': 200, 'benchmark_trips': 200, 'paired_trips': 200, 'benchmark_unpriced': 'n/a'}} violates 'benchmark_block' and must be refused (L19.7: step 2 is the one place 'refuse a verdict' happens), got 'ok'
+E       assert True is False
+
+tests/test_strategy_search_round2_l19.py:543: AssertionError
+____ test_an_absent_benchmark_block_is_its_own_slug_not_a_headline_failure _____
+
+    def test_an_absent_benchmark_block_is_its_own_slug_not_a_headline_failure():
+        """The contract audit's item A: "block never written" ≠ "headline failed".
+    
+        ``round2_preconditions`` used to report an **absent** benchmark block under
+        the ``paired_floor`` slug (``screen.py:734-736``), the same slug a genuine
+        ``paired_trips < 150`` shortfall emits.  The judge buckets by slug, so a
+        literal rule reported "the block was never written" as ``headline_rejected``
+        — a verdict about the *strategy* drawn from a record that is missing its
+        input.  The two now have one slug each: ``benchmark_block`` for a malformed
+        or absent block (a refusal), ``paired_floor`` for a finite shortfall (a
+        headline failure, L19.7 / C10).
+        """
+        ok, why = screen.round2_preconditions(step2_record(benchmark=None))
+>       assert ok is False and why.startswith("benchmark_block"), (
+            f"an absent benchmark block must refuse with its own slug, got {why!r}")
+E       AssertionError: an absent benchmark block must refuse with its own slug, got 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate'
+E       assert (False is False and False)
+E        +  where False = <built-in method startswith of str object at 0x7f741865dac0>('benchmark_block')
+E        +    where <built-in method startswith of str object at 0x7f741865dac0> = 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate'.startswith
+
+tests/test_strategy_search_round2_l19.py:583: AssertionError
+________ test_a_non_finite_benchmark_count_cannot_pass_the_paired_floor ________
+
+    def test_a_non_finite_benchmark_count_cannot_pass_the_paired_floor():
+        """``nan < 150`` is ``False``: the fail-open hole the audit found (item A).
+    
+        A NaN ``paired_trips`` passed step 2 on the pre-fix helper, so a block that
+        could not be read at all behaved exactly like one with 200 paired trips.
+        Every count the floor and the two identities read must be a **finite**
+        number or the cell refuses a verdict.
+        """
+        for key in ("paired_trips", "config_trips", "benchmark_trips",
+                    "benchmark_unpriced"):
+            block = {"config_trips": 200, "benchmark_trips": 200,
+                     "paired_trips": 200, "benchmark_unpriced": 0}
+            block[key] = float("nan")
+            ok, why = screen.round2_preconditions(step2_record(benchmark=block))
+>           assert ok is False and why.startswith("benchmark_block"), (
+                f"a NaN {key} must refuse, not pass: got {why!r}")
+E           AssertionError: a NaN paired_trips must refuse, not pass: got 'ok'
+E           assert (True is False)
+
+tests/test_strategy_search_round2_l19.py:612: AssertionError
+_______ test_round2_precondition_stage_is_the_only_slug_to_stage_mapping _______
+
+    def test_round2_precondition_stage_is_the_only_slug_to_stage_mapping():
+        """One spelling of the slug→stage rule, fail-closed on an unknown slug.
+    
+        The judge used to carry its own literal ``paired_floor`` comparison, and the
+        contract between the helper and the judge was enforced by convention only
+        (the audit's item A, first half).  The mapping now lives in ``screen``, next
+        to the slugs it maps, and a slug it does not know **raises** — a future
+        precondition cannot silently inherit ``not_evaluated`` or a bucket.
+        """
+>       stage, ok, why = screen.round2_precondition_stage(True, "ok")
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_precondition_stage'. Did you mean: 'round2_preconditions'?
+
+tests/test_strategy_search_round2_l19.py:625: AttributeError
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block0] - AssertionError: the refusal must name the precondition it is about: expected the slug 'benchmark_block' first, got 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate' — the judge buckets on that slug, so an unrelated reason is a mis-bucketed cell
+assert False
+ +  where False = <built-in method startswith of str object at 0x7f741865dac0>('benchmark_block')
+ +    where <built-in method startswith of str object at 0x7f741865dac0> = 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate'.startswith
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block1] - AssertionError: the refusal must name the precondition it is about: expected the slug 'benchmark_block' first, got 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate' — the judge buckets on that slug, so an unrelated reason is a mis-bucketed cell
+assert False
+ +  where False = <built-in method startswith of str object at 0x7f741865dac0>('benchmark_block')
+ +    where <built-in method startswith of str object at 0x7f741865dac0> = 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate'.startswith
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block2] - AssertionError: the mutation {'benchmark': {'config_trips': 200, 'benchmark_trips': 200, 'paired_trips': nan, 'benchmark_unpriced': 0}} violates 'benchmark_block' and must be refused (L19.7: step 2 is the one place 'refuse a verdict' happens), got 'ok'
+assert True is False
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block3] - AssertionError: the mutation {'benchmark': {'config_trips': 200, 'benchmark_trips': inf, 'paired_trips': 200, 'benchmark_unpriced': 0}} violates 'benchmark_block' and must be refused (L19.7: step 2 is the one place 'refuse a verdict' happens), got 'ok'
+assert True is False
+FAILED tests/test_strategy_search_round2_l19.py::test_step_2_preconditions_can_fail_on_every_declared_precondition[benchmark_block4] - AssertionError: the mutation {'benchmark': {'config_trips': 200, 'benchmark_trips': 200, 'paired_trips': 200, 'benchmark_unpriced': 'n/a'}} violates 'benchmark_block' and must be refused (L19.7: step 2 is the one place 'refuse a verdict' happens), got 'ok'
+assert True is False
+FAILED tests/test_strategy_search_round2_l19.py::test_an_absent_benchmark_block_is_its_own_slug_not_a_headline_failure - AssertionError: an absent benchmark block must refuse with its own slug, got 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate'
+assert (False is False and False)
+ +  where False = <built-in method startswith of str object at 0x7f741865dac0>('benchmark_block')
+ +    where <built-in method startswith of str object at 0x7f741865dac0> = 'paired_floor: the record carries no benchmark block with paired_trips — the paired floor is a step-2 precondition (L19.7), so an absent block cannot be left to the gate'.startswith
+FAILED tests/test_strategy_search_round2_l19.py::test_a_non_finite_benchmark_count_cannot_pass_the_paired_floor - AssertionError: a NaN paired_trips must refuse, not pass: got 'ok'
+assert (True is False)
+FAILED tests/test_strategy_search_round2_l19.py::test_round2_precondition_stage_is_the_only_slug_to_stage_mapping - AttributeError: module 'src.backtesting.strategy_search.screen' has no attribute 'round2_precondition_stage'. Did you mean: 'round2_preconditions'?
+8 failed, 15 passed, 38 deselected in 0.23s
+rc_l19=1
+
+=== tests/test_strategy_search_round2_judge.py -k 'benchmark_block or trips_floor or paired_floor' ===
+.F..                                                                     [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+__ test_an_absent_or_malformed_benchmark_block_is_not_evaluated_not_a_verdict __
+
+grid = [{'family': 'E1', 'cell_id': 'e1_cont_g0.5_eod', 'config': 'e1_cont_g0.5_eod', 'config_name_resolved': 'E1|e1_cont_g0....: 'e1_cont_g0.5_t60', 'config': 'e1_cont_g0.5_t60', 'config_name_resolved': 'E1|e1_cont_g0.5_t60|slip_x1_5', ...}, ...]
+
+    def test_an_absent_or_malformed_benchmark_block_is_not_evaluated_not_a_verdict(grid):
+        """The contract audit's item A, at the judge: a malformed input is not a result.
+    
+        An absent benchmark block and a genuine ``paired_trips < 150`` shortfall used
+        to emit the same ``paired_floor`` slug, so a literal slug rule reported "the
+        block was never written" as ``headline_rejected`` — indistinguishable from a
+        real headline failure.  ``benchmark_block`` now covers the absent block and
+        every non-finite count (``nan < 150`` is ``False``, so NaN used to pass), and
+        the cell refuses a verdict instead.
+        """
+        absent = families.GRIDS["E1"][1]["name"]
+        nan_cell = families.GRIDS["E1"][2]["name"]
+    
+        def mutate(c, window, cost, record):
+            if c == absent and cost == judge.BASE_COST:
+                record["benchmark"] = None
+            if c == nan_cell and cost == judge.BASE_COST:
+                record["benchmark"]["paired_trips"] = float("nan")
+    
+>       verdict = _judge(build_grid(mutate=mutate))
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_strategy_search_round2_judge.py:545: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_strategy_search_round2_judge.py:392: in _judge
+    return judge.judge_round2(records, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/backtesting/strategy_search/judge.py:1172: in judge_round2
+    per_window[window] = score_cell(cell, levels["base"][window],
+src/backtesting/strategy_search/judge.py:988: in score_cell
+    "benchmark": benchmark_verdict(base, slip),
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/backtesting/strategy_search/judge.py:589: in benchmark_verdict
+    screen.assert_benchmark_paired_identity(block)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+block = {'variant': 'matched_long_same_entry', 'source': 'realised_trips', 'eod_flat_min': 930, 'entry_convention': "t+1 open, config's own entry bar, buy", ...}
+
+    def assert_benchmark_paired_identity(block: Mapping) -> None:
+        """Both benchmark trip-count identities hold, **to 1e-9** (L19.7).
+    
+        ``benchmark_trips == config_trips`` — the benchmark's trip count is the
+        **generated** count, one benchmark trip per realised config trip (R3-6.1
+        §2.4); and ``paired_trips + benchmark_unpriced == benchmark_trips`` — the
+        unpriceable-EOD trips are *inside* the generated count, not extra (§2.7).
+        This is what L19.7 puts in place of L13's
+        ``benchmark_trips + benchmark_unpriced == config_trips``.
+    
+        Called from the judge **before any ``delta_bps`` is read**: a block whose
+        counts do not close cannot be scored, and a silently mismatched pair makes
+        every gate number read off it incomparable with the trip table it claims to
+        describe.
+        """
+        missing = [k for k in ("config_trips", "benchmark_trips", "paired_trips",
+                               "benchmark_unpriced") if k not in block]
+        if missing:
+            raise BenchmarkIdentityError(
+                f"the benchmark block carries no {', '.join(missing)}, so neither "
+                f"identity is checkable (L19.7)")
+        config_trips = float(block["config_trips"])
+        benchmark_trips = float(block["benchmark_trips"])
+        paired = float(block["paired_trips"])
+        unpriced = float(block["benchmark_unpriced"])
+        if (abs(benchmark_trips - config_trips) <= 1e-9
+                and abs((paired + unpriced) - benchmark_trips) <= 1e-9):
+            return
+>       raise BenchmarkIdentityError(
+            f"the benchmark block's trip counts do not close: "
+            f"benchmark_trips==config_trips is {benchmark_trips:g} vs "
+            f"{config_trips:g}; "
+            f"paired_trips+benchmark_unpriced==benchmark_trips is {paired:g}+"
+            f"{unpriced:g} vs {benchmark_trips:g} (L19.7; both checked to 1e-9)")
+E       src.backtesting.strategy_search.screen.BenchmarkIdentityError: the benchmark block's trip counts do not close: benchmark_trips==config_trips is 168 vs 168; paired_trips+benchmark_unpriced==benchmark_trips is nan+0 vs 168 (L19.7; both checked to 1e-9)
+
+src/backtesting/strategy_search/screen.py:773: BenchmarkIdentityError
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_judge.py::test_an_absent_or_malformed_benchmark_block_is_not_evaluated_not_a_verdict - src.backtesting.strategy_search.screen.BenchmarkIdentityError: the benchmark block's trip counts do not close: benchmark_trips==config_trips is 168 vs 168; paired_trips+benchmark_unpriced==benchmark_trips is nan+0 vs 168 (L19.7; both checked to 1e-9)
+1 failed, 3 passed, 42 deselected in 17.51s
+rc_judge=1

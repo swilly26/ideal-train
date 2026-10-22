@@ -494,8 +494,9 @@ def test_the_paired_floor_slug_is_headline_rejected_not_not_evaluated(grid):
     """L19.7 / C10 — the one routing exception, pinned at the judge.
 
     ``config_trips >= 150`` with ``paired_trips < 150`` is a **headline**
-    failure.  The helper reports it under the slug ``paired_floor`` and does not
-    map it itself; the judge does, by the slug.  The block still closes both
+    failure.  The helper reports it under the slug ``paired_floor``;
+    ``screen.round2_precondition_stage`` is the one place that slug becomes the
+    ``headline`` stage, and the judge calls it.  The block still closes both
     identities (``140 + 28 == 168``), so the shortfall is a paired-subset
     shortfall and not a broken block.
     """
@@ -521,6 +522,36 @@ def test_the_paired_floor_slug_is_headline_rejected_not_not_evaluated(grid):
     assert any(row["config"] == cell for row in verdict["headline_rejected"])
     assert not any(row["config"] == cell for row in verdict["benchmark_rejected"]), (
         "the paired floor is NOT the benchmark gate failing closed (L19.7)")
+
+
+def test_an_absent_or_malformed_benchmark_block_is_not_evaluated_not_a_verdict(grid):
+    """The contract audit's item A, at the judge: a malformed input is not a result.
+
+    An absent benchmark block and a genuine ``paired_trips < 150`` shortfall used
+    to emit the same ``paired_floor`` slug, so a literal slug rule reported "the
+    block was never written" as ``headline_rejected`` — indistinguishable from a
+    real headline failure.  ``benchmark_block`` now covers the absent block and
+    every non-finite count (``nan < 150`` is ``False``, so NaN used to pass), and
+    the cell refuses a verdict instead.
+    """
+    absent = families.GRIDS["E1"][1]["name"]
+    nan_cell = families.GRIDS["E1"][2]["name"]
+
+    def mutate(c, window, cost, record):
+        if c == absent and cost == judge.BASE_COST:
+            record["benchmark"] = None
+        if c == nan_cell and cost == judge.BASE_COST:
+            record["benchmark"]["paired_trips"] = float("nan")
+
+    verdict = _judge(build_grid(mutate=mutate))
+    for cell, label in ((absent, "absent"), (nan_cell, "NaN paired_trips")):
+        assert verdict["buckets"][cell] == screen.ROUND2_NOT_EVALUATED, (
+            f"a {label} benchmark block is a malformed input, not a strategy "
+            f"result — got {verdict['buckets'][cell]!r}")
+        assert "benchmark_block" in verdict["cells"][cell]["why"]
+        assert cell not in verdict["cells_by_bucket"]["headline_rejected"], (
+            f"the {label} block must not be reported as a headline failure: the "
+            f"audit's trap is that both cases emitted the paired_floor slug")
 
 
 def test_a_trips_floor_refusal_is_not_evaluated_with_the_slug_in_why(grid):
