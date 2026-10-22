@@ -16,8 +16,11 @@ The canonical spelling is **``slip_x1_5``**: the probe records already on disk
 under ``/home/team/shared`` are written with it, and a record is evidence and is
 not rewritten.  The dotted spelling is not aliased — :func:`canonical_label`
 *refuses* it, because a silent alias is how the clash survived.
-``ROUND2_GATE_ORDER_SPEC.md`` §4 spells it ``slip_x1.5``; L3 ("ONE label
-spelling used in docs and code") governs and that citation is stale.
+``ROUND2_GATE_ORDER_SPEC.md`` §4 now spells it ``slip_x1_5`` too, and
+``tests/test_strategy_search_round2_l19.py`` asserts the spec's literal against
+:data:`SLIP_X1_5` by value — so the doc and this module can no longer drift
+apart silently (the earlier sentence here, which said §4 spelled the dotted
+form, was falsified by its own tree).
 
 Declared levels
 ---------------

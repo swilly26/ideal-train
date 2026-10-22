@@ -939,7 +939,7 @@ def session_block_lower_bound(trades, seed: int = ROUND2_BOOTSTRAP_SEED,
 
     **Pinned by its CALL SEQUENCE, not by four literals** (L19.8).  Two
     implementations that agree on seed, percentile and resample count but differ
-    on any of the five points below return different lower bounds, and the
+    on any of the seven points below return different lower bounds, and the
     difference is material whenever sessions differ in trip count.  The sequence,
     in order:
 
