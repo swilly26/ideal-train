@@ -1,0 +1,187 @@
+ROUND-2 JUDGE — MUTATION BATTERY EVIDENCE
+========================================
+Tree        : /home/team/shared/wt-r2, branch feature/strategy-search
+Commit      : 7be0f81 (the bytes the battery ran against; no product code changed
+              by this evidence, see "TREE STATE" at the foot of this file)
+Tests       : tests/test_strategy_search_round2_judge.py — 49 tests, 49 green
+              (JUDGE_FULL_9CAD4FE.txt, 158 s)
+Driver      : /home/team/shared/r2_judge_mutations.py (15 mutants, M1–M15)
+Raw logs    : /home/team/shared/r2_judge_mutations_run1.txt  (the full battery)
+              /home/team/shared/r2_judge_mutations.orig.py   (the driver as found,
+              never executed, kept for the diff)
+
+WHY THIS FILE IS THE HONEST EVIDENCE
+------------------------------------
+Every guard in the judge reads a number that the fixtures publish correctly, so a
+green run of the 49 tests proves only that the code and the fixtures agree. What
+proves a guard can *fail* is the opposite: break the thing it watches and watch
+the test that names it go red. The driver was written by the judge session and
+**never executed** — before this run no claim existed that any judge guard can
+fail, which is the same gap L15 was filed against for the gate docs.
+
+METHOD
+------
+One mutant at a time, applied **in place**, the named test run, the outcome
+captured, the original bytes restored in a `finally`. Each mutant's pytest run is
+scoped with `-k` to the **one test that must fail**, so the battery is ~15 × 7 s
+rather than 15 × 158 s. No mutation is committed. Every run used the containment
+env (`WATCHDOG_SCRIPT`, `SUPERVISE_SCRIPT`, `ALGOFLOW_TEST_SESSION=1`) from the
+tree under test.
+
+Reproduce:
+
+    cd /home/team/shared/wt-r2
+    export WATCHDOG_SCRIPT="$PWD/watchdog.sh"
+    export SUPERVISE_SCRIPT="$PWD/scripts/supervise_traders.sh"
+    export ALGOFLOW_TEST_SESSION=1
+    nice -n 19 /home/team/shared/engine/.venv/bin/python -u \
+        /home/team/shared/r2_judge_mutations.py <log-path> [M2,M13]
+
+BASELINE (no mutation)
+----------------------
+`pytest tests/test_strategy_search_round2_judge.py -k "<all 15 named tests>" -q`
+→ **15 passed, 34 deselected in 70.29s, rc=0**. The battery cannot start on a red
+baseline; it did not have to be stopped.
+
+RESULT
+------
+**15 mutants. 13 bit on the first full run. The 2 that did not were mis-designed
+mutants, not blind guards; both were re-pointed and both then bit (2/2).**
+
+| # | mutant | the guard it should kill | first run | after re-point |
+|---|---|---|---|---|
+| M1 | the `paired_floor` slug routes to `not_evaluated` (the L19.7 routing exception dropped) | `test_the_paired_floor_slug_is_headline_rejected_not_not_evaluated` | BITES | — |
+| M2 | a stage that **passed** is handed in under the benchmark's label, so the bucket follows the wrong stage (C1) | `test_the_bucket_is_the_first_failure_in_the_labelling_order` | BLIND | **BITES** |
+| M3 | a `fat_tail` block that is `not_evaluated` passes (fail-closed dropped) | `test_a_fat_tail_block_that_is_not_evaluated_fails_closed` | BITES | — |
+| M4 | the concentration trip minimum is dropped (share rule only) | `test_the_concentration_gate_fails_a_cell_with_a_thin_traded_symbol` | BITES | — |
+| M5 | the persisted headline bound is trusted, never re-derived (L19.8) | `test_a_persisted_headline_bound_the_trip_table_does_not_re_derive_is_refused` | BITES | — |
+| M6 | the benchmark's per-trip mean is trusted, never re-derived (F10) | `test_a_benchmark_whose_per_trip_rows_do_not_mean_its_published_expectancy_is_refused` | BITES | — |
+| M7 | the gating levels are assumed commission-free (I2/L3) | `test_a_commission_bearing_gating_level_is_refused` | BITES | — |
+| M8 | the block's caps in force are not checked (R3-6.3 §1) | `test_a_concentration_block_under_another_caps_set_refuses_a_verdict` | BITES | — |
+| M9 | fold breadth is read at base but its verdict is forced True (L6) | `test_the_fold_breadth_gate_fails_a_cell_with_a_thin_month` | BITES | — |
+| M10 | the neighbour rule always passes (step 9 dropped) | `test_the_neighbour_gate_fails_a_cell_whose_axis_neighbours_are_negative` | BITES | — |
+| M11 | a `not_evaluated` cell enters ranked (L19.6) | `test_a_cell_with_only_a_reported_sizing_is_not_evaluated` | BITES | — |
+| M12 | a record that re-declares `n_configs`/`z_bar` is accepted (L19.12) | `test_a_record_that_re_declares_n_or_z_bar_is_refused` | BITES | — |
+| M13 | `B` becomes a gate (the L19.9 fifth-gate failure) | `test_b_is_recorded_and_never_scored` | BLIND | **BITES** |
+| M14 | the two gating cost levels need not be 1.5× apart (L3) | `test_the_x1_5_level_must_be_one_and_a_half_times_the_base_slippage` | BITES | — |
+| M15 | the benchmark block's paired identity is not asserted (L19.7) | `test_a_benchmark_block_whose_trip_counts_do_not_close_is_refused` | BITES | — |
+
+THREE PATCHES THAT NEVER RAN (found before the first run)
+---------------------------------------------------------
+The driver as written could not have produced a single trustworthy verdict: three
+of its fifteen patches did not apply or could not fire, and it reported rc from
+the subprocess only, so a mutant that broke the *import* would have been counted
+as a kill. All three were corrected before any result was recorded:
+
+* **M1 targeted the wrong file.** It patched `judge.py` for
+  `if slug == PAIRED_FLOOR_SLUG:`, which does not exist there — the judge
+  deliberately holds **no second copy** of the routing rule and delegates to
+  `screen.round2_precondition_stage`, where that comparison lives
+  (`screen.py:868`). The mutant is re-pointed at `screen.py` (the driver's
+  `TARGETS` map); its description is unchanged, because that *is* the guard it
+  meant to kill. It bit on the first run.
+* **M9's patch carried eight leading spaces where the landed line has four**, so
+  it never applied. Re-pointed at the four-space line; it bit on the first run.
+* **The driver counted "rc != 0" as a bite.** It now parses pytest's summary and
+  FAILED/ERROR lines and only calls it BITES when the **named** test is in the
+  FAILED list; an import/collection ERROR is recorded as ERROR, not a kill.
+
+THE TWO MUTANTS THAT DID NOT BITE — kept, because they are the honest half
+----------------------------------------------------------------------------
+**M2 (v1) — BLIND, and not a guard hole.** As written it swapped the benchmark and
+concentration *payloads* under fixed stage labels:
+`_triple("benchmark", stages["concentration"])` and the mirror. On that test's
+fixture **both** stages fail, so whichever payload sits in the benchmark slot is
+still `False`, the label is still `"benchmark"`, and the bucket is unchanged —
+`rc=0`. It also cannot be rescued by re-ordering the triples: `round2_bucket`
+re-sorts them into `ROUND2_BUCKET_ORDER` and its own docstring says the input
+order is irrelevant. The guard is fine; the mutant moved a number between two
+identical values. **Re-pointed** at the swap that can move a *verdict*: benchmark
+↔ `fat_tail`, the one stage that passes on that fixture. The benchmark slot then
+carries a pass, the first failure in the declared order becomes `fat_tail`, and
+the test fails. `rc=1` — BITES.
+
+**M13 (v1) — BLIND, and not a guard hole.** It inserted
+`if blocks < 3: return _result(False, "B < 3", ...)`. The test's whole point is
+that `B` differs by a factor of four between its two grids — **168 vs 48** — and
+both are ≥ 3, so the inserted branch could never fire and the code path was
+byte-identical to the unmutated one. That is a mutant that does not mutate.
+**Re-pointed** at `if blocks < 100:` — a gate that reads `B` at all — so the
+48-block grid fails the headline while the 168-block grid does not, the two
+buckets diverge, and `many["buckets"] == few["buckets"]` fails. `rc=1` — BITES.
+
+**No guard in the judge was found blind.** Every one of the 15 guards has a
+mutant that makes its own named test fail. No product code was changed by this
+battery, so there is no prefix/postfix pair to record: the fixes above are to the
+*driver* (how a guard is broken), not to the *guard*.
+
+TARGETED RE-RUN OF THE TWO RE-POINTED MUTANTS
+---------------------------------------------
+    cd /home/team/shared/wt-r2   (same containment env as above)
+    ... r2_judge_mutations.py /tmp/mutonly.txt M2,M13
+
+    baseline rc=0  2 passed, 32 deselected
+    M2: BITES (rc=1) — test_the_bucket_is_the_first_failure_in_the_labelling_order
+    M13: BITES (rc=1) — test_b_is_recorded_and_never_scored
+    2 mutants, 2 bit
+    all mutants bit: True  (rc=0)
+
+A FULL RE-RUN ON THE FINAL DRIVER WAS STARTED AND DELIBERATELY STOPPED
+----------------------------------------------------------------------
+A second full battery (`r2_judge_mutations_run2.txt`) was launched on the
+re-pointed driver to produce one clean 15/15 log in a single pass. It cleared its
+baseline (`15 passed, 34 deselected in 70.67s, rc=0`) and ran M1 (BITES) and M2
+(BITES, now the re-pointed version) before the session's work budget ran out and
+the driver was **stopped by pid** mid-battery. The driver writes its log file only
+on exit, so `r2_judge_mutations_run2.txt` **does not exist** and nothing is
+claimed from it beyond the two lines quoted here. The claim this file stands
+behind is the one that is fully evidenced: **run 1 (15 mutants, 13 bit) + the
+targeted re-run of the two re-pointed mutants (2/2 bit) = all 15 guards proven
+able to fail.** The next session should re-run the battery once end-to-end to
+collapse that into a single log; it costs ~4 minutes.
+
+VERBATIM — RUN 1 (`r2_judge_mutations_run1.txt`)
+------------------------------------------------
+baseline rc=0  15 passed, 34 deselected in 70.29s (0:01:10)  (0 = every named test passes unmutated)
+
+M1: BITES (rc=1, 7.5s) [screen.py] — the paired_floor slug buckets not_evaluated (the L19.7 routing exception dropped)
+     1 failed, 48 deselected in 6.66s | FAILED ...::test_the_paired_floor_slug_is_headline_rejected_not_not_evaluated
+M2: BLIND (rc=0, 7.6s) [judge.py] — the benchmark and concentration verdicts are handed in swapped, so the bucket follows the wrong stage (C1)
+     1 passed, 48 deselected in 6.77s
+M3: BITES (rc=1, 6.8s) [judge.py] — a fat_tail block that is not_evaluated passes (fail-closed dropped)
+     1 failed, 48 deselected in 5.98s | FAILED ...::test_a_fat_tail_block_that_is_not_evaluated_fails_closed
+M4: BITES (rc=1, 7.6s) [judge.py] — the concentration trip minimum is dropped (share rule only)
+     1 failed, 48 deselected in 6.75s | FAILED ...::test_the_concentration_gate_fails_a_cell_with_a_thin_traded_symbol
+M5: BITES (rc=1, 7.6s) [judge.py] — the persisted headline bound is trusted, never re-derived (L19.8)
+     1 failed, 48 deselected in 6.83s | FAILED ...::test_a_persisted_headline_bound_the_trip_table_does_not_re_derive_is_refused
+M6: BITES (rc=1, 7.5s) [judge.py] — the benchmark's per-trip mean is trusted, never re-derived (F10)
+     1 failed, 48 deselected in 6.73s | FAILED ...::test_a_benchmark_whose_per_trip_rows_do_not_mean_its_published_expectancy_is_refused
+M7: BITES (rc=1, 7.7s) [judge.py] — the gating levels are assumed commission-free, not asserted (I2/L3)
+     1 failed, 48 deselected in 6.99s | FAILED ...::test_a_commission_bearing_gating_level_is_refused
+M8: BITES (rc=1, 7.6s) [judge.py] — the block's caps in force are not checked (R3-6.3 §1)
+     1 failed, 48 deselected in 6.81s | FAILED ...::test_a_concentration_block_under_another_caps_set_refuses_a_verdict
+M9: BITES (rc=1, 7.5s) [judge.py] — fold breadth is read at base but its verdict is forced True (L6)
+     1 failed, 48 deselected in 6.76s | FAILED ...::test_the_fold_breadth_gate_fails_a_cell_with_a_thin_month
+M10: BITES (rc=1, 7.6s) [judge.py] — the neighbour rule always passes (step 9 dropped)
+     1 failed, 48 deselected in 6.81s | FAILED ...::test_the_neighbour_gate_fails_a_cell_whose_axis_neighbours_are_negative
+M11: BITES (rc=1, 5.0s) [judge.py] — a not_evaluated cell enters ranked (L19.6)
+     1 failed, 48 deselected in 4.22s | FAILED ...::test_a_cell_with_only_a_reported_sizing_is_not_evaluated
+M12: BITES (rc=1, 7.8s) [judge.py] — a record that re-declares n_configs/z_bar is accepted (L19.12)
+     1 failed, 48 deselected in 7.02s | FAILED ...::test_a_record_that_re_declares_n_or_z_bar_is_refused
+M13: BLIND (rc=0, 15.3s) [judge.py] — B becomes a gate (the L19.9 fifth-gate failure)
+     1 passed, 48 deselected in 14.51s
+M14: BITES (rc=1, 7.6s) [judge.py] — the two gating cost levels need not be 1.5x apart (L3)
+     1 failed, 48 deselected in 6.79s | FAILED ...::test_the_x1_5_level_must_be_one_and_a_half_times_the_base_slippage
+M15: BITES (rc=1, 7.5s) [judge.py] — the benchmark block's paired identity is not asserted (L19.7)
+     1 failed, 48 deselected in 6.78s | FAILED ...::test_a_benchmark_block_whose_trip_counts_do_not_close_is_refused
+
+15 mutants, 13 bit
+all mutants bit: False  (rc=1)
+
+TREE STATE
+----------
+No mutation is committed and none is left behind: the driver restores each file
+in a `finally`, and after the run that was stopped by pid the tree was restored
+explicitly (`git checkout -- src/backtesting/strategy_search/judge.py`) and
+verified clean — `git status --short` empty, HEAD `7be0f81` == origin. This file
+is the only change this commit carries.
