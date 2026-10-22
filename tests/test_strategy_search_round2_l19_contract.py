@@ -458,7 +458,8 @@ def _step2_record(**over):
     """A minimal record that satisfies **every** step-2 precondition."""
     record = {
         "trips": 150,
-        "trip_table": [{"legs": 1, "notional": families.R2_CAPS["notional_usd"]}] * 150,
+        "trip_table": [{"legs": 1, "side": 1,
+                        "notional": families.R2_CAPS["notional_usd"]}] * 150,
         "config_params": dict(families.R2_CAPS),
         "benchmark": {"config_trips": 150, "benchmark_trips": 150,
                       "paired_trips": 150, "benchmark_unpriced": 0},

@@ -768,6 +768,22 @@ def round2_preconditions(record: Mapping, table=None) -> tuple[bool, str]:
     if notional is None:
         return False, (f"trip_table: no per-trip 'notional' column (the L4 trip "
                        f"table is handed in under {ROUND2_TRIP_TABLE_KEY!r})")
+    side = _trip_column(table, "side")
+    if side is None:
+        return False, (f"side: no per-trip 'side' column (the L4 trip table is "
+                       f"handed in under {ROUND2_TRIP_TABLE_KEY!r}) — a scored "
+                       f"trip has a direction, and it is never inferred from "
+                       f"'legs' (the contract audit's item D)")
+    for i, s in enumerate(side):
+        try:
+            direction = _finite_count(s)
+        except (TypeError, ValueError):
+            direction = None
+        if direction is None or direction not in (1.0, -1.0):
+            return False, (f"side: trip {i} has side {s!r} — a scored trip is "
+                           f"long (+1) or short (-1); legs == 1 alone does not "
+                           f"give a direction, and a side of 0 has no per-trip "
+                           f"benchmark row to pair with (L19.7 / item D)")
     from src.backtesting.strategy_search import families as _families
     # The reference is the pinned literal: the caps check below requires the run's
     # own notional_usd to equal it, so this cannot disagree with the run.

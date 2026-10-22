@@ -463,7 +463,8 @@ def step2_record(**kw) -> dict:
         "trips": trips,
         "notional_usd": notional,
         "config_params": dict(families.R2_CAPS),
-        "trip_table": [{"legs": 1, "notional": notional} for _ in range(trips)],
+        "trip_table": [{"legs": 1, "side": 1, "notional": notional}
+                       for _ in range(trips)],
         "benchmark": {"config_trips": trips, "benchmark_trips": trips,
                       "paired_trips": trips, "benchmark_unpriced": 0},
     }
@@ -485,9 +486,10 @@ def test_step_2_preconditions_accept_a_record_that_violates_none():
         "second spelling would fork the contract")
 
 
-def _trip_table(*notionals: float, legs: tuple = ()) -> list:
+def _trip_table(*notionals: float, legs: tuple = (), side: tuple = ()) -> list:
     notional = families.R2_CAPS["notional_usd"]
     return [{"legs": legs[i] if i < len(legs) else 1,
+             "side": side[i] if i < len(side) else 1,
              "notional": notionals[i]} for i in range(len(notionals))]
 
 
@@ -499,6 +501,16 @@ STEP2_VIOLATIONS = [
     ({"trips": 149}, "trips_floor"),
     ({"trip_table": _trip_table(*([families.R2_CAPS["notional_usd"]] * 150),
                                 legs=(1,) * 10 + (2,) + (1,) * 139)}, "legs"),
+    # The contract audit's item D: a scored trip has a DIRECTION, and `legs == 1`
+    # alone does not give one — a pair-kind instrument holding one leg is
+    # legs==1/side==0 and has no per-trip benchmark row to pair with.
+    ({"trip_table": _trip_table(*([families.R2_CAPS["notional_usd"]] * 150),
+                                side=(1,) * 10 + (0,) + (1,) * 139)}, "side"),
+    ({"trip_table": _trip_table(*([families.R2_CAPS["notional_usd"]] * 150),
+                                side=(1,) * 10 + (2,) + (1,) * 139)}, "side"),
+    ({"trip_table": [{"legs": 1,
+                      "notional": families.R2_CAPS["notional_usd"]}
+                     for _ in range(150)]}, "side"),
     ({"trip_table": _trip_table(*([families.R2_CAPS["notional_usd"]] * 150
                                   + [families.R2_CAPS["notional_usd"] + 1.0]))},
      "notional"),
@@ -712,6 +724,7 @@ def test_the_step_2_trip_table_is_accepted_in_the_engines_own_frame_shape():
     """
     trips = 200
     frame = pd.DataFrame({"legs": [1] * trips,
+                          "side": [1] * trips,
                           "notional": [families.R2_CAPS["notional_usd"]] * trips})
     ok, why = screen.round2_preconditions(step2_record(trip_table=frame))
     assert ok is True, f"the engine's own trip frame must be accepted, got {why!r}"

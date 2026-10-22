@@ -1,0 +1,5 @@
+.......................                                                  [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+23 passed, 56 deselected in 0.21s
+rc_d=0
