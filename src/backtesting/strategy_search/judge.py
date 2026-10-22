@@ -329,7 +329,7 @@ def _gating(index: Mapping, cell: str, window: str, cost: str) -> Mapping | None
 
 
 # ── step 2: the shared preconditions (screen's, plus the block-level caps) ─
-def cell_preconditions(record: Mapping) -> tuple[bool, str]:
+def cell_preconditions(record: Mapping, table=None) -> tuple[bool, str]:
     """Step 2 for one gating record: :func:`screen.round2_preconditions` + caps.
 
     The helper does the five conjuncts the spec names (trips floor, trip table,
@@ -343,8 +343,11 @@ def cell_preconditions(record: Mapping) -> tuple[bool, str]:
     ``why`` opens with the refusal's slug either way, because the judge's bucket
     pass routes on that slug (``paired_floor`` → ``headline_rejected``; anything
     else → ``not_evaluated``).
+
+    ``table`` is the trip table the caller will also hand to the bootstrap, so
+    step 2 and the headline cannot read two different tables (audit item B).
     """
-    ok, why = screen.round2_preconditions(record)
+    ok, why = screen.round2_preconditions(record, table=table)
     if not ok:
         return ok, why
     block = record.get("concentration")
@@ -450,7 +453,7 @@ def _table_bps(table) -> list[float]:
     return out
 
 
-def headline_verdict(base: Mapping, slip: Mapping | None) -> dict:
+def headline_verdict(base: Mapping, slip: Mapping | None, table=None) -> dict:
     """Spec §1 steps 3–4 for one window: the bootstrap bar and the ×1.5 net rule.
 
     The decision number is the **empirical 0.0694th percentile** of the
@@ -464,8 +467,14 @@ def headline_verdict(base: Mapping, slip: Mapping | None) -> dict:
     ``bootstrap_block_p0.0694``/``B`` is not the one its own trip table
     re-derives, or which re-declares the seed, the resample count, ``z_bar`` or
     ``n_configs``, raises :class:`GateBlockInconsistent` (L19.8 / L19.12).
+
+    ``table`` is the table :func:`cell_preconditions` was handed — **the same
+    object**, not a second read of the record — so the count step 2 checked and
+    the rows this bootstrap iterates cannot be two different tables (audit
+    item B).
     """
-    table = base.get(screen.ROUND2_TRIP_TABLE_KEY)
+    if table is None:
+        table = base.get(screen.ROUND2_TRIP_TABLE_KEY)
     if table is None:
         raise GateBlockInconsistent(
             f"{base.get('cell_id')!r} {base.get('window')!r}: the base record "
@@ -931,6 +940,60 @@ def concentration_verdict(record: Mapping) -> dict:
 
 
 # ── the per-cell scoring pass (spec §1 steps 2,3/4,6,7,8,5) ────────────
+def pinned_trip_table(record: Mapping) -> object:
+    """The record's trip table, pinned to the record's own trip count (L19.7).
+
+    Two counts are asserted against each other **before any gate is read**:
+
+    * ``len(trip_table) == record["trips"]`` — step 2 checks the *claimed* count
+      and then iterates whatever table it is handed, so a record claiming 150
+      trips with a 12-row table used to pass step 2 and produce a headline from
+      12 trips (the contract audit's item B);
+    * ``benchmark["config_trips"] == record["trips"]`` — the block's generated
+      count is the same number the config ran, and
+      :func:`screen.assert_benchmark_paired_identity` only checks the identities
+      *inside* the block, so nothing tied it to the record (item C).
+
+    A mismatch is a **hard refusal**, not a bucket: a record whose counts
+    disagree with its own table is corrupt, and a corrupt record is not a
+    strategy result.  Returns the table object, so the caller passes **that
+    object** to both step 2 and the bootstrap.
+    """
+    table = record.get(screen.ROUND2_TRIP_TABLE_KEY)
+    where = (f"{record.get('cell_id')!r} {record.get('window')!r} "
+             f"{record.get('cost_label')!r}")
+    if table is None:
+        raise RecordSetError(
+            f"{where}: the record carries no "
+            f"{screen.ROUND2_TRIP_TABLE_KEY!r}, so neither its trip count nor its "
+            f"headline can be pinned to it (L19.7)")
+    try:
+        rows = len(table)
+        claimed = int(float(record.get("trips")))
+    except (TypeError, ValueError):
+        raise RecordSetError(
+            f"{where}: the record's trips {record.get('trips')!r} is not a count, "
+            f"so the trip table cannot be pinned to it (L19.7)") from None
+    if rows != claimed:
+        raise RecordSetError(
+            f"{where}: the record claims {claimed} trips but its trip table has "
+            f"{rows} rows — step 2 checks the claimed count and the headline "
+            f"iterates the table, so the two must be the same table or the "
+            f"headline is computed on trips the record does not claim (L19.7)")
+    block = record.get("benchmark")
+    if not isinstance(block, Mapping) or "config_trips" not in block:
+        raise RecordSetError(
+            f"{where}: the benchmark block carries no config_trips, so its trip "
+            f"count cannot be pinned to the record's {claimed} (L19.7)")
+    if not _same_number(block["config_trips"], claimed):
+        raise RecordSetError(
+            f"{where}: the benchmark block's config_trips is "
+            f"{block['config_trips']!r} but the record ran {claimed} trips — a "
+            f"benchmark block for another run's trip count cannot be compared "
+            f"with this one (L19.7)")
+    return table
+
+
 def score_cell(cell: str, base: Mapping, slip: Mapping | None,
                folds: Mapping[str, Mapping]) -> dict:
     """Score one cell's two gating records; **no bucketing** (that is pass two).
@@ -942,10 +1005,13 @@ def score_cell(cell: str, base: Mapping, slip: Mapping | None,
     (L12) — a headline-failing cell is still scored by the other gates, and each
     gate's own rows are recorded as evidence (C9 / I3).
     """
-    ok, why = cell_preconditions(base)
+    table = base.get(screen.ROUND2_TRIP_TABLE_KEY)
+    ok, why = cell_preconditions(base, table=table)
     pre_triple, headline_override = _precondition_stage(ok, why)
     slip_pre_ok, slip_pre_why = ((True, "ok") if slip is None
-                                 else cell_preconditions(slip))
+                                 else cell_preconditions(
+                                     slip, table=slip.get(
+                                         screen.ROUND2_TRIP_TABLE_KEY)))
     if not slip_pre_ok:
         # C10: the paired floor applies at EACH gating level's benchmark block.
         pre_triple, override = _precondition_stage(False, slip_pre_why)
@@ -985,10 +1051,18 @@ def score_cell(cell: str, base: Mapping, slip: Mapping | None,
     screen.assert_gate_blocks_present(base, screen.ROUND2_GATE_BLOCKS)
     if slip is not None:
         screen.assert_gate_blocks_present(slip, screen.ROUND2_GATE_BLOCKS)
+    # Audit items B + C: the trip table is pinned to the record's own counts, and
+    # THE SAME object is handed to the headline below.  A record claiming 150
+    # trips with a 12-row table (or a block counting another run's trips) is
+    # corrupt, and a corrupt record refuses loudly rather than becoming a
+    # headline computed on rows the record does not claim.
+    table = pinned_trip_table(base)
+    if slip is not None:
+        pinned_trip_table(slip)
     stages = {
         "preconditions": {"pass": pre_triple[1], "why": pre_triple[2],
                           "detail": {"level": BASE_COST}},
-        "headline": headline_verdict(base, slip),
+        "headline": headline_verdict(base, slip, table=table),
         "benchmark": benchmark_verdict(base, slip),
         "fat_tail": fat_tail_verdict(base),
         "concentration": concentration_verdict(base),

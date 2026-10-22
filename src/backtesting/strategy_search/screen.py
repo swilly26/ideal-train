@@ -705,7 +705,7 @@ def _same_number(a, b) -> bool:
         return False
 
 
-def round2_preconditions(record: Mapping) -> tuple[bool, str]:
+def round2_preconditions(record: Mapping, table=None) -> tuple[bool, str]:
     """Spec §1 step 2 — the shared fail-closed preconditions, in one place (L19.7).
 
     All conjunctive, all computed before any gate is read: the 150-trip floor on
@@ -734,6 +734,13 @@ def round2_preconditions(record: Mapping) -> tuple[bool, str]:
 
     It **evaluates no gate**: what it reads is either :data:`POWER_FLOOR` or a
     pinned literal.
+
+    ``table`` is the trip table to check, and it exists so that a caller can pass
+    **the same object** it will hand to :func:`session_block_lower_bound`: step 2
+    checks the *claimed* trip count while the bootstrap iterates whatever table it
+    is given, so the two must not be able to see different tables (the contract
+    audit's item B).  ``None`` means "read it from the record", the pre-existing
+    behaviour.
     """
     raw_trips = record.get("trips", 0)
     trips_n = _finite_count(0 if raw_trips is None else raw_trips)
@@ -744,7 +751,7 @@ def round2_preconditions(record: Mapping) -> tuple[bool, str]:
     trips = int(trips_n)
     if trips < POWER_FLOOR:
         return False, f"trips_floor: trips {trips} < {POWER_FLOOR}"
-    table = record.get(ROUND2_TRIP_TABLE_KEY)
+    table = record.get(ROUND2_TRIP_TABLE_KEY) if table is None else table
     legs = _trip_column(table, "legs")
     if legs is None:
         return False, (f"trip_table: no per-trip 'legs' column (the L4 trip table "

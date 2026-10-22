@@ -570,6 +570,80 @@ def test_a_trips_floor_refusal_is_not_evaluated_with_the_slug_in_why(grid):
     assert cell not in verdict["cells_by_bucket"]["headline_rejected"]
 
 
+def test_a_record_whose_trip_table_is_shorter_than_its_trip_count_is_refused(grid):
+    """The contract audit's item B: a claimed count and a table must agree.
+
+    Step 2 checks the **claimed** ``trips`` and then the headline iterates
+    whatever table it is handed, so a record claiming 150 trips with a 12-row
+    table passed step 2 and produced a headline from 12 trips.  A corrupt record
+    is not a strategy result: the judge refuses loudly rather than bucketing it.
+    """
+    cell = families.GRIDS["E1"][0]["name"]
+
+    def mutate(c, window, cost, record):
+        if c == cell and window == "W1" and cost == judge.BASE_COST:
+            record["trips"] = 150                 # still >= the 150-trip floor
+            record["trip_table"] = record["trip_table"][:12]
+
+    with pytest.raises(judge.RecordSetError, match="claims 150 trips"):
+        _judge(build_grid(mutate=mutate))
+
+
+def test_a_benchmark_block_counted_for_another_runs_trips_is_refused(grid):
+    """The contract audit's item C: ``config_trips`` is pinned to the record.
+
+    :func:`screen.assert_benchmark_paired_identity` checks the identities
+    *inside* the block and nothing compared ``config_trips`` to the record, so a
+    block written for another run's trip count could be quoted beside this one.
+    """
+    cell = families.GRIDS["E1"][0]["name"]
+
+    def mutate(c, window, cost, record):
+        if c == cell and window == "W1" and cost == judge.BASE_COST:
+            record["benchmark"]["config_trips"] = 150
+
+    with pytest.raises(judge.RecordSetError, match="config_trips"):
+        _judge(build_grid(mutate=mutate))
+
+
+def test_the_same_trip_table_object_reaches_step_2_and_the_bootstrap(grid,
+                                                                    monkeypatch):
+    """The audit's item B, second half: **one** table object, not two reads.
+
+    Passing the record to step 2 and to the bootstrap leaves two independent
+    reads of the same key; anything between them (a `_trim`, a JSON round trip, a
+    caller that rebuilds the record) can make them different tables without
+    either check noticing.  The judge passes the object it pinned, so this spies
+    on both calls and asserts every table they see is an object from the record
+    set itself — identity, not equality.
+    """
+    tables = [record["trip_table"] for record in grid]
+    seen = []
+    real_pre = screen.round2_preconditions
+    real_boot = screen.session_block_lower_bound
+
+    def spy_pre(record, table=None):
+        seen.append(("preconditions", table))
+        return real_pre(record, table=table)
+
+    def spy_boot(trades, *args, **kwargs):
+        seen.append(("bootstrap", trades))
+        return real_boot(trades, *args, **kwargs)
+
+    monkeypatch.setattr(screen, "round2_preconditions", spy_pre)
+    monkeypatch.setattr(screen, "session_block_lower_bound", spy_boot)
+    _judge(grid)
+
+    kinds = {kind for kind, _table in seen}
+    assert kinds == {"preconditions", "bootstrap"}, (
+        f"both calls must be exercised for this to be evidence, got {kinds}")
+    for kind, table in seen:
+        assert any(table is known for known in tables), (
+            f"the {kind} call did not receive a table object from the record "
+            f"set — a copy is a second table, and the count step 2 checked then "
+            f"describes rows the bootstrap never saw")
+
+
 def test_a_cell_with_only_a_reported_sizing_is_not_evaluated(grid):
     """L1 / R3-3(ii): ``equity_fraction`` is a column and can never gate."""
     cell = families.GRIDS["E1"][2]["name"]

@@ -1,0 +1,229 @@
+FFF                                                                      [100%]
+[containment] containment summary: 0 refusal(s), 0 stray(s) reaped, 0 live-stack process(es) on the box at session end
+
+=================================== FAILURES ===================================
+___ test_a_record_whose_trip_table_is_shorter_than_its_trip_count_is_refused ___
+
+grid = [{'family': 'E1', 'cell_id': 'e1_cont_g0.5_eod', 'config': 'e1_cont_g0.5_eod', 'config_name_resolved': 'E1|e1_cont_g0....: 'e1_cont_g0.5_t60', 'config': 'e1_cont_g0.5_t60', 'config_name_resolved': 'E1|e1_cont_g0.5_t60|slip_x1_5', ...}, ...]
+
+    def test_a_record_whose_trip_table_is_shorter_than_its_trip_count_is_refused(grid):
+        """The contract audit's item B: a claimed count and a table must agree.
+    
+        Step 2 checks the **claimed** ``trips`` and then the headline iterates
+        whatever table it is handed, so a record claiming 150 trips with a 12-row
+        table passed step 2 and produced a headline from 12 trips.  A corrupt record
+        is not a strategy result: the judge refuses loudly rather than bucketing it.
+        """
+        cell = families.GRIDS["E1"][0]["name"]
+    
+        def mutate(c, window, cost, record):
+            if c == cell and window == "W1" and cost == judge.BASE_COST:
+                record["trips"] = 150                 # still >= the 150-trip floor
+                record["trip_table"] = record["trip_table"][:12]
+    
+        with pytest.raises(judge.RecordSetError, match="claims 150 trips"):
+>           _judge(build_grid(mutate=mutate))
+
+tests/test_strategy_search_round2_judge.py:589: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_strategy_search_round2_judge.py:392: in _judge
+    return judge.judge_round2(records, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/backtesting/strategy_search/judge.py:1176: in judge_round2
+    per_window[window] = score_cell(cell, levels["base"][window],
+src/backtesting/strategy_search/judge.py:991: in score_cell
+    "headline": headline_verdict(base, slip),
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+base = {'family': 'E1', 'cell_id': 'e1_cont_g0.5_eod', 'config': 'e1_cont_g0.5_eod', 'config_name_resolved': 'E1|e1_cont_g0.5_eod|baseline', ...}
+slip = {'family': 'E1', 'cell_id': 'e1_cont_g0.5_eod', 'config': 'e1_cont_g0.5_eod', 'config_name_resolved': 'E1|e1_cont_g0.5_eod|slip_x1_5', ...}
+
+    def headline_verdict(base: Mapping, slip: Mapping | None) -> dict:
+        """Spec §1 steps 3–4 for one window: the bootstrap bar and the ×1.5 net rule.
+    
+        The decision number is the **empirical 0.0694th percentile** of the
+        session-block bootstrap of mean net bps/trip at base, computed by
+        :func:`screen.session_block_lower_bound` under the declared call sequence
+        (seed :data:`screen.ROUND2_BOOTSTRAP_SEED`, :data:`screen.ROUND2_BOOTSTRAP_RESAMPLES`
+        resamples).  ``z_bar`` is recorded and **not applied** (C7).  The ×1.5 rule
+        is ``net_bps_per_trip > 0``; a missing ×1.5 record **fails closed**.
+    
+        The persisted headline fields are cross-checked, not trusted: a record whose
+        ``bootstrap_block_p0.0694``/``B`` is not the one its own trip table
+        re-derives, or which re-declares the seed, the resample count, ``z_bar`` or
+        ``n_configs``, raises :class:`GateBlockInconsistent` (L19.8 / L19.12).
+        """
+        table = base.get(screen.ROUND2_TRIP_TABLE_KEY)
+        if table is None:
+            raise GateBlockInconsistent(
+                f"{base.get('cell_id')!r} {base.get('window')!r}: the base record "
+                f"carries no {screen.ROUND2_TRIP_TABLE_KEY!r}, so the headline's "
+                f"lower bound cannot be re-derived (spec §3, L4)")
+        try:
+            lower, blocks = screen.session_block_lower_bound(table)
+        except ValueError as exc:
+            raise GateBlockInconsistent(
+                f"{base.get('cell_id')!r} {base.get('window')!r}: the trip table "
+                f"cannot produce the headline bootstrap ({exc})") from exc
+    
+        for key, expected in HEADLINE_DECLARED:
+            if key in base and not _same_number(base[key], expected):
+                raise GateBlockInconsistent(
+                    f"{base.get('cell_id')!r} {base.get('window')!r}: the record "
+                    f"declares {key}={base[key]!r}, but the pre-registration fixes "
+                    f"it at {expected!r} — a re-declared literal after the data is "
+                    f"seen is a forking path (L19.12, C7)")
+        persisted_lb = base.get(HEADLINE_DERIVED[0])
+        if persisted_lb is not None and not _isclose(persisted_lb, lower):
+            raise GateBlockInconsistent(
+                f"{base.get('cell_id')!r} {base.get('window')!r}: the persisted "
+                f"{HEADLINE_DERIVED[0]}={persisted_lb!r} is not the {lower!r} the "
+                f"trip table re-derives under the declared call sequence (L19.8) — "
+                f"a persisted number that cannot be re-derived is not evidence")
+        persisted_b = base.get(HEADLINE_DERIVED[1])
+        if persisted_b is not None and not _same_number(persisted_b, blocks):
+>           raise GateBlockInconsistent(
+                f"{base.get('cell_id')!r} {base.get('window')!r}: the persisted B="
+                f"{persisted_b!r} is not the {blocks} distinct entry-date blocks the "
+                f"trip table has (L19.9)")
+E           src.backtesting.strategy_search.judge.GateBlockInconsistent: 'e1_cont_g0.5_eod' 'W1': the persisted B=48 is not the 3 distinct entry-date blocks the trip table has (L19.9)
+
+src/backtesting/strategy_search/judge.py:497: GateBlockInconsistent
+_______ test_a_benchmark_block_counted_for_another_runs_trips_is_refused _______
+
+grid = [{'family': 'E1', 'cell_id': 'e1_cont_g0.5_eod', 'config': 'e1_cont_g0.5_eod', 'config_name_resolved': 'E1|e1_cont_g0....: 'e1_cont_g0.5_t60', 'config': 'e1_cont_g0.5_t60', 'config_name_resolved': 'E1|e1_cont_g0.5_t60|slip_x1_5', ...}, ...]
+
+    def test_a_benchmark_block_counted_for_another_runs_trips_is_refused(grid):
+        """The contract audit's item C: ``config_trips`` is pinned to the record.
+    
+        :func:`screen.assert_benchmark_paired_identity` checks the identities
+        *inside* the block and nothing compared ``config_trips`` to the record, so a
+        block written for another run's trip count could be quoted beside this one.
+        """
+        cell = families.GRIDS["E1"][0]["name"]
+    
+        def mutate(c, window, cost, record):
+            if c == cell and window == "W1" and cost == judge.BASE_COST:
+                record["benchmark"]["config_trips"] = 150
+    
+        with pytest.raises(judge.RecordSetError, match="config_trips"):
+>           _judge(build_grid(mutate=mutate))
+
+tests/test_strategy_search_round2_judge.py:606: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_strategy_search_round2_judge.py:392: in _judge
+    return judge.judge_round2(records, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/backtesting/strategy_search/judge.py:1176: in judge_round2
+    per_window[window] = score_cell(cell, levels["base"][window],
+src/backtesting/strategy_search/judge.py:992: in score_cell
+    "benchmark": benchmark_verdict(base, slip),
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/backtesting/strategy_search/judge.py:593: in benchmark_verdict
+    screen.assert_benchmark_paired_identity(block)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+block = {'variant': 'matched_long_same_entry', 'source': 'realised_trips', 'eod_flat_min': 930, 'entry_convention': "t+1 open, config's own entry bar, buy", ...}
+
+    def assert_benchmark_paired_identity(block: Mapping) -> None:
+        """Both benchmark trip-count identities hold, **to 1e-9** (L19.7).
+    
+        ``benchmark_trips == config_trips`` — the benchmark's trip count is the
+        **generated** count, one benchmark trip per realised config trip (R3-6.1
+        §2.4); and ``paired_trips + benchmark_unpriced == benchmark_trips`` — the
+        unpriceable-EOD trips are *inside* the generated count, not extra (§2.7).
+        This is what L19.7 puts in place of L13's
+        ``benchmark_trips + benchmark_unpriced == config_trips``.
+    
+        Called from the judge **before any ``delta_bps`` is read**: a block whose
+        counts do not close cannot be scored, and a silently mismatched pair makes
+        every gate number read off it incomparable with the trip table it claims to
+        describe.
+        """
+        missing = [k for k in ("config_trips", "benchmark_trips", "paired_trips",
+                               "benchmark_unpriced") if k not in block]
+        if missing:
+            raise BenchmarkIdentityError(
+                f"the benchmark block carries no {', '.join(missing)}, so neither "
+                f"identity is checkable (L19.7)")
+        config_trips = float(block["config_trips"])
+        benchmark_trips = float(block["benchmark_trips"])
+        paired = float(block["paired_trips"])
+        unpriced = float(block["benchmark_unpriced"])
+        if (abs(benchmark_trips - config_trips) <= 1e-9
+                and abs((paired + unpriced) - benchmark_trips) <= 1e-9):
+            return
+>       raise BenchmarkIdentityError(
+            f"the benchmark block's trip counts do not close: "
+            f"benchmark_trips==config_trips is {benchmark_trips:g} vs "
+            f"{config_trips:g}; "
+            f"paired_trips+benchmark_unpriced==benchmark_trips is {paired:g}+"
+            f"{unpriced:g} vs {benchmark_trips:g} (L19.7; both checked to 1e-9)")
+E       src.backtesting.strategy_search.screen.BenchmarkIdentityError: the benchmark block's trip counts do not close: benchmark_trips==config_trips is 168 vs 150; paired_trips+benchmark_unpriced==benchmark_trips is 168+0 vs 168 (L19.7; both checked to 1e-9)
+
+src/backtesting/strategy_search/screen.py:878: BenchmarkIdentityError
+_______ test_the_same_trip_table_object_reaches_step_2_and_the_bootstrap _______
+
+grid = [{'family': 'E1', 'cell_id': 'e1_cont_g0.5_eod', 'config': 'e1_cont_g0.5_eod', 'config_name_resolved': 'E1|e1_cont_g0....: 'e1_cont_g0.5_t60', 'config': 'e1_cont_g0.5_t60', 'config_name_resolved': 'E1|e1_cont_g0.5_t60|slip_x1_5', ...}, ...]
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe27861fc50>
+
+    def test_the_same_trip_table_object_reaches_step_2_and_the_bootstrap(grid,
+                                                                        monkeypatch):
+        """The audit's item B, second half: **one** table object, not two reads.
+    
+        Passing the record to step 2 and to the bootstrap leaves two independent
+        reads of the same key; anything between them (a `_trim`, a JSON round trip, a
+        caller that rebuilds the record) can make them different tables without
+        either check noticing.  The judge passes the object it pinned, so this spies
+        on both calls and asserts every table they see is an object from the record
+        set itself — identity, not equality.
+        """
+        tables = [record["trip_table"] for record in grid]
+        seen = []
+        real_pre = screen.round2_preconditions
+        real_boot = screen.session_block_lower_bound
+    
+        def spy_pre(record, table=None):
+            seen.append(("preconditions", table))
+            return real_pre(record, table=table)
+    
+        def spy_boot(trades, *args, **kwargs):
+            seen.append(("bootstrap", trades))
+            return real_boot(trades, *args, **kwargs)
+    
+        monkeypatch.setattr(screen, "round2_preconditions", spy_pre)
+        monkeypatch.setattr(screen, "session_block_lower_bound", spy_boot)
+>       _judge(grid)
+
+tests/test_strategy_search_round2_judge.py:635: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_strategy_search_round2_judge.py:392: in _judge
+    return judge.judge_round2(records, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/backtesting/strategy_search/judge.py:1176: in judge_round2
+    per_window[window] = score_cell(cell, levels["base"][window],
+src/backtesting/strategy_search/judge.py:945: in score_cell
+    ok, why = cell_preconditions(base)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+src/backtesting/strategy_search/judge.py:347: in cell_preconditions
+    ok, why = screen.round2_preconditions(record)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+record = {'family': 'E1', 'cell_id': 'e1_cont_g0.5_eod', 'config': 'e1_cont_g0.5_eod', 'config_name_resolved': 'E1|e1_cont_g0.5_eod|baseline', ...}
+table = None
+
+    def spy_pre(record, table=None):
+        seen.append(("preconditions", table))
+>       return real_pre(record, table=table)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: round2_preconditions() got an unexpected keyword argument 'table'
+
+tests/test_strategy_search_round2_judge.py:627: TypeError
+=========================== short test summary info ============================
+FAILED tests/test_strategy_search_round2_judge.py::test_a_record_whose_trip_table_is_shorter_than_its_trip_count_is_refused - src.backtesting.strategy_search.judge.GateBlockInconsistent: 'e1_cont_g0.5_eod' 'W1': the persisted B=48 is not the 3 distinct entry-date blocks the trip table has (L19.9)
+FAILED tests/test_strategy_search_round2_judge.py::test_a_benchmark_block_counted_for_another_runs_trips_is_refused - src.backtesting.strategy_search.screen.BenchmarkIdentityError: the benchmark block's trip counts do not close: benchmark_trips==config_trips is 168 vs 150; paired_trips+benchmark_unpriced==benchmark_trips is 168+0 vs 168 (L19.7; both checked to 1e-9)
+FAILED tests/test_strategy_search_round2_judge.py::test_the_same_trip_table_object_reaches_step_2_and_the_bootstrap - TypeError: round2_preconditions() got an unexpected keyword argument 'table'
+3 failed, 46 deselected in 8.82s
+rc_judge=1
