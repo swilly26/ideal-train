@@ -665,3 +665,334 @@ def test_B_is_recorded_and_no_verdict_path_reads_it():
     assert screen.ROUND2_B_ANNOTATIONS == (3, screen.ROUND2_N_CONFIGS // 4), (
         "the two retained annotations are 3 and N/4, documented in the spec as "
         "diagnostics (L19.9/C6)")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# L19.8 — the port's blind spots: four fixtures the golden cannot reach
+# ═══════════════════════════════════════════════════════════════════════
+#: The stage-2 W1 block bound as **stage 2 published it** — ``block_ci95[0]``
+#: at ``.rebuild.W1.bootstrap`` of
+#: ``/home/team/shared/strategy_search/stage2/stage2_rebuild.json``.  That file
+#: is untracked (it lives in the shared tree, not in this repo), so the literal
+#: is committed here with its source named rather than read from disk.  The
+#: committed golden carries the same number to ~2e-15
+#: (``p2_5_of_the_same_draws`` = -9.381813321383438); this literal is the
+#: *published* one and the pin below is 1e-9, because the two differ only in the
+#: last two bits of float formatting.
+STAGE2_W1_BLOCK_CI95_LOW = -9.381813321383436
+
+_NOTIONAL = 24_000.0
+
+
+def _trip(entry, exit_, bps: float) -> dict:
+    """One trip row carrying exactly the three columns the bootstrap reads."""
+    return {"entry_time": pd.Timestamp(entry), "exit_time": pd.Timestamp(exit_),
+            "notional": _NOTIONAL, "pnl_after_costs": bps * _NOTIONAL / 1e4}
+
+
+def _stage2_block_half(frame: pd.DataFrame, seed: int, resamples: int,
+                       percentile: float) -> tuple[float, int]:
+    """The **source's** block half, written out statement for statement.
+
+    ``scripts/run_strategy_search_stage2.py:159-173``, block half only — the
+    lines that fill ``blocks`` before the i.i.d. cross-check draws from the same
+    stream.  It is deliberately *not* a transcription of the spec's prose: these
+    are the script's own statements in the script's own order, so a fixture's
+    expected value is the number the **declared source** produces, not the
+    number this test file happens to think the source produces.
+    ``test_the_port_reproduces_stage2s_published_block_bound_at_p2_5`` checks
+    this helper against the script itself, so the claim cannot rot.
+    """
+    t = frame.copy()
+    t["day"] = pd.to_datetime(t["entry_time"]).dt.strftime("%Y-%m-%d")
+    t["bps"] = t["pnl_after_costs"] / t["notional"] * 1e4
+    rng = np.random.default_rng(seed)
+    days = t["day"].unique()
+    by_day = [g["bps"].to_numpy() for _, g in t.groupby("day")]
+    blocks = np.empty(resamples)
+    for i in range(resamples):
+        idx = rng.integers(0, len(by_day), len(by_day))
+        blocks[i] = np.concatenate([by_day[j] for j in idx]).mean()
+    return float(np.percentile(blocks, percentile)), len(days)
+
+
+def _first_appearance_reference(frame: pd.DataFrame, seed: int, resamples: int,
+                                percentile: float) -> float:
+    """The plausible *wrong* block order: ``Series.unique()``, first appearance.
+
+    Spec §1 step 3 (b) mandates ascending date order and names this order as
+    the different draw it is not.  Same key, same seed, same draw, same
+    statistic — only the block order differs.
+    """
+    t = frame.copy()
+    t["day"] = pd.to_datetime(t["entry_time"]).dt.strftime("%Y-%m-%d")
+    t["bps"] = t["pnl_after_costs"] / t["notional"] * 1e4
+    rng = np.random.default_rng(seed)
+    by_day = [t.loc[t["day"] == d, "bps"].to_numpy()
+              for d in list(t["day"].unique())]
+    blocks = np.empty(resamples)
+    for i in range(resamples):
+        idx = rng.integers(0, len(by_day), len(by_day))
+        blocks[i] = np.concatenate([by_day[j] for j in idx]).mean()
+    return float(np.percentile(blocks, percentile))
+
+
+def _per_trip_resample(frame: pd.DataFrame, seed: int, resamples: int,
+                       percentile: float) -> float:
+    """The plausible *wrong* unit: resample **trips**, not sessions.
+
+    This is what the golden cannot rule out: its 251 trips sit on 251 distinct
+    entry dates, so on that table the block draw and a per-trip draw are nearly
+    the same experiment.  A fixture with several trips on one session is where
+    the two separate.
+    """
+    t = frame.copy()
+    t["bps"] = t["pnl_after_costs"] / t["notional"] * 1e4
+    x = t["bps"].to_numpy()
+    rng = np.random.default_rng(seed)
+    draws = np.array([rng.choice(x, size=len(x), replace=True).mean()
+                      for _ in range(resamples)])
+    return float(np.percentile(draws, percentile))
+
+
+def _multi_trip_sessions_frame() -> pd.DataFrame:
+    """Five sessions, one of them carrying four trips (the golden's blind spot).
+
+    The committed stage-2 fixture has **one trip per session** — 251 trips on
+    251 entry dates — so on it "resample sessions" and "resample trips" cannot
+    be told apart.  This frame can: 9 trips, 5 blocks, 4 of them on one date.
+    Deterministic and built in-test (nothing here is a fact about the market).
+    """
+    return pd.DataFrame([
+        _trip("2025-09-02 09:31", "2025-09-02 09:40", 40.0),
+        _trip("2025-09-02 10:00", "2025-09-02 10:10", 44.0),
+        _trip("2025-09-02 11:00", "2025-09-02 11:20", 36.0),
+        _trip("2025-09-02 12:00", "2025-09-02 12:30", 48.0),
+        _trip("2025-09-03 09:31", "2025-09-03 09:40", -20.0),
+        _trip("2025-09-03 10:00", "2025-09-03 10:10", -24.0),
+        _trip("2025-09-04 09:31", "2025-09-04 09:40", -60.0),
+        _trip("2025-09-05 09:31", "2025-09-05 09:40", 5.0),
+        _trip("2025-09-08 09:31", "2025-09-08 09:40", -35.0),
+    ])
+
+
+def test_two_trips_on_one_session_move_the_bound_off_a_per_trip_resample():
+    """**Block structure, not per-trip resampling, drives the number** (L19.8).
+
+    Three statements: the fixture really does put several trips on one entry
+    date (else it proves nothing); the helper equals the **source's** block half
+    written out longhand; and the per-trip resample — same seed, same percentile,
+    same resample count, same trips — gives a *different* number on this frame.
+    That last one is the fixture the golden cannot be: with one trip per session
+    the two experiments coincide.
+    """
+    frame = _multi_trip_sessions_frame()
+    per_day = pd.to_datetime(frame["entry_time"]).dt.strftime("%Y-%m-%d").value_counts()
+    assert per_day.max() >= 2 and per_day.size < len(frame), (
+        f"control: the fixture must put >= 2 trips on one entry date (max "
+        f"{per_day.max()} over {per_day.size} dates, {len(frame)} trips), or the "
+        f"block draw and the per-trip draw are the same experiment (L19.8)")
+
+    seed = screen.ROUND2_BOOTSTRAP_SEED
+    resamples = screen.ROUND2_BOOTSTRAP_RESAMPLES
+    pct = screen.ROUND2_HEADLINE_PERCENTILE
+
+    lower, blocks = screen.session_block_lower_bound(frame)
+    expected, n_blocks = _stage2_block_half(frame, seed, resamples, pct)
+    assert blocks == n_blocks == per_day.size, (
+        f"B re-derived {blocks} / {n_blocks} but the frame has {per_day.size} "
+        f"entry-date blocks (L19.9)")
+    assert lower == expected, (
+        f"the helper returned {lower!r}; the declared source's block half "
+        f"(scripts/run_strategy_search_stage2.py:159-173), written out longhand, "
+        f"gives {expected!r} on a frame with {per_day.max()} trips on one session "
+        f"(L19.8) — a different block key, block order, draw or statistic")
+
+    per_trip = _per_trip_resample(frame, seed, resamples, pct)
+    assert abs(per_trip - lower) > 1.0, (
+        f"resampling **trips** gives {per_trip!r} bps, within 1 bps of the "
+        f"session-block bound {lower!r} on a frame with {per_day.max()} trips on "
+        f"one entry date — so this fixture cannot show that block structure "
+        f"(not per-trip resampling) drives the number (L19.8)")
+
+
+def _overnight_frame() -> pd.DataFrame:
+    """Trips whose entry and exit dates differ: 5 entry blocks, 4 exit blocks.
+
+    Three of the six trips close on a later session than they opened, so the
+    entry-date partition and the exit-date partition are *different partitions*
+    — which is what makes the block key observable.  Spec §1 step 3 (a) fixes it
+    as the entry date.
+    """
+    return pd.DataFrame([
+        _trip("2025-09-02 09:31", "2025-09-03 09:31", 50.0),
+        _trip("2025-09-02 10:00", "2025-09-02 10:30", -30.0),
+        _trip("2025-09-03 11:00", "2025-09-04 09:31", -70.0),
+        _trip("2025-09-04 10:00", "2025-09-04 10:30", 20.0),
+        _trip("2025-09-05 09:31", "2025-09-08 09:31", 60.0),
+        _trip("2025-09-08 10:00", "2025-09-08 10:30", 10.0),
+    ])
+
+
+def test_the_block_key_is_the_entry_date_not_the_exit_date():
+    """A trip that closes on a later session is blocked by its **entry** date.
+
+    Spec §1 step 3 (a): ``entry_time.date()``.  The fixture's exit-date
+    partition differs from its entry-date partition, so the two keys give
+    different bounds; the helper must produce the entry-date one, and ``B`` must
+    be the entry-date block count.
+    """
+    frame = _overnight_frame()
+    entry_day = pd.to_datetime(frame["entry_time"]).dt.strftime("%Y-%m-%d")
+    exit_day = pd.to_datetime(frame["exit_time"]).dt.strftime("%Y-%m-%d")
+    assert (entry_day != exit_day).any(), (
+        "control: the fixture needs at least one trip whose entry and exit dates "
+        "differ, or the block key is unobservable (L19.8 (a))")
+    assert entry_day.nunique() != exit_day.nunique(), (
+        f"control: entry blocks ({entry_day.nunique()}) and exit blocks "
+        f"({exit_day.nunique()}) must differ, or the two keys partition the same "
+        f"trips and the assertion below cannot fail (L19.8 (a))")
+
+    seed = screen.ROUND2_BOOTSTRAP_SEED
+    resamples = screen.ROUND2_BOOTSTRAP_RESAMPLES
+    pct = screen.ROUND2_HEADLINE_PERCENTILE
+
+    lower, blocks = screen.session_block_lower_bound(frame)
+    by_entry, _ = _stage2_block_half(frame, seed, resamples, pct)
+    by_exit, _ = _stage2_block_half(frame.assign(entry_time=frame["exit_time"]),
+                                    seed, resamples, pct)
+    assert blocks == entry_day.nunique(), (
+        f"B is {blocks}; the entry-date block count is {entry_day.nunique()} and "
+        f"the exit-date one is {exit_day.nunique()} — B must be the entry-date "
+        f"count (L19.8 (a), L19.9)")
+    assert lower == by_entry, (
+        f"the helper returned {lower!r} but the entry-date-keyed source sequence "
+        f"gives {by_entry!r} (L19.8 (a)) — the block key is the entry date")
+    assert abs(by_exit - by_entry) > 1.0, (
+        f"control: keying the same trips on their **exit** date gives "
+        f"{by_exit!r}, within 1 bps of the entry-date bound {by_entry!r}; the "
+        f"fixture cannot distinguish the two keys and proves nothing")
+
+
+def _out_of_order_frame() -> pd.DataFrame:
+    """24 sessions / 60 trips with the rows deliberately **not** in date order.
+
+    The block order is only observable when first-appearance order differs from
+    ascending date order.  Deterministic, built in-test.
+    """
+    rows = []
+    for i, day in enumerate(pd.bdate_range("2025-09-02", periods=24)):
+        for k in range(1 + (i % 4)):
+            entry = day + pd.Timedelta(minutes=31 + k * 30)
+            rows.append(_trip(entry, entry + pd.Timedelta(minutes=10),
+                              ((i * 23) % 61) - 30.0 + k))
+    return pd.DataFrame(rows)[::-1].reset_index(drop=True)
+
+
+def test_the_block_order_is_ascending_by_date_not_first_appearance():
+    """The blocks are ordered **ascending by date**, not by first appearance.
+
+    Spec §1 step 3 (b) (:85-87) says ``groupby``'s default sort is the order the
+    draw uses and that ``Series.unique()``'s first-appearance order "is a
+    different draw".  This fixture is that claim, executed: the two orders give
+    different bounds and the helper must give the ascending one.  Sorting the
+    frame itself changes nothing — the port's answer must not depend on row
+    order at all.
+    """
+    frame = _out_of_order_frame()
+    first_seen = list(dict.fromkeys(
+        pd.to_datetime(frame["entry_time"]).dt.strftime("%Y-%m-%d")))
+    ascending = sorted(first_seen)
+    assert first_seen != ascending, (
+        "control: the fixture's rows must arrive out of entry-date order, or "
+        "first-appearance order and ascending order are the same list (L19.8 (b))")
+    assert len(ascending) > 1
+
+    seed = screen.ROUND2_BOOTSTRAP_SEED
+    resamples = screen.ROUND2_BOOTSTRAP_RESAMPLES
+    pct = screen.ROUND2_HEADLINE_PERCENTILE
+
+    lower, blocks = screen.session_block_lower_bound(frame)
+    by_date, n_blocks = _stage2_block_half(frame, seed, resamples, pct)
+    by_first = _first_appearance_reference(frame, seed, resamples, pct)
+    assert blocks == n_blocks == len(ascending)
+    assert lower == by_date, (
+        f"the helper returned {lower!r}; the source sequence's ascending-date "
+        f"order gives {by_date!r} on a frame whose rows arrive in "
+        f"{first_seen[:3]}... order (L19.8 (b))")
+    assert abs(by_first - by_date) > 0.1, (
+        f"control: first-appearance order gives {by_first!r}, within 0.1 bps of "
+        f"the ascending-date bound {by_date!r} — the fixture cannot separate the "
+        f"two orders, so it does not pin (b)")
+
+    sorted_frame = frame.sort_values("entry_time").reset_index(drop=True)
+    assert screen.session_block_lower_bound(sorted_frame)[0] == lower, (
+        "sorting the rows changed the lower bound: the port must be a function "
+        "of the blocks, not of the frame's row order (L19.8 (b))")
+
+
+def _stage2_script():
+    """The stage-2 script as a module — the source the port claims to port.
+
+    Importing it is safe: module level is constants and function definitions,
+    and the entry point is under ``if __name__ == "__main__"``.
+    """
+    import importlib.util
+    path = ROOT / "scripts" / "run_strategy_search_stage2.py"
+    spec = importlib.util.spec_from_file_location("_r2_stage2_for_provenance", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_port_reproduces_stage2s_published_block_bound_at_p2_5(monkeypatch):
+    """Provenance: the "verbatim port" claim, as a test rather than a coincidence.
+
+    The committed golden agrees with stage 2's published block bound to ~2e-15,
+    which *today* is consistent with a verbatim port and a coincidence alike.
+    This test closes that gap on the stage-2 W1 table by asking three questions
+    in the strongest available order:
+
+    * the **script itself**, imported, reproduces the published literal
+      ``block_ci95[0]`` = -9.381813321383436 (``.rebuild.W1.bootstrap`` of
+      ``strategy_search/stage2/stage2_rebuild.json``) to 1e-9 — so the fixture
+      and the literal are the same experiment;
+    * the **longhand** source sequence used by the fixtures above reproduces the
+      same number — so those fixtures' expected values really are the source's;
+    * the **port**, asked for stage 2's own percentile, reproduces it too — and
+      at the round-2 percentile on the same table it returns a different number,
+      so the equality is about the stream and not about any percentile working.
+    """
+    frame = pd.read_csv(FIXTURE)
+    seed = screen.ROUND2_BOOTSTRAP_SEED
+    resamples = screen.ROUND2_BOOTSTRAP_RESAMPLES
+
+    published = _stage2_script().bootstrap(frame, seed=seed, n=resamples)["block_ci95"][0]
+    assert published == pytest.approx(STAGE2_W1_BLOCK_CI95_LOW, abs=1e-9), (
+        f"the stage-2 script's own block_ci95[0] on the committed W1 table is "
+        f"{published!r}, not the published {STAGE2_W1_BLOCK_CI95_LOW!r} "
+        f"(strategy_search/stage2/stage2_rebuild.json, .rebuild.W1.bootstrap) — "
+        f"the fixture is not the table stage 2 bootstrapped")
+
+    longhand, n_blocks = _stage2_block_half(frame, seed, resamples, 2.5)
+    assert longhand == pytest.approx(published, abs=1e-9), (
+        f"the longhand source sequence gives {longhand!r} and the script gives "
+        f"{published!r}: the fixtures' expected values are not the source's "
+        f"(L19.8) — fix _stage2_block_half, not this number")
+    assert n_blocks == 251
+
+    monkeypatch.setattr(screen, "ROUND2_HEADLINE_PERCENTILE", 2.5)
+    port, blocks = screen.session_block_lower_bound(frame)
+    assert blocks == 251
+    assert port == pytest.approx(STAGE2_W1_BLOCK_CI95_LOW, abs=1e-9), (
+        f"the port asked for stage 2's 2.5th percentile returns {port!r}, not "
+        f"the published {STAGE2_W1_BLOCK_CI95_LOW!r} (1e-9).  The 'verbatim "
+        f"port' claim is then false: the port's block key, block order, draw, "
+        f"statistic or stream differs from run_strategy_search_stage2.py:159-181")
+
+    monkeypatch.setattr(screen, "ROUND2_HEADLINE_PERCENTILE", 0.0694)
+    round2_bar, _ = screen.session_block_lower_bound(frame)
+    assert abs(round2_bar - port) > 1.0, (
+        f"control: the round-2 bar ({round2_bar!r}) and stage 2's 2.5th "
+        f"percentile ({port!r}) coincide on this table, so the equality above "
+        f"does not show the percentile is read at all")
